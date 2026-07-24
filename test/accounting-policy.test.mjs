@@ -10,7 +10,7 @@ import {
   BUCKETS as frontendBuckets,
   NON_CASH_BUCKETS,
   classifyPaymentMode as classifyFrontend,
-} from '../../rgaccount/src/utils/paymentMode.js';
+} from '../../mountreality-frontend/src/utils/paymentMode.js';
 
 const CASES = [
   ['CASH', 'cash'],
@@ -194,7 +194,7 @@ test('daily DayBook shows specialized mirrors only on the authoritative source d
 
 test('DayBook presentation filters do not rewrite book running or closing balances', async () => {
   const source = await readFile(
-    new URL('../../rgaccount/src/pages/DayBook.jsx', import.meta.url),
+    new URL('../../mountreality-frontend/src/pages/DayBook.jsx', import.meta.url),
     'utf8'
   );
 
@@ -210,7 +210,7 @@ test('DayBook presentation filters do not rewrite book running or closing balanc
 
 test('Balance Sheet exports distinguish whole-book accounting from filtered rows', async () => {
   const source = await readFile(
-    new URL('../../rgaccount/src/pages/BalanceSheet.jsx', import.meta.url),
+    new URL('../../mountreality-frontend/src/pages/BalanceSheet.jsx', import.meta.url),
     'utf8'
   );
 
@@ -481,18 +481,18 @@ test('plot report received amount sums each posted direct and installment receip
   assert.equal((receivedExpr.match(/FROM plot_installment_payments pip/g) || []).length, 1);
 });
 
-test('dashboard forecast uses posted movements and signed reversal directions', async () => {
+test('finance forecast engine uses posted movements and signed reversal directions', async () => {
   const source = await readFile(
-    new URL('../src/controllers/forecast.controller.js', import.meta.url),
+    new URL('../src/services/forecastEngine.service.js', import.meta.url),
     'utf8'
   );
 
   assert.doesNotMatch(source, /status\s*(?:!=|<>)\s*'rejected'/);
   assert.match(source, /LOWER\(COALESCE\(pp\.status, 'approved'\)\) = 'approved'/);
   assert.match(source, /LOWER\(COALESCE\(fp\.status, 'approved'\)\) = 'approved'/);
-  assert.match(source, /RUN_RATE_MOVEMENT_SQL/);
-  assert.match(source, /GREATEST\(-COALESCE\(debit, 0\), 0\)/);
-  assert.match(source, /GREATEST\(-COALESCE\(credit, 0\), 0\)/);
+  assert.match(source, /MOVEMENTS_UNION_SQL/);
+  assert.match(source, /GREATEST\(-COALESCE\(m\.debit, 0\), 0\)/);
+  assert.match(source, /GREATEST\(-COALESCE\(m\.credit, 0\), 0\)/);
 });
 
 test('member financial summaries include posted non-bounced rows only', async () => {

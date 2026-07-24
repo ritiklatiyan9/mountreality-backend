@@ -72,7 +72,7 @@ export const createFarmer = asyncHandler(async (req, res) => {
   const {
     name, phone, address, total_amount, interest_rate, site_id, notes, status, member_id,
     payment_mode, cash_amount, bank_amount, bank_name, bank_account_no, bank_reference, bank_ifsc,
-    land_size_bigha, land_rate, commission_percentage, commission_amount,
+    land_size_bigha, land_size_unit, land_rate, commission_percentage, commission_amount, commission_paid_to_broker,
   } = req.body;
 
   if (!name) {
@@ -109,9 +109,11 @@ export const createFarmer = asyncHandler(async (req, res) => {
     bank_reference: bank_reference || null,
     bank_ifsc: bank_ifsc || null,
     land_size_bigha: land_size_bigha != null && land_size_bigha !== '' ? parseFloat(land_size_bigha) : null,
+    land_size_unit: ['BIGHA', 'YARD', 'SQMT'].includes(land_size_unit) ? land_size_unit : 'BIGHA',
     land_rate: land_rate != null && land_rate !== '' ? parseFloat(land_rate) : null,
     commission_percentage: commission_percentage != null && commission_percentage !== '' ? parseFloat(commission_percentage) : null,
     commission_amount: commission_amount != null && commission_amount !== '' ? parseFloat(commission_amount) : null,
+    commission_paid_to_broker: commission_paid_to_broker != null && commission_paid_to_broker !== '' ? parseFloat(commission_paid_to_broker) : null,
   };
 
   const farmer = await farmerModel.create(farmerData, pool);
@@ -157,7 +159,7 @@ export const updateFarmer = asyncHandler(async (req, res) => {
   const {
     name, phone, address, total_amount, interest_rate, notes, status, member_id,
     payment_mode, cash_amount, bank_amount, bank_name, bank_account_no, bank_reference, bank_ifsc,
-    land_size_bigha, land_rate, commission_percentage, commission_amount,
+    land_size_bigha, land_size_unit, land_rate, commission_percentage, commission_amount, commission_paid_to_broker,
   } = req.body;
 
   // Build the update set without an extra existence-check round-trip — the
@@ -197,9 +199,11 @@ export const updateFarmer = asyncHandler(async (req, res) => {
   if (bank_reference !== undefined) updateData.bank_reference = bank_reference;
   if (bank_ifsc !== undefined) updateData.bank_ifsc = bank_ifsc;
   if (land_size_bigha !== undefined) updateData.land_size_bigha = land_size_bigha != null && land_size_bigha !== '' ? parseFloat(land_size_bigha) : null;
+  if (land_size_unit !== undefined) updateData.land_size_unit = ['BIGHA', 'YARD', 'SQMT'].includes(land_size_unit) ? land_size_unit : 'BIGHA';
   if (land_rate !== undefined) updateData.land_rate = land_rate != null && land_rate !== '' ? parseFloat(land_rate) : null;
   if (commission_percentage !== undefined) updateData.commission_percentage = commission_percentage != null && commission_percentage !== '' ? parseFloat(commission_percentage) : null;
   if (commission_amount !== undefined) updateData.commission_amount = commission_amount != null && commission_amount !== '' ? parseFloat(commission_amount) : null;
+  if (commission_paid_to_broker !== undefined) updateData.commission_paid_to_broker = commission_paid_to_broker != null && commission_paid_to_broker !== '' ? parseFloat(commission_paid_to_broker) : null;
 
   if (Object.keys(updateData).length === 0) {
     return res.status(400).json({ message: 'Nothing to update' });
@@ -278,7 +282,8 @@ export const createPayment = asyncHandler(async (req, res) => {
   const mode = allocation.mode;
   const cashAmt = allocation.cash;
   const bankAmt = allocation.bank;
-  const paymentDate = date || new Date().toISOString().split('T')[0];
+  const canSetCustomDate = req.user.role === 'admin' || req.user.role === 'super_admin';
+  const paymentDate = (canSetCustomDate && date) ? date : new Date().toISOString().split('T')[0];
   const adminId = assigned_admin_id ? parseInt(assigned_admin_id) : null;
   const chequeNo = mode === 'CHEQUE' && req.body.cheque_no
     ? String(req.body.cheque_no).trim()
@@ -504,8 +509,9 @@ export const updatePayment = asyncHandler(async (req, res) => {
   const existing = existingResult.rows[0];
   if (!existing) return res.status(404).json({ message: 'Payment not found' });
 
+  const canSetCustomDate = req.user.role === 'admin' || req.user.role === 'super_admin';
   const updateData = {};
-  if (date !== undefined) updateData.date = date;
+  if (date !== undefined && canSetCustomDate) updateData.date = date;
   if (particular !== undefined) updateData.particular = particular;
   if (amount !== undefined) updateData.amount = amount;
   if (by_note !== undefined) updateData.by_note = by_note;
@@ -630,7 +636,7 @@ export const listFarmerMembers = asyncHandler(async (req, res) => {
   const result = await pool.query(
     `SELECT id, full_name, phone, address, bank_name, branch AS bank_branch, account_no AS bank_account_no, ifsc_code AS bank_ifsc, member_type
      FROM members
-     WHERE site_id = $1
+     WHERE site_id = $1 AND member_type = 'FARMER'
      ORDER BY full_name ASC`,
     [parseInt(site_id)]
   );
