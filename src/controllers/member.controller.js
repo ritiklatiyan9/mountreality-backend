@@ -13,7 +13,7 @@ const normalizedCredit = (row) => Math.max(money(row?.credit), 0) + Math.max(-mo
 
 // ── MEMBER FIELDS (whitelist) ──
 export const MEMBER_FIELDS = [
-  'member_type', 'full_name', 'father_name', 'gender', 'date_of_birth', 'blood_group',
+  'member_type', 'role', 'full_name', 'father_name', 'gender', 'date_of_birth', 'blood_group',
   'phone', 'alt_phone', 'email', 'whatsapp',
   'address', 'city', 'state', 'pincode',
   'aadhar_no', 'pan_no', 'voter_id',
@@ -51,7 +51,7 @@ const sanitize = (body) => {
       let val = body[f];
       if (typeof val === 'string') val = val.trim();
       // Uppercase certain fields
-      if (['full_name', 'father_name', 'member_type', 'gender', 'blood_group',
+      if (['full_name', 'father_name', 'member_type', 'role', 'gender', 'blood_group',
         'city', 'state', 'aadhar_no', 'pan_no', 'voter_id', 'ifsc_code',
         'occupation', 'company_name', 'reference', 'status',
         'mother_name', 'spouse_name', 'nationality', 'religion', 'caste',

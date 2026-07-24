@@ -73,3 +73,7 @@ export const migrateMemberCategories = async () => {
 };
 
 export default migrateMemberCategories;
+
+migrateMemberCategories()
+    .then((ok) => process.exit(ok ? 0 : 1))
+    .catch(() => process.exit(1));

@@ -10,6 +10,12 @@ import { plotModel, plotPaymentModel } from '../models/Plot.model.js';
 import pool from '../config/db.js';
 import { buildVerifyUrl, ReceiptType } from '../utils/receiptToken.js';
 import { classifyPaymentMode, normalizeCashType, emptyBucketMap, BUCKETS } from '../utils/paymentMode.js';
+import { getRevenue, getExpenseBreakdown, getProfit } from '../graphql/services/kpi.service.js';
+
+// All-time bounds for endpoints that report a running total rather than a
+// date-windowed one (matches the wide bounds already used by getSiteCashflow).
+const ALL_TIME_START = '1900-01-01';
+const ALL_TIME_END = '2100-12-31';
 
 // plot_payments keeps a three-value settlement type.  payment_from is a
 // business/narration field (BOOKING, REFUND, etc.) and must never decide which
@@ -2395,84 +2401,28 @@ export const getProfitSummary = asyncHandler(async (req, res) => {
 
   const siteId = parseInt(site_id);
 
-  // ── Earn: Plot Payments (unchanged) ──
-  const earnResult = await pool.query(
-    `SELECT COALESCE(SUM(amount), 0)::numeric AS total_earn
-     FROM (
-       SELECT amount FROM plot_payments
-       WHERE site_id = $1
-         AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
-         AND LOWER(COALESCE(status, 'approved')) = 'approved'
-       UNION ALL
-       SELECT amount FROM plot_installment_payments
-       WHERE plot_id IN (SELECT id FROM plots WHERE site_id = $1)
-         AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
-     ) u`,
-    [siteId]
-  );
-  const totalEarn = parseFloat(earnResult.rows[0].total_earn) || 0;
+  // ── Earn / Expense — sourced from the canonical kpi.service.js formula
+  // (same one the Dashboard's live KPI cards use) instead of re-deriving the
+  // revenue/expense SQL here. This endpoint reports an all-time running total,
+  // so it calls the canonical functions with wide date bounds. ──
+  const [totalEarn, expData] = await Promise.all([
+    getRevenue(siteId, ALL_TIME_START, ALL_TIME_END),
+    getExpenseBreakdown(siteId, ALL_TIME_START, ALL_TIME_END),
+  ]);
+  const totalExpense = expData.total;
 
-  // ── Expenses: query authoritative source tables directly (NOT day_book) ──
-  // Each module table is the single source of truth for its amounts.
-  const expenseResult = await pool.query(
-    `SELECT source_type, COALESCE(SUM(debit), 0)::numeric AS total_debit, COUNT(*)::int AS row_count
-     FROM (
-       SELECT fp.amount AS debit, 'farmer_payments' AS source_type
-       FROM farmer_payments fp
-       JOIN farmers f ON f.id = fp.farmer_id
-       WHERE f.site_id = $1
-         AND UPPER(COALESCE(fp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
-         AND LOWER(COALESCE(fp.status, 'approved')) = 'approved'
-       UNION ALL
-       SELECT COALESCE(debit, 0) - COALESCE(credit, 0) AS debit,
-              'expenses' AS source_type
-       FROM expenses
-       WHERE site_id = $1
-         AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
-         AND LOWER(COALESCE(status, 'approved')) = 'approved'
-       UNION ALL
-       SELECT amount AS debit, 'commissions' AS source_type
-       FROM plot_commissions
-       WHERE site_id = $1
-         AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
-         AND LOWER(COALESCE(status, 'approved')) = 'approved'
-       UNION ALL
-       SELECT amount AS debit, 'commission_payments' AS source_type
-       FROM plot_commission_payments
-       WHERE site_id = $1
-         AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
-         AND LOWER(COALESCE(status, 'approved')) = 'approved'
-       UNION ALL
-       SELECT amount AS debit, 'vendor_payments' AS source_type
-       FROM vendor_payments
-       WHERE site_id = $1
-         AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
-         AND LOWER(COALESCE(status, 'approved')) = 'approved'
-       UNION ALL
-       SELECT COALESCE(debit, 0) - COALESCE(credit, 0) AS debit,
-              'expenses' AS source_type
-       FROM day_book
-       WHERE site_id = $1
-         AND entry_type = 'EXPENSE'
-         AND farmer_payment_id IS NULL AND commission_id IS NULL AND vendor_payment_id IS NULL
-         AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
-         AND LOWER(COALESCE(status, 'approved')) = 'approved'
-     ) u
-     GROUP BY source_type`,
-    [siteId]
-  );
-
+  // Reshape the canonical breakdown into this endpoint's existing byModule
+  // keys — 'commissions' (not 'plot_commissions') and 'daybook_expense' rows
+  // folded into 'expenses', matching the shape this endpoint returned before.
   const byModule = { plot_payments: { credit: totalEarn, debit: 0 } };
-  let totalExpense = 0;
-
-  for (const row of expenseResult.rows) {
-    const debit = parseFloat(row.total_debit) || 0;
-    totalExpense += debit;
-    if (!byModule[row.source_type]) byModule[row.source_type] = { credit: 0, debit: 0 };
-    byModule[row.source_type].debit += debit;
+  const moduleKeyMap = { plot_commissions: 'commissions', daybook_expense: 'expenses' };
+  for (const [sourceType, { debit }] of Object.entries(expData.breakdown)) {
+    const key = moduleKeyMap[sourceType] || sourceType;
+    if (!byModule[key]) byModule[key] = { credit: 0, debit: 0 };
+    byModule[key].debit += debit;
   }
 
-  const profit = totalEarn - totalExpense;
+  const profit = getProfit(totalEarn, totalExpense);
 
   // ── Ledger flow: non-profit entries, separated by site vs person ledger_type ──
   const profitModules = [

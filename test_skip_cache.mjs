@@ -7,7 +7,7 @@ const query = JSON.stringify({
   query: `{ kpiCards(siteId: "5", range: { start: "2000-01-01", end: "2026-12-31" }, skipCache: true) { outstanding outstandingDetail { given returned pending } } }`
 });
 
-const resp = await fetch('https://rgaccountbackend.onrender.com0/graphql', {
+const resp = await fetch('http://localhost:80000/graphql', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
   body: query,

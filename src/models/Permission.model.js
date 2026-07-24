@@ -27,9 +27,10 @@ export const ALL_MODULES = Object.freeze([
     'excel',
     'reports',
     'settings',
+    'finance_forecast',
 ]);
 
-const READ_ONLY_MODULES = new Set(['dashboard', 'balance_sheet', 'reports', 'settings']);
+const READ_ONLY_MODULES = new Set(['dashboard', 'balance_sheet', 'reports', 'settings', 'finance_forecast']);
 // Modules introduced after the original permission rollout stay fail-closed for
 // existing sub-admins. An administrator must opt users into these sensitive
 // document/payment surfaces from the permission matrix.

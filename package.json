@@ -5,13 +5,14 @@
   "main": "src/server.js",
   "scripts": {
     "start": "npm run start:with-migrations",
-    "predev": "npm run migrate:plot-documents && npm run migrate:dms && npm run migrate:member-kyc-document-field && npm run migrate:balance-sheet && npm run migrate:application-settings && npm run migrate:registry-payment-invariants && npm run migrate:transaction-person-mapping && npm run migrate:sms-reminder-log && npm run migrate:accounting && npm run migrate:saas",
+    "predev": "npm run migrate:plot-documents && npm run migrate:dms && npm run migrate:member-kyc-document-field && npm run migrate:member-categories && npm run migrate:balance-sheet && npm run migrate:application-settings && npm run migrate:registry-payment-invariants && npm run migrate:transaction-person-mapping && npm run migrate:sms-reminder-log && npm run migrate:accounting && npm run migrate:saas",
     "dev": "nodemon src/server.js",
     "db:setup": "node src/scripts/setupDb.js && npm run migrate:accounting && npm run migrate:saas",
     "migrate:saas": "node src/migrations/079_saas_multitenancy.js",
     "migrate:plot-documents": "node src/migrations/059_plot_documents.js",
     "migrate:dms": "node src/migrations/069_dms_documents.js",
     "migrate:member-kyc-document-field": "node src/migrations/072_member_kyc_document_field.js",
+    "migrate:member-categories": "node src/migrations/003_member_categories.js",
     "migrate:balance-sheet": "node src/migrations/073_balance_sheet_performance.js",
     "migrate:application-settings": "node src/migrations/074_application_settings.js",
     "migrate:registry-payment-invariants": "node src/migrations/075_registry_payment_plot_invariants.js",
@@ -22,11 +23,15 @@
     "migrate:farmer-split-invariant": "node src/migrations/082_farmer_split_invariant.js",
     "migrate:firm-single-ledger-post": "node src/migrations/083_firm_single_ledger_post.js",
     "migrate:firm-transfer-pairs": "node src/migrations/084_firm_transfer_pair_invariant.js",
-    "migrate:accounting": "npm run migrate:cashflow-sync-coverage && npm run migrate:ledger-bucket && npm run migrate:farmer-split-invariant && npm run migrate:firm-single-ledger-post && npm run migrate:firm-transfer-pairs",
+    "migrate:farmer-land-broker-commission": "node src/migrations/085_farmer_land_unit_and_broker_commission.js",
+    "migrate:member-role": "node src/migrations/086_member_role.js",
+    "migrate:plan-pricing": "node src/migrations/087_update_plan_pricing.js",
+    "migrate:accounting": "npm run migrate:cashflow-sync-coverage && npm run migrate:ledger-bucket && npm run migrate:farmer-split-invariant && npm run migrate:firm-single-ledger-post && npm run migrate:firm-transfer-pairs && npm run migrate:farmer-land-broker-commission && npm run migrate:member-role && npm run migrate:plan-pricing",
     "check:ledger": "node src/checks/ledger-consistency.mjs",
     "test:accounting": "node --test test/accounting-policy.test.mjs",
+    "test:finance-forecast": "node --test test/finance-forecast.test.mjs",
     "worker:sms": "node src/workers/smsWorker.js",
-    "start:with-migrations": "npm run migrate:plot-documents && npm run migrate:dms && npm run migrate:member-kyc-document-field && npm run migrate:balance-sheet && npm run migrate:application-settings && npm run migrate:registry-payment-invariants && npm run migrate:transaction-person-mapping && npm run migrate:sms-reminder-log && npm run migrate:accounting && npm run migrate:saas && node src/server.js"
+    "start:with-migrations": "npm run migrate:plot-documents && npm run migrate:dms && npm run migrate:member-kyc-document-field && npm run migrate:member-categories && npm run migrate:balance-sheet && npm run migrate:application-settings && npm run migrate:registry-payment-invariants && npm run migrate:transaction-person-mapping && npm run migrate:sms-reminder-log && npm run migrate:accounting && npm run migrate:saas && node src/server.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.700.0",

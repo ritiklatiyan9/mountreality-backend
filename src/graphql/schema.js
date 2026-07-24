@@ -15,6 +15,7 @@ import { getPlotPageData, getPlotPaymentDetail, getRegistryBankChequePayments } 
 import { cacheGet, cacheSet, cacheEnabled, clearCacheByPrefixes } from '../config/cache.js';
 import pool from '../config/db.js';
 import { inventoryModel } from '../models/Inventory.model.js';
+import { getFinanceForecast } from '../services/forecastEngine.service.js';
 
 const PRIVILEGED_ROLES = new Set(['admin', 'super_admin']);
 
@@ -170,6 +171,116 @@ const BreakdownItemType = new GraphQLObjectType({
     debit:  { type: new GraphQLNonNull(GraphQLFloat) },
     credit: { type: new GraphQLNonNull(GraphQLFloat) },
     count:  { type: new GraphQLNonNull(GraphQLInt) },
+  },
+});
+
+// ── Finance Forecast types ──
+
+const ForecastSourceMixItemType = new GraphQLObjectType({
+  name: 'ForecastSourceMixItem',
+  fields: {
+    source: { type: new GraphQLNonNull(GraphQLString) },
+    amount: { type: new GraphQLNonNull(GraphQLFloat) },
+  },
+});
+
+const ForecastHistoryMonthType = new GraphQLObjectType({
+  name: 'ForecastHistoryMonth',
+  fields: {
+    key:      { type: new GraphQLNonNull(GraphQLString) },
+    label:    { type: new GraphQLNonNull(GraphQLString) },
+    inflow:   { type: new GraphQLNonNull(GraphQLFloat) },
+    outflow:  { type: new GraphQLNonNull(GraphQLFloat) },
+    net:      { type: new GraphQLNonNull(GraphQLFloat) },
+    txnCount: { type: new GraphQLNonNull(GraphQLInt) },
+  },
+});
+
+const ForecastWeekdayType = new GraphQLObjectType({
+  name: 'ForecastWeekday',
+  fields: {
+    weekday:  { type: new GraphQLNonNull(GraphQLInt) },
+    label:    { type: new GraphQLNonNull(GraphQLString) },
+    txnCount: { type: new GraphQLNonNull(GraphQLInt) },
+    inflow:   { type: new GraphQLNonNull(GraphQLFloat) },
+    outflow:  { type: new GraphQLNonNull(GraphQLFloat) },
+  },
+});
+
+const ForecastDueItemsType = new GraphQLObjectType({
+  name: 'ForecastDueItems',
+  fields: {
+    overdueReceivables: { type: new GraphQLNonNull(GraphQLFloat) },
+    vendorOverdue:      { type: new GraphQLNonNull(GraphQLFloat) },
+    vendorUnscheduled:  { type: new GraphQLNonNull(GraphQLFloat) },
+    farmerOutstanding:  { type: new GraphQLNonNull(GraphQLFloat) },
+  },
+});
+
+const ForecastScenarioType = new GraphQLObjectType({
+  name: 'ForecastScenario',
+  fields: {
+    inflow:               { type: new GraphQLNonNull(GraphQLFloat) },
+    outflow:              { type: new GraphQLNonNull(GraphQLFloat) },
+    net:                  { type: new GraphQLNonNull(GraphQLFloat) },
+    projectedClosingCash: { type: new GraphQLNonNull(GraphQLFloat) },
+    lowerBound:           { type: new GraphQLNonNull(GraphQLFloat) },
+    upperBound:           { type: new GraphQLNonNull(GraphQLFloat) },
+  },
+});
+
+const ForecastMonthScenariosType = new GraphQLObjectType({
+  name: 'ForecastMonthScenarios',
+  fields: {
+    conservative: { type: new GraphQLNonNull(ForecastScenarioType) },
+    base:         { type: new GraphQLNonNull(ForecastScenarioType) },
+    optimistic:   { type: new GraphQLNonNull(ForecastScenarioType) },
+  },
+});
+
+const ForecastMonthType = new GraphQLObjectType({
+  name: 'ForecastMonth',
+  fields: {
+    key:              { type: new GraphQLNonNull(GraphQLString) },
+    label:            { type: new GraphQLNonNull(GraphQLString) },
+    patternInflow:    { type: new GraphQLNonNull(GraphQLFloat) },
+    patternOutflow:   { type: new GraphQLNonNull(GraphQLFloat) },
+    scheduledInflow:  { type: new GraphQLNonNull(GraphQLFloat) },
+    scheduledOutflow: { type: new GraphQLNonNull(GraphQLFloat) },
+    scenarios:        { type: new GraphQLNonNull(ForecastMonthScenariosType) },
+  },
+});
+
+const FinanceForecastType = new GraphQLObjectType({
+  name: 'FinanceForecast',
+  fields: {
+    modelVersion:          { type: new GraphQLNonNull(GraphQLString) },
+    generatedAt:           { type: new GraphQLNonNull(GraphQLString) },
+    disclaimer:            { type: new GraphQLNonNull(GraphQLString) },
+    horizonMonths:         { type: new GraphQLNonNull(GraphQLInt) },
+    lookbackMonths:        { type: new GraphQLNonNull(GraphQLInt) },
+    currentCash:           { type: new GraphQLNonNull(GraphQLFloat) },
+    expectedTotalInflow:   { type: new GraphQLNonNull(GraphQLFloat) },
+    expectedTotalOutflow:  { type: new GraphQLNonNull(GraphQLFloat) },
+    netMovement:           { type: new GraphQLNonNull(GraphQLFloat) },
+    lowestProjectedCash:   { type: new GraphQLNonNull(GraphQLFloat) },
+    firstDeficitMonth:     { type: GraphQLString },
+    deficitMonthCount:     { type: new GraphQLNonNull(GraphQLInt) },
+    conservativeCashFloor: { type: new GraphQLNonNull(GraphQLFloat) },
+    riskLevel:             { type: new GraphQLNonNull(GraphQLString) },
+    riskSummary:           { type: new GraphQLNonNull(GraphQLString) },
+    inflowTrendPct:        { type: new GraphQLNonNull(GraphQLFloat) },
+    outflowTrendPct:       { type: new GraphQLNonNull(GraphQLFloat) },
+    inflowVolatility:      { type: new GraphQLNonNull(GraphQLFloat) },
+    outflowVolatility:     { type: new GraphQLNonNull(GraphQLFloat) },
+    confidenceScore:       { type: new GraphQLNonNull(GraphQLInt) },
+    confidenceLevel:       { type: new GraphQLNonNull(GraphQLString) },
+    history:               { type: new GraphQLList(ForecastHistoryMonthType) },
+    weekdayPattern:        { type: new GraphQLList(ForecastWeekdayType) },
+    sourceMixRevenue:      { type: new GraphQLList(ForecastSourceMixItemType) },
+    sourceMixExpense:      { type: new GraphQLList(ForecastSourceMixItemType) },
+    dueItems:              { type: ForecastDueItemsType },
+    months:                { type: new GraphQLList(ForecastMonthType) },
   },
 });
 
@@ -517,6 +628,7 @@ const RegistryLinkablePaymentType = new GraphQLObjectType({
 
 // ── Cache helpers ──
 const CACHE_TTL = 15; // 15 seconds — short enough to stay fresh while reducing DB load
+const FORECAST_CACHE_TTL = 55; // Finance Forecast polls every 60s; cache just under that
 
 function cacheKey(prefix, siteId, start, end) {
   return `dashboard:${prefix}:${siteId}:${start}:${end}`;
@@ -638,6 +750,40 @@ const QueryType = new GraphQLObjectType({
 
         const payload = { ...result, breakdown: breakdownArr };
         if (cacheEnabled()) await cacheSet(key, payload, CACHE_TTL);
+        return payload;
+      },
+    },
+
+    financeForecast: {
+      type: FinanceForecastType,
+      args: {
+        siteId:         { type: new GraphQLNonNull(GraphQLID) },
+        horizonMonths:  { type: GraphQLInt },
+        lookbackMonths: { type: GraphQLInt },
+        forceRefresh:   { type: GraphQLBoolean },
+      },
+      async resolve(_, { siteId, horizonMonths = 6, lookbackMonths = 6, forceRefresh = false }, ctx) {
+        const id = requireModuleRead(ctx, 'finance_forecast', siteId);
+
+        // Same dashboard: cache namespace/helper as kpiCards, so the existing
+        // clearCacheByPrefixes(['dashboard:', ...]) calls that already fire
+        // after farmer/plot/vendor/expense mutations invalidate this too,
+        // with no extra wiring at each mutation call site.
+        const key = cacheKey('finance-forecast', id, horizonMonths, lookbackMonths);
+
+        if (!forceRefresh && cacheEnabled()) {
+          const cached = await cacheGet(key);
+          if (cached) return cached;
+        }
+
+        const result = await getFinanceForecast(id, { horizonMonths, lookbackMonths });
+
+        const payload = {
+          ...result,
+          sourceMixRevenue: Object.entries(result.sourceMix.revenue).map(([source, amount]) => ({ source, amount })),
+          sourceMixExpense: Object.entries(result.sourceMix.expense).map(([source, amount]) => ({ source, amount })),
+        };
+        if (cacheEnabled()) await cacheSet(key, payload, FORECAST_CACHE_TTL);
         return payload;
       },
     },

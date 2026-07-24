@@ -21,7 +21,6 @@ export const ALL_COMPONENTS = [
   'kpi_totalExpense',
   'kpi_profit',
   'kpi_siteBalance',
-  'cashflow_forecast',
   'expense_radar',
   'recent_transactions',
   'module_breakdown',

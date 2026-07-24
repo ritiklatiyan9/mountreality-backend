@@ -355,6 +355,13 @@ export async function getImprestDistribution(siteId, start, end) {
   }));
 }
 
+// ── Canonical Profit / Margin — every consumer (Dashboard cards, charts,
+// reports, Finance Forecast) must call these instead of re-deriving the
+// formula, so a future policy change only has one place to edit. ──
+export const getProfit = (revenue, expenseTotal) => revenue - expenseTotal;
+export const getProfitMargin = (revenue, profit) =>
+  revenue > 0 ? Math.round((profit / revenue) * 10000) / 100 : 0;
+
 // ── Combined KPI fetch (single round-trip where possible) ──
 export async function getAllKpis(siteId, start, end, excludeOldPlots = false) {
   const [revenue, expData, cashflow, outstanding, personalLedgerCredit, imprestGiven, imprestDistribution, registryPayments, imprestPairs] = await Promise.all([
@@ -373,8 +380,8 @@ export async function getAllKpis(siteId, start, end, excludeOldPlots = false) {
   // Total Incoming / Outgoing / Site Balance come from the canonical ledger.
   // Total Expenses = farmer + expenses + commissions + vendors + orphan daybook
   // Profit = Plot Revenue - Total Expenses
-  const netProfit = revenue - expData.total;
-  const profitMargin = revenue > 0 ? (netProfit / revenue) * 100 : 0;
+  const netProfit = getProfit(revenue, expData.total);
+  const profitMargin = getProfitMargin(revenue, netProfit);
 
   return {
     totalRevenue: revenue,
@@ -384,7 +391,7 @@ export async function getAllKpis(siteId, start, end, excludeOldPlots = false) {
     siteBalance: cashflow.siteBalance,
     totalExpense: expData.total,
     netProfit,
-    profitMargin: Math.round(profitMargin * 100) / 100,
+    profitMargin,
     outstanding: outstanding.pending,
     cashflow: cashflow.net,
     personalLedgerCredit,

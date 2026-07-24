@@ -9,75 +9,25 @@
  * Tolerance: ₹0.01 (floating-point rounding)
  */
 import pool from '../../config/db.js';
+import { getRevenue, getExpenseBreakdown, getProfit, getProfitMargin } from './kpi.service.js';
 
 const TOLERANCE = 0.01;
 
 /**
  * Run A — Source tables (single source of truth).
- * Mirrors getProfitSummary logic exactly.
+ * Revenue/expense are sourced from the same canonical kpi.service.js formula
+ * the live Dashboard KPI cards use, so this checker can never silently drift
+ * from what's actually displayed — it stays a check of Run A's *table*
+ * (module tables) against Run B's *table* (cash_flow_entries), which is what
+ * "sync triggers are broken" actually means, without also having to keep two
+ * independently-maintained copies of the revenue/expense SQL in sync by hand.
  */
 async function runFromSourceTables(siteId, start, end) {
-  // Revenue: plot_payments + installments
-  const revResult = await pool.query(
-    `SELECT COALESCE(SUM(amount), 0)::numeric AS total
-     FROM (
-       SELECT pp.amount FROM plot_payments pp
-       JOIN plots plt ON plt.id = pp.plot_id
-       WHERE plt.site_id = $1 AND pp.date >= $2 AND pp.date < $3
-         AND LOWER(COALESCE(pp.status, 'approved')) = 'approved'
-         AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
-       UNION ALL
-       SELECT pip.amount FROM plot_installment_payments pip
-       JOIN plots p ON p.id = pip.plot_id
-       WHERE p.site_id = $1 AND pip.payment_date >= $2 AND pip.payment_date < $3
-         AND UPPER(COALESCE(pip.cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
-     ) u`,
-    [siteId, start, end]
-  );
-  const totalRevenue = parseFloat(revResult.rows[0].total) || 0;
-
-  // Expense: mirror getProfitSummary exactly. Person-ledger debit is a financing
-  // movement rather than an operating expense, and is verified separately as
-  // outstanding.
-  const expResult = await pool.query(
-    `SELECT COALESCE(SUM(debit), 0)::numeric AS total
-     FROM (
-       SELECT fp.amount AS debit FROM farmer_payments fp
-       JOIN farmers f ON f.id = fp.farmer_id
-       WHERE f.site_id = $1 AND fp.date >= $2 AND fp.date < $3
-         AND LOWER(COALESCE(fp.status, 'approved')) = 'approved'
-         AND UPPER(COALESCE(fp.cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
-       UNION ALL
-       SELECT COALESCE(debit, 0) - COALESCE(credit, 0) AS debit FROM expenses
-       WHERE site_id = $1 AND date >= $2 AND date < $3
-         AND LOWER(COALESCE(status, 'approved')) = 'approved'
-         AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
-       UNION ALL
-       SELECT amount AS debit FROM plot_commissions
-       WHERE site_id = $1 AND date >= $2 AND date < $3
-         AND LOWER(COALESCE(status, 'approved')) = 'approved'
-         AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
-       UNION ALL
-       SELECT amount AS debit FROM plot_commission_payments
-       WHERE site_id = $1 AND date >= $2 AND date < $3
-         AND LOWER(COALESCE(status, 'approved')) = 'approved'
-         AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
-       UNION ALL
-       SELECT amount AS debit FROM vendor_payments
-       WHERE site_id = $1 AND payment_date >= $2 AND payment_date < $3
-         AND LOWER(COALESCE(status, 'approved')) = 'approved'
-         AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
-       UNION ALL
-       SELECT COALESCE(debit, 0) - COALESCE(credit, 0) AS debit FROM day_book
-       WHERE site_id = $1 AND date >= $2 AND date < $3
-         AND UPPER(COALESCE(entry_type, '')) = 'EXPENSE'
-         AND farmer_payment_id IS NULL AND commission_id IS NULL AND vendor_payment_id IS NULL
-         AND LOWER(COALESCE(status, 'approved')) = 'approved'
-         AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
-     ) u`,
-    [siteId, start, end]
-  );
-  const totalExpense = parseFloat(expResult.rows[0].total) || 0;
+  const [totalRevenue, expData] = await Promise.all([
+    getRevenue(siteId, start, end),
+    getExpenseBreakdown(siteId, start, end),
+  ]);
+  const totalExpense = expData.total;
 
   // Outstanding Run A: direct person-ledger entries are already their own
   // source of truth, while mapped person movements are independently rebuilt
@@ -174,12 +124,12 @@ async function runFromSourceTables(siteId, start, end) {
   );
   const outstanding = (parseFloat(outResult.rows[0].given) || 0) - (parseFloat(outResult.rows[0].returned) || 0);
 
-  const netProfit = totalRevenue - totalExpense;
+  const netProfit = getProfit(totalRevenue, totalExpense);
   return {
     totalRevenue,
     totalExpense,
     netProfit,
-    profitMargin: totalRevenue > 0 ? Math.round((netProfit / totalRevenue) * 10000) / 100 : 0,
+    profitMargin: getProfitMargin(totalRevenue, netProfit),
     outstanding,
     // Kept for GraphQL backward compatibility. It is the same independently
     // derived profit-module net, not a second cash-flow assertion.
@@ -248,7 +198,7 @@ async function runFromCashFlowEntries(siteId, start, end) {
 
   // Person-ledger debit belongs to outstanding, not operating expense.
   const adjExpense = totalExpense + orphanExpense;
-  const netProfit = totalRevenue - adjExpense;
+  const netProfit = getProfit(totalRevenue, adjExpense);
 
   // Outstanding Run B: actual person-ledger rows, including module `_person`
   // mirrors. Registry mappings remain informational and never form a balance.
@@ -278,7 +228,7 @@ async function runFromCashFlowEntries(siteId, start, end) {
     totalRevenue,
     totalExpense: adjExpense,
     netProfit,
-    profitMargin: totalRevenue > 0 ? Math.round((netProfit / totalRevenue) * 10000) / 100 : 0,
+    profitMargin: getProfitMargin(totalRevenue, netProfit),
     outstanding,
     cashflow: netProfit,
   };

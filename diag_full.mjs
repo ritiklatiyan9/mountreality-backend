@@ -60,7 +60,7 @@ const query = JSON.stringify({
 });
 
 try {
-  const resp = await fetch('https://rgaccountbackend.onrender.com0/graphql', {
+  const resp = await fetch('http://localhost:80000/graphql', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
     body: query,
