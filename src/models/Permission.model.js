@@ -28,6 +28,12 @@ export const ALL_MODULES = Object.freeze([
     'reports',
     'settings',
     'finance_forecast',
+    // Compliance and legal are split so sensitive legal matters, template
+    // administration and workflow settings remain independently fail-closed.
+    'compliance',
+    'legal',
+    'compliance_templates',
+    'compliance_settings',
 ]);
 
 const READ_ONLY_MODULES = new Set(['dashboard', 'balance_sheet', 'reports', 'settings', 'finance_forecast']);
@@ -43,6 +49,10 @@ const RESTRICTED_MODULES = new Set([
     // fail-closed for existing sub-admins; an admin opts users in.
     'construction',
     'inventory',
+    'compliance',
+    'legal',
+    'compliance_templates',
+    'compliance_settings',
 ]);
 
 const getDefaultPermissions = (module) => {
