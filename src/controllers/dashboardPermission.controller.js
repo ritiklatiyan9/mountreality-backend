@@ -29,6 +29,7 @@ export const ALL_COMPONENTS = [
   'member_search',
   'activity_card',
   'verify_panel',
+  'compliance_watch',
 ];
 
 // GET /dashboard-permissions/:userId

@@ -49,3 +49,30 @@ export async function sendLoginOtpEmail({ to, name, otp, minutes }) {
       </div>`,
   });
 }
+
+/** Compliance reminders share the configured SMTP transport but use a separate,
+ * plain operational template. Throws on delivery failure so the scheduler can
+ * persist a retryable FAILED notification log row. */
+export async function sendComplianceReminderEmail({
+  to, name, title, message, dueDate, siteName, actionUrl,
+}) {
+  if (!transporter) throw new Error('SMTP is not configured');
+  const safe = (value) => String(value || '').replace(/[<>&"]/g, (char) => ({
+    '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;',
+  }[char]));
+  await transporter.sendMail({
+    from: process.env.SMTP_FROM || `"MountReality" <${USER}>`,
+    to,
+    subject: `[MountReality] ${title}`,
+    text: `${message}\n${dueDate ? `Due: ${dueDate}\n` : ''}${siteName ? `Site: ${siteName}\n` : ''}${actionUrl || ''}`,
+    html: `
+      <div style="font-family:Arial,Helvetica,sans-serif;max-width:560px;margin:auto;padding:24px;border:1px solid #e2e8f0;border-radius:14px">
+        <p style="margin:0;color:#2563eb;font-size:12px;font-weight:bold;letter-spacing:.08em;text-transform:uppercase">MountReality Compliance</p>
+        <h2 style="margin:8px 0 12px;color:#0f172a">${safe(title)}</h2>
+        <p style="color:#334155;line-height:1.6">${safe(message)}</p>
+        ${dueDate ? `<p style="color:#475569"><b>Due:</b> ${safe(dueDate)}</p>` : ''}
+        ${siteName ? `<p style="color:#475569"><b>Site:</b> ${safe(siteName)}</p>` : ''}
+        ${actionUrl ? `<a href="${safe(actionUrl)}" style="display:inline-block;margin-top:14px;background:#2563eb;color:white;text-decoration:none;padding:10px 16px;border-radius:9px">Open in MountReality</a>` : ''}
+      </div>`,
+  });
+}

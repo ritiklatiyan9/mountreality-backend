@@ -41,6 +41,8 @@ import constructionRoutes from './construction.routes.js';
 import inventoryRoutes from './inventory.routes.js';
 import reportRoutes from './report.routes.js';
 import forecastAssistantRoutes from './forecastAssistant.routes.js';
+import complianceRoutes from './compliance.routes.js';
+import complianceDocumentRoutes from './complianceDocument.routes.js';
 
 router.use('/auth', authRoutes);
 router.use('/billing', billingRoutes);
@@ -82,4 +84,6 @@ router.use('/construction', constructionRoutes);
 router.use('/inventory', inventoryRoutes);
 router.use('/reports', reportRoutes);
 router.use('/forecast', forecastAssistantRoutes);
+router.use('/compliance', complianceRoutes);
+router.use('/compliance-documents', complianceDocumentRoutes);
 export default router;
