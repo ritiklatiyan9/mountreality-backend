@@ -4,9 +4,15 @@
    — which is the failure that makes "the app loads but nothing updates
    live" so hard to diagnose.
 
-   CORS_ORIGINS is a comma-separated allowlist, e.g.
+   CORS_ORIGINS is a comma-separated allowlist. Entries are exact origins,
+   and `*` may stand in for one or more host labels:
 
-     CORS_ORIGINS=https://mountreality.com,https://console.mountreality.com
+     CORS_ORIGINS=https://mountreality.com,https://*.mountreality.com
+
+   That pair is the whole domain: the apex plus every subdomain under it.
+   The apex needs its own entry — `*.mountreality.com` deliberately does
+   NOT match `mountreality.com`, the same way a wildcard TLS certificate
+   does not cover its own apex.
 
    Unset, this stays permissive. That is deliberate: it is what the API
    already did, and silently locking out a live front end is a worse
@@ -22,6 +28,31 @@ const configured = (process.env.CORS_ORIGINS || '')
   .map((value) => value.trim())
   .filter(Boolean);
 
+/* One or more host labels — letters, digits and hyphens, dot-separated.
+   Deliberately excludes `/`, `:` and `@`, so a wildcard can never eat a
+   path, a port or credentials and let `https://evil.com/x.mountreality.com`
+   through. */
+const LABELS = '[a-z0-9-]+(?:\\.[a-z0-9-]+)*';
+
+/* Substring matching is the trap here: `endsWith('mountreality.com')`
+   also accepts `evilmountreality.com`, and `includes()` accepts
+   `mountreality.com.evil.com`. Each pattern is compiled to an ANCHORED
+   regex with every literal escaped, so a match has to span the entire
+   origin and the wildcard can only ever stand where a `*` was written. */
+const toMatcher = (pattern) => {
+  const lower = pattern.toLowerCase();
+  if (!lower.includes('*')) return (origin) => origin === lower;
+
+  const source = lower
+    .split('*')
+    .map((literal) => literal.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join(LABELS);
+  const re = new RegExp(`^${source}$`);
+  return (origin) => re.test(origin);
+};
+
+const matchers = configured.map(toMatcher);
+
 export const ALLOWED_ORIGINS = configured;
 export const isRestricted = configured.length > 0;
 
@@ -30,7 +61,8 @@ export function isOriginAllowed(origin) {
   // health checks. Not a cross-origin request, so there is nothing to refuse.
   if (!origin) return true;
   if (!isRestricted) return true;
-  return configured.includes(origin);
+  const candidate = origin.toLowerCase();
+  return matchers.some((match) => match(candidate));
 }
 
 /* Rejection resolves false rather than throwing: an Error here would land
