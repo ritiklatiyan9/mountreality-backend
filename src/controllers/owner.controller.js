@@ -2,6 +2,7 @@ import asyncHandler from '../utils/asyncHandler.js';
 import pool from '../config/db.js';
 import { hashPassword } from '../config/jwt.js';
 import userModel from '../models/User.model.js';
+import { generateUniqueSubdomain, isValidSubdomain } from '../utils/subdomain.js';
 
 /**
  * GET /owner/stats — platform KPIs for the Owner Panel dashboard.
@@ -95,9 +96,10 @@ export const registerOrganization = asyncHandler(async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    const subdomain = await generateUniqueSubdomain(client, company_name);
     const org = await client.query(
-      'INSERT INTO organizations (name) VALUES ($1) RETURNING *',
-      [String(company_name).trim()]
+      'INSERT INTO organizations (name, subdomain) VALUES ($1, $2) RETURNING *',
+      [String(company_name).trim(), subdomain]
     );
     const user = await client.query(
       `INSERT INTO users (name, email, password, phone, role, organization_id, is_active, token_version)
@@ -171,7 +173,7 @@ export const getOrganizationDetail = asyncHandler(async (req, res) => {
  */
 export const listOrganizations = asyncHandler(async (req, res) => {
   const { rows } = await pool.query(`
-    SELECT o.id, o.name, o.is_active, o.created_at,
+    SELECT o.id, o.name, o.subdomain, o.is_active, o.created_at,
            sa.name AS super_admin_name, sa.email AS super_admin_email, sa.phone AS super_admin_phone,
            (SELECT COUNT(*)::int FROM users u WHERE u.organization_id = o.id) AS user_count,
            (SELECT COUNT(*)::int FROM sites s WHERE s.organization_id = o.id) AS site_count,
@@ -201,17 +203,47 @@ export const listOrganizations = asyncHandler(async (req, res) => {
  */
 export const updateOrganization = asyncHandler(async (req, res) => {
   const orgId = parseInt(req.params.id, 10);
-  const { is_active } = req.body;
+  const { is_active, subdomain } = req.body;
   if (!Number.isInteger(orgId)) return res.status(400).json({ message: 'Invalid organization id' });
-  if (typeof is_active !== 'boolean') return res.status(400).json({ message: 'is_active must be boolean' });
+  if (is_active === undefined && subdomain === undefined) {
+    return res.status(400).json({ message: 'Nothing to update' });
+  }
+  if (is_active !== undefined && typeof is_active !== 'boolean') {
+    return res.status(400).json({ message: 'is_active must be boolean' });
+  }
 
-  const { rows } = await pool.query(
-    'UPDATE organizations SET is_active = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
-    [is_active, orgId]
-  );
+  let slug;
+  if (subdomain !== undefined) {
+    slug = String(subdomain).trim().toLowerCase();
+    if (!isValidSubdomain(slug)) {
+      return res.status(400).json({
+        message: '2-63 chars, lowercase letters/digits/hyphens, not reserved (www, console, api…)',
+      });
+    }
+  }
+
+  const sets = ['updated_at = NOW()'];
+  const values = [];
+  if (is_active !== undefined) { values.push(is_active); sets.push(`is_active = $${values.length}`); }
+  if (slug !== undefined) { values.push(slug); sets.push(`subdomain = $${values.length}`); }
+  values.push(orgId);
+
+  let rows;
+  try {
+    ({ rows } = await pool.query(
+      `UPDATE organizations SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`,
+      values
+    ));
+  } catch (err) {
+    // 23505 = unique_violation on the case-insensitive subdomain index.
+    if (err.code === '23505') {
+      return res.status(409).json({ message: 'That subdomain is already taken' });
+    }
+    throw err;
+  }
   if (!rows[0]) return res.status(404).json({ message: 'Organization not found' });
 
-  res.json({ organization: rows[0], message: is_active ? 'Organization enabled' : 'Organization disabled' });
+  res.json({ organization: rows[0], message: 'Organization updated' });
 });
 
 /**

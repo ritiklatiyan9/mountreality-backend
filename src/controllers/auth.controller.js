@@ -6,6 +6,7 @@ import userModel from '../models/User.model.js';
 import siteModel from '../models/Site.model.js';
 import permissionModel from '../models/Permission.model.js';
 import pool from '../config/db.js';
+import { generateUniqueSubdomain } from '../utils/subdomain.js';
 
 /**
  * Everything a successful sign-in returns (tokens + sites + permissions + session).
@@ -43,7 +44,18 @@ const buildLoginPayload = async (user, req) => {
     sessionId = sessionResult.rows[0].id;
   }
 
-  return { user: userModel.sanitize(user), accessToken, refreshToken, sites, permissions, sessionId };
+  const organization = await fetchOrganization(user.organization_id);
+
+  return { user: userModel.sanitize(user), organization, accessToken, refreshToken, sites, permissions, sessionId };
+};
+
+const fetchOrganization = async (organizationId) => {
+  if (!organizationId) return null;
+  const { rows } = await pool.query(
+    'SELECT id, name, subdomain FROM organizations WHERE id = $1',
+    [organizationId]
+  );
+  return rows[0] || null;
 };
 
 /**
@@ -115,9 +127,10 @@ export const signup = asyncHandler(async (req, res) => {
   let user;
   try {
     await client.query('BEGIN');
+    const subdomain = await generateUniqueSubdomain(client, company_name);
     const orgResult = await client.query(
-      'INSERT INTO organizations (name) VALUES ($1) RETURNING *',
-      [String(company_name).trim()]
+      'INSERT INTO organizations (name, subdomain) VALUES ($1, $2) RETURNING *',
+      [String(company_name).trim(), subdomain]
     );
     const userResult = await client.query(
       `INSERT INTO users (name, email, password, phone, role, organization_id, is_active, token_version)
@@ -278,7 +291,19 @@ export const getMe = asyncHandler(async (req, res) => {
     permissions = await permissionModel.getByUserId(user.id);
   }
 
-  res.json({ user: userModel.sanitize(user), sites, permissions });
+  const organization = await fetchOrganization(user.organization_id);
+
+  res.json({ user: userModel.sanitize(user), organization, sites, permissions });
+});
+
+/**
+ * POST /auth/domain-intro-seen — the signed-in user has dismissed the
+ * first-login workspace-domain modal; never show it again on any device.
+ * Idempotent, so the client can fire-and-forget it.
+ */
+export const markDomainIntroSeen = asyncHandler(async (req, res) => {
+  await pool.query('UPDATE users SET domain_intro_seen = true WHERE id = $1', [req.user.id]);
+  res.json({ ok: true });
 });
 
 /**
