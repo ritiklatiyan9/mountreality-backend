@@ -5,14 +5,17 @@ import morgan from 'morgan';
 import { createHandler } from 'graphql-http/lib/use/express';
 import { schema as graphqlSchema } from './graphql/schema.js';
 import pool from './config/db.js';
+import { corsOptions, logCorsPolicy } from './config/cors.js';
 import authMiddleware from './middlewares/auth.middleware.js';
 import errorMiddleware from './middlewares/error.middleware.js';
 
 const app = express();
 
+logCorsPolicy();
+
 app.use(helmet());
 app.use(morgan('combined'));
-app.use(cors());
+app.use(cors(corsOptions));
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 

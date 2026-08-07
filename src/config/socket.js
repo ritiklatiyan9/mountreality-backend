@@ -1,5 +1,6 @@
 import { Server } from 'socket.io';
 import { verifyToken } from './jwt.js';
+import { socketCorsOptions } from './cors.js';
 
 let io;
 // Map to keep track of user socket connections
@@ -7,12 +8,8 @@ let io;
 const userSocketMap = new Map();
 
 export const initSocket = (server) => {
-    io = new Server(server, {
-        cors: {
-            origin: '*', // Be careful in production, you might want to restrict this
-            methods: ['GET', 'POST']
-        }
-    });
+    // Same allowlist the HTTP app uses — see config/cors.js.
+    io = new Server(server, { cors: socketCorsOptions });
 
     // Middleware for Socket authentication
     io.use((socket, next) => {
