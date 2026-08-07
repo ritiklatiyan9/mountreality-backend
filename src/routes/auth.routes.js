@@ -3,7 +3,7 @@ const router = express.Router();
 
 import {
   register, signup, login, googleLogin, googleStatus,
-  refresh, logout, updateProfile, getMe, changePassword,
+  refresh, logout, updateProfile, getMe, changePassword, markDomainIntroSeen,
 } from '../controllers/auth.controller.js';
 import authMiddleware from '../middlewares/auth.middleware.js';
 import upload from '../middlewares/multer.middleware.js';
@@ -16,6 +16,7 @@ router.get('/google/status', googleStatus);   // Non-secret diagnostics: is Goog
 router.post('/refresh', refresh);
 router.post('/logout', authMiddleware, logout);
 router.get('/me', authMiddleware, getMe);
+router.post('/domain-intro-seen', authMiddleware, markDomainIntroSeen);
 router.put('/profile', authMiddleware, upload.single('photo'), updateProfile);
 router.put('/change-password', authMiddleware, changePassword);
 
