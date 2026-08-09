@@ -70,8 +70,22 @@ const authMiddleware = async (req, res, next) => {
       req.sessionId = sessionId;
     }
 
-    // Tenant boundary: any site_id sent in query/body must belong to the caller's org.
-    const requestedSiteId = parseInt(req.query?.site_id ?? req.body?.site_id, 10);
+    // Tenant boundary: the selected Site is carried explicitly so RBAC can be
+    // intersected with its published operating policy. Reject mismatched site
+    // contexts instead of allowing a caller to authorize against Site A while
+    // reading or mutating Site B.
+    const suppliedSiteIds = [
+      req.query?.site_id,
+      req.body?.site_id,
+      req.header('X-Site-ID'),
+    ]
+      .map((value) => Number.parseInt(value, 10))
+      .filter((value) => Number.isInteger(value) && value > 0);
+    const distinctSiteIds = [...new Set(suppliedSiteIds)];
+    if (distinctSiteIds.length > 1) {
+      return res.status(409).json({ message: 'Selected site does not match the requested site' });
+    }
+    const requestedSiteId = distinctSiteIds[0];
     if (Number.isInteger(requestedSiteId) && requestedSiteId > 0 && dbUser.role !== 'owner') {
       const siteCheck = await pool.query(
         'SELECT 1 FROM sites WHERE id = $1 AND organization_id = $2 LIMIT 1',
@@ -80,10 +94,20 @@ const authMiddleware = async (req, res, next) => {
       if (!siteCheck.rows[0]) {
         return res.status(403).json({ message: 'Access denied to this site' });
       }
+      if (dbUser.role === 'sub_admin') {
+        const assignment = await pool.query(
+          'SELECT 1 FROM user_sites WHERE user_id = $1 AND site_id = $2 LIMIT 1',
+          [dbUser.id, requestedSiteId]
+        );
+        if (!assignment.rows[0]) {
+          return res.status(403).json({ message: 'Access denied to this site' });
+        }
+      }
     }
 
     // decoded contains: id, email, version — role + org always come fresh from the DB
     req.user = { ...decoded, role: dbUser.role, organization_id: dbUser.organization_id };
+    req.siteContextId = requestedSiteId || null;
     req.subscriptionActive = dbUser.subscription_active;
     next();
   } catch (err) {

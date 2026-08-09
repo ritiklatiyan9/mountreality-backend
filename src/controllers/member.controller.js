@@ -78,8 +78,8 @@ export const DOC_FIELDS = [
   'offer_letter_url', 'other_certificate_url',
 ];
 
-/** Upload all document files from req.files in PARALLEL and return a map of field→url */
-const uploadDocuments = async (files) => {
+/** Upload all document files in parallel and only save when every selected file succeeds. */
+const uploadDocuments = async (files, options) => {
   const urls = {};
   if (!files) return urls;
 
@@ -87,14 +87,16 @@ const uploadDocuments = async (files) => {
   for (const fieldName of DOC_FIELDS) {
     const fileArr = files[fieldName];
     if (fileArr && fileArr.length > 0) {
-      tasks.push(
-        uploadSingle(fileArr[0], 'cloudinary')
-          .then((url) => { urls[fieldName] = url; })
-          .catch((err) => { console.error(`Upload failed for ${fieldName}:`, err?.message || err); })
-      );
+      tasks.push(uploadSingle(fileArr[0], 's3', { ...options, folder: 'member-files' }).then((url) => ({ fieldName, url })));
     }
   }
-  if (tasks.length > 0) await Promise.all(tasks);
+  try {
+    const uploaded = await Promise.all(tasks);
+    uploaded.forEach(({ fieldName, url }) => { urls[fieldName] = url; });
+  } catch (error) {
+    console.error('Member document upload failed:', error?.message || error);
+    throw new Error('Profile image or document upload failed. Please retry.');
+  }
   return urls;
 };
 
@@ -119,7 +121,7 @@ export const createMember = asyncHandler(async (req, res) => {
 
   const [phoneCheck, docUrls] = await Promise.all([
     phoneCheckPromise,
-    uploadDocuments(req.files),
+    uploadDocuments(req.files, { localBaseUrl: `${req.protocol}://${req.get('host')}` }),
   ]);
 
   if (phoneCheck.rows.length > 0) {
@@ -334,7 +336,7 @@ export const updateMember = asyncHandler(async (req, res) => {
         [data.phone, memberId]
       )
     : Promise.resolve({ rows: [] });
-  const docUploadPromise = uploadDocuments(req.files);
+  const docUploadPromise = uploadDocuments(req.files, { localBaseUrl: `${req.protocol}://${req.get('host')}` });
 
   const [existingRes, phoneCheck, docUrls] = await Promise.all([
     existingPromise,

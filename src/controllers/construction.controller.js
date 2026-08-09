@@ -3,10 +3,38 @@ import pool from '../config/db.js';
 import { inventoryModel } from '../models/Inventory.model.js';
 
 const num = (v) => (v === undefined || v === null || v === '' ? null : Number(v));
+const positiveId = (value) => {
+  const id = Number.parseInt(value, 10);
+  return Number.isInteger(id) && id > 0 ? id : null;
+};
+const constructionScope = (req) => ({
+  siteId: parseInt(req.constructionSiteId ?? req.siteContextId, 10),
+  organizationId: parseInt(req.user?.organization_id, 10),
+});
 const requireSite = (req, res) => {
-  const siteId = parseInt(req.query.site_id || req.body.site_id, 10);
+  const { siteId: canonicalSiteId } = constructionScope(req);
+  const suppliedSiteId = parseInt(req.query.site_id || req.body.site_id, 10);
+  if (canonicalSiteId && suppliedSiteId && canonicalSiteId !== suppliedSiteId) {
+    res.status(409).json({ message: 'Selected site does not match the requested site' });
+    return null;
+  }
+  const siteId = canonicalSiteId || suppliedSiteId;
   if (!siteId) { res.status(400).json({ message: 'site_id is required' }); return null; }
   return siteId;
+};
+
+const userBelongsToSite = async (userId, siteId, organizationId, db = pool) => {
+  if (!userId) return true;
+  const { rows } = await db.query(
+    `SELECT 1 FROM users u
+      WHERE u.id = $1 AND u.organization_id = $3 AND u.is_active = true
+        AND (u.role IN ('admin', 'super_admin') OR EXISTS (
+          SELECT 1 FROM user_sites us WHERE us.user_id = u.id AND us.site_id = $2
+        ))
+      LIMIT 1`,
+    [userId, siteId, organizationId],
+  );
+  return Boolean(rows[0]);
 };
 
 // Recompute a request's status from its line items (CANCELLED stays sticky).
@@ -22,7 +50,8 @@ const deriveRequestStatus = (items) => {
 
 export const listProjects = asyncHandler(async (req, res) => {
   const siteId = requireSite(req, res); if (!siteId) return;
-  const params = [siteId];
+  const { organizationId } = constructionScope(req);
+  const params = [siteId, organizationId];
   let where = 'WHERE p.site_id = $1';
   if (req.query.status && req.query.status !== 'all') { params.push(req.query.status.toUpperCase()); where += ` AND p.status = $${params.length}`; }
   if (req.query.search?.trim()) { params.push(`%${req.query.search.trim()}%`); where += ` AND (p.name ILIKE $${params.length} OR p.code ILIKE $${params.length})`; }
@@ -34,12 +63,15 @@ export const listProjects = asyncHandler(async (req, res) => {
        COALESCE(r.pending_requests, 0)::int   AS pending_requests,
        (p.target_end_date IS NOT NULL AND p.target_end_date < CURRENT_DATE AND p.status <> 'COMPLETED') AS is_overdue
      FROM construction_projects p
+     JOIN sites scope_site ON scope_site.id = p.site_id AND scope_site.organization_id = $2
      LEFT JOIN (SELECT project_id, COUNT(*) task_count, COUNT(*) FILTER (WHERE status='DONE') done_count
                 FROM construction_tasks GROUP BY project_id) t ON t.project_id = p.id
-     LEFT JOIN (SELECT project_id, SUM(qty*rate) actual_cost
-                FROM inventory_movements WHERE movement_type='CONSUMPTION' GROUP BY project_id) c ON c.project_id = p.id
-     LEFT JOIN (SELECT project_id, COUNT(*) pending_requests
-                FROM construction_material_requests WHERE status IN ('REQUESTED','PARTIALLY_FULFILLED') GROUP BY project_id) r ON r.project_id = p.id
+     LEFT JOIN (SELECT project_id, site_id, SUM(qty*rate) actual_cost
+                FROM inventory_movements WHERE movement_type='CONSUMPTION' GROUP BY project_id, site_id) c
+            ON c.project_id = p.id AND c.site_id = p.site_id
+     LEFT JOIN (SELECT project_id, site_id, COUNT(*) pending_requests
+                FROM construction_material_requests WHERE status IN ('REQUESTED','PARTIALLY_FULFILLED') GROUP BY project_id, site_id) r
+            ON r.project_id = p.id AND r.site_id = p.site_id
      ${where}
      ORDER BY p.created_at DESC`,
     params
@@ -49,26 +81,50 @@ export const listProjects = asyncHandler(async (req, res) => {
 
 export const createProject = asyncHandler(async (req, res) => {
   const siteId = requireSite(req, res); if (!siteId) return;
+  const { organizationId } = constructionScope(req);
   const { name, code, status, start_date, target_end_date, budget, notes, assigned_admin_id } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ message: 'Project name is required' });
+  const assignedAdminId = assigned_admin_id ? positiveId(assigned_admin_id) : null;
+  if (assigned_admin_id && !assignedAdminId) {
+    return res.status(400).json({ message: 'Assigned admin is invalid' });
+  }
+  if (!await userBelongsToSite(assignedAdminId, siteId, organizationId)) {
+    return res.status(400).json({ message: 'Assigned admin is not available for this Site' });
+  }
   const { rows } = await pool.query(
     `INSERT INTO construction_projects (site_id, name, code, status, start_date, target_end_date, budget, notes, assigned_admin_id, created_by)
-     VALUES ($1,$2,$3,COALESCE($4,'PLANNING'),$5,$6,$7,$8,$9,$10) RETURNING *`,
+     SELECT $1,$2,$3,COALESCE($4,'PLANNING'),$5,$6,$7,$8,$9,$10
+       FROM sites s WHERE s.id = $1 AND s.organization_id = $11
+     RETURNING *`,
     [siteId, name.trim(), code?.trim() || null, status?.toUpperCase() || null,
      start_date || null, target_end_date || null, num(budget) || 0, notes?.trim() || null,
-     assigned_admin_id || null, req.user.id]
+     assignedAdminId, req.user.id, organizationId]
   );
+  if (!rows[0]) return res.status(404).json({ message: 'Site not found' });
   res.status(201).json({ project: rows[0] });
 });
 
 export const getProject = asyncHandler(async (req, res) => {
   const id = parseInt(req.params.id, 10);
-  const { rows } = await pool.query('SELECT * FROM construction_projects WHERE id = $1', [id]);
+  const siteId = requireSite(req, res); if (!siteId) return;
+  const { organizationId } = constructionScope(req);
+  const { rows } = await pool.query(
+    `SELECT p.* FROM construction_projects p
+      JOIN sites s ON s.id = p.site_id AND s.organization_id = $3
+     WHERE p.id = $1 AND p.site_id = $2`,
+    [id, siteId, organizationId],
+  );
   const project = rows[0];
   if (!project) return res.status(404).json({ message: 'Project not found' });
 
   const [tasks, requests, cost] = await Promise.all([
-    pool.query('SELECT * FROM construction_tasks WHERE project_id = $1 ORDER BY sequence ASC, id ASC', [id]),
+    pool.query(
+      `SELECT t.* FROM construction_tasks t
+        JOIN construction_projects p ON p.id = t.project_id AND p.site_id = $2
+        JOIN sites s ON s.id = p.site_id AND s.organization_id = $3
+       WHERE t.project_id = $1 ORDER BY t.sequence ASC, t.id ASC`,
+      [id, siteId, organizationId],
+    ),
     pool.query(
       `SELECT r.*, u.name AS requested_by_name,
          COALESCE(json_agg(json_build_object(
@@ -78,14 +134,21 @@ export const getProject = asyncHandler(async (req, res) => {
          ) ORDER BY ri.id) FILTER (WHERE ri.id IS NOT NULL), '[]') AS items
        FROM construction_material_requests r
        LEFT JOIN construction_material_request_items ri ON ri.request_id = r.id
-       LEFT JOIN inventory_materials m ON m.id = ri.material_id
-       LEFT JOIN users u ON u.id = r.requested_by
-       WHERE r.project_id = $1
+       LEFT JOIN inventory_materials m ON m.id = ri.material_id AND m.site_id = r.site_id
+       LEFT JOIN users u ON u.id = r.requested_by AND u.organization_id = $3
+       JOIN sites s ON s.id = r.site_id AND s.organization_id = $3
+       WHERE r.project_id = $1 AND r.site_id = $2
        GROUP BY r.id, u.name
        ORDER BY r.created_at DESC`,
-      [id]
+      [id, siteId, organizationId]
     ),
-    pool.query(`SELECT COALESCE(SUM(qty*rate),0) AS actual_cost FROM inventory_movements WHERE movement_type='CONSUMPTION' AND project_id = $1`, [id]),
+    pool.query(
+      `SELECT COALESCE(SUM(im.qty*im.rate),0) AS actual_cost
+         FROM inventory_movements im
+         JOIN sites s ON s.id = im.site_id AND s.organization_id = $3
+        WHERE im.movement_type='CONSUMPTION' AND im.project_id = $1 AND im.site_id = $2`,
+      [id, siteId, organizationId],
+    ),
   ]);
 
   res.json({
@@ -97,6 +160,8 @@ export const getProject = asyncHandler(async (req, res) => {
 
 export const updateProject = asyncHandler(async (req, res) => {
   const id = parseInt(req.params.id, 10);
+  const siteId = requireSite(req, res); if (!siteId) return;
+  const { organizationId } = constructionScope(req);
   const fields = ['name', 'code', 'status', 'start_date', 'target_end_date', 'actual_end_date', 'budget', 'progress_pct', 'notes', 'assigned_admin_id'];
   const sets = [];
   const params = [];
@@ -106,15 +171,32 @@ export const updateProject = asyncHandler(async (req, res) => {
     if (f === 'status') v = String(v).toUpperCase();
     else if (f === 'budget') v = num(v) || 0;
     else if (f === 'progress_pct') v = Math.max(0, Math.min(100, parseInt(v, 10) || 0));
-    else if (['start_date', 'target_end_date', 'actual_end_date', 'assigned_admin_id'].includes(f)) v = v || null;
+    else if (f === 'assigned_admin_id') v = v ? positiveId(v) : null;
+    else if (['start_date', 'target_end_date', 'actual_end_date'].includes(f)) v = v || null;
     else v = v === null ? null : String(v).trim() || null;
     params.push(v);
     sets.push(`${f} = $${params.length}`);
   }
   if (sets.length === 0) return res.status(400).json({ message: 'Nothing to update' });
-  params.push(id);
+  if (req.body.assigned_admin_id !== undefined) {
+    const assignedAdminId = req.body.assigned_admin_id ? positiveId(req.body.assigned_admin_id) : null;
+    if (req.body.assigned_admin_id && !assignedAdminId) {
+      return res.status(400).json({ message: 'Assigned admin is invalid' });
+    }
+    if (!await userBelongsToSite(assignedAdminId, siteId, organizationId)) {
+      return res.status(400).json({ message: 'Assigned admin is not available for this Site' });
+    }
+  }
+  params.push(id, siteId, organizationId);
+  const idIndex = params.length - 2;
+  const siteIndex = params.length - 1;
+  const orgIndex = params.length;
   const { rows } = await pool.query(
-    `UPDATE construction_projects SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length} RETURNING *`,
+    `UPDATE construction_projects p SET ${sets.join(', ')}, updated_at = NOW()
+      FROM sites s
+     WHERE p.id = $${idIndex} AND p.site_id = $${siteIndex}
+       AND s.id = p.site_id AND s.organization_id = $${orgIndex}
+     RETURNING p.*`,
     params
   );
   if (!rows[0]) return res.status(404).json({ message: 'Project not found' });
@@ -123,7 +205,15 @@ export const updateProject = asyncHandler(async (req, res) => {
 
 export const deleteProject = asyncHandler(async (req, res) => {
   const id = parseInt(req.params.id, 10);
-  const del = await pool.query('DELETE FROM construction_projects WHERE id = $1 RETURNING id', [id]);
+  const siteId = requireSite(req, res); if (!siteId) return;
+  const { organizationId } = constructionScope(req);
+  const del = await pool.query(
+    `DELETE FROM construction_projects p USING sites s
+      WHERE p.id = $1 AND p.site_id = $2
+        AND s.id = p.site_id AND s.organization_id = $3
+      RETURNING p.id`,
+    [id, siteId, organizationId],
+  );
   if (!del.rows[0]) return res.status(404).json({ message: 'Project not found' });
   res.json({ success: true });
 });
@@ -132,20 +222,29 @@ export const deleteProject = asyncHandler(async (req, res) => {
 
 export const createTask = asyncHandler(async (req, res) => {
   const projectId = parseInt(req.params.id, 10);
+  const siteId = requireSite(req, res); if (!siteId) return;
+  const { organizationId } = constructionScope(req);
   const { name, status, progress_pct, sequence, start_date, due_date } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ message: 'Task name is required' });
   const { rows } = await pool.query(
     `INSERT INTO construction_tasks (project_id, name, status, progress_pct, sequence, start_date, due_date, created_by)
-     VALUES ($1,$2,COALESCE($3,'PENDING'),$4,$5,$6,$7,$8) RETURNING *`,
+     SELECT p.id,$2,COALESCE($3,'PENDING'),$4,$5,$6,$7,$8
+       FROM construction_projects p
+       JOIN sites s ON s.id = p.site_id AND s.organization_id = $10
+      WHERE p.id = $1 AND p.site_id = $9
+     RETURNING *`,
     [projectId, name.trim(), status?.toUpperCase() || null,
      Math.max(0, Math.min(100, parseInt(progress_pct, 10) || 0)), parseInt(sequence, 10) || 0,
-     start_date || null, due_date || null, req.user.id]
+     start_date || null, due_date || null, req.user.id, siteId, organizationId]
   );
+  if (!rows[0]) return res.status(404).json({ message: 'Project not found' });
   res.status(201).json({ task: rows[0] });
 });
 
 export const updateTask = asyncHandler(async (req, res) => {
   const id = parseInt(req.params.taskId, 10);
+  const siteId = requireSite(req, res); if (!siteId) return;
+  const { organizationId } = constructionScope(req);
   const fields = ['name', 'status', 'progress_pct', 'sequence', 'start_date', 'due_date'];
   const sets = [];
   const params = [];
@@ -161,9 +260,16 @@ export const updateTask = asyncHandler(async (req, res) => {
     sets.push(`${f} = $${params.length}`);
   }
   if (sets.length === 0) return res.status(400).json({ message: 'Nothing to update' });
-  params.push(id);
+  params.push(id, siteId, organizationId);
+  const idIndex = params.length - 2;
+  const siteIndex = params.length - 1;
+  const orgIndex = params.length;
   const { rows } = await pool.query(
-    `UPDATE construction_tasks SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length} RETURNING *`,
+    `UPDATE construction_tasks t SET ${sets.join(', ')}, updated_at = NOW()
+      FROM construction_projects p, sites s
+     WHERE t.id = $${idIndex} AND p.id = t.project_id AND p.site_id = $${siteIndex}
+       AND s.id = p.site_id AND s.organization_id = $${orgIndex}
+     RETURNING t.*`,
     params
   );
   if (!rows[0]) return res.status(404).json({ message: 'Task not found' });
@@ -172,7 +278,16 @@ export const updateTask = asyncHandler(async (req, res) => {
 
 export const deleteTask = asyncHandler(async (req, res) => {
   const id = parseInt(req.params.taskId, 10);
-  const del = await pool.query('DELETE FROM construction_tasks WHERE id = $1 RETURNING id', [id]);
+  const siteId = requireSite(req, res); if (!siteId) return;
+  const { organizationId } = constructionScope(req);
+  const del = await pool.query(
+    `DELETE FROM construction_tasks t
+      USING construction_projects p, sites s
+      WHERE t.id = $1 AND p.id = t.project_id AND p.site_id = $2
+        AND s.id = p.site_id AND s.organization_id = $3
+      RETURNING t.id`,
+    [id, siteId, organizationId],
+  );
   if (!del.rows[0]) return res.status(404).json({ message: 'Task not found' });
   res.json({ success: true });
 });
@@ -181,6 +296,8 @@ export const deleteTask = asyncHandler(async (req, res) => {
 
 export const createMaterialRequest = asyncHandler(async (req, res) => {
   const projectId = parseInt(req.params.id, 10);
+  const siteId = requireSite(req, res); if (!siteId) return;
+  const { organizationId } = constructionScope(req);
   const { task_id, note, items } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ message: 'At least one item is required' });
   const clean = items
@@ -191,9 +308,32 @@ export const createMaterialRequest = asyncHandler(async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const proj = await client.query('SELECT site_id FROM construction_projects WHERE id = $1', [projectId]);
+    const proj = await client.query(
+      `SELECT p.site_id FROM construction_projects p
+        JOIN sites s ON s.id = p.site_id AND s.organization_id = $3
+       WHERE p.id = $1 AND p.site_id = $2`,
+      [projectId, siteId, organizationId],
+    );
     if (!proj.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Project not found' }); }
-    const siteId = proj.rows[0].site_id;
+    if (task_id) {
+      const task = await client.query(
+        'SELECT 1 FROM construction_tasks WHERE id = $1 AND project_id = $2 LIMIT 1',
+        [parseInt(task_id, 10), projectId],
+      );
+      if (!task.rows[0]) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'Task does not belong to this project' });
+      }
+    }
+    const materialIds = [...new Set(clean.map((it) => it.material_id))];
+    const materialCheck = await client.query(
+      'SELECT id FROM inventory_materials WHERE site_id = $1 AND id = ANY($2::int[])',
+      [siteId, materialIds]
+    );
+    if (materialCheck.rows.length !== materialIds.length) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'One or more materials do not belong to this site' });
+    }
 
     const reqRow = await client.query(
       `INSERT INTO construction_material_requests (site_id, project_id, task_id, status, note, requested_by)
@@ -219,13 +359,16 @@ export const createMaterialRequest = asyncHandler(async (req, res) => {
 
 export const getMaterialRequest = asyncHandler(async (req, res) => {
   const id = parseInt(req.params.reqId, 10);
+  const siteId = requireSite(req, res); if (!siteId) return;
+  const { organizationId } = constructionScope(req);
   const { rows } = await pool.query(
     `SELECT r.*, u.name AS requested_by_name, p.name AS project_name
        FROM construction_material_requests r
-       LEFT JOIN users u ON u.id = r.requested_by
-       LEFT JOIN construction_projects p ON p.id = r.project_id
-      WHERE r.id = $1`,
-    [id]
+       LEFT JOIN users u ON u.id = r.requested_by AND u.organization_id = $3
+       JOIN construction_projects p ON p.id = r.project_id AND p.site_id = r.site_id
+       JOIN sites s ON s.id = r.site_id AND s.organization_id = $3
+      WHERE r.id = $1 AND r.site_id = $2`,
+    [id, siteId, organizationId]
   );
   const request = rows[0];
   if (!request) return res.status(404).json({ message: 'Request not found' });
@@ -234,9 +377,9 @@ export const getMaterialRequest = asyncHandler(async (req, res) => {
     `SELECT ri.*, m.name AS material_name, m.unit,
             GREATEST(ri.qty_requested - ri.qty_issued, 0) AS qty_shortage
        FROM construction_material_request_items ri
-       JOIN inventory_materials m ON m.id = ri.material_id
+       JOIN inventory_materials m ON m.id = ri.material_id AND m.site_id = $2
       WHERE ri.request_id = $1 ORDER BY ri.id`,
-    [id]
+    [id, siteId]
   );
   // Attach live available stock per item so the UI can show issue-now vs shortage.
   const withStock = await Promise.all(items.rows.map(async (it) => {
@@ -253,10 +396,18 @@ export const getMaterialRequest = asyncHandler(async (req, res) => {
  */
 export const issueMaterialRequest = asyncHandler(async (req, res) => {
   const id = parseInt(req.params.reqId, 10);
+  const siteId = requireSite(req, res); if (!siteId) return;
+  const { organizationId } = constructionScope(req);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const r = await client.query('SELECT * FROM construction_material_requests WHERE id = $1 FOR UPDATE', [id]);
+    const r = await client.query(
+      `SELECT r.* FROM construction_material_requests r
+        JOIN sites s ON s.id = r.site_id AND s.organization_id = $3
+       WHERE r.id = $1 AND r.site_id = $2
+       FOR UPDATE OF r`,
+      [id, siteId, organizationId],
+    );
     const request = r.rows[0];
     if (!request) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Request not found' }); }
     if (request.status === 'CANCELLED') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'Request is cancelled' }); }
@@ -266,10 +417,15 @@ export const issueMaterialRequest = asyncHandler(async (req, res) => {
     for (const it of itemsRes.rows) {
       const remaining = Number(it.qty_requested) - Number(it.qty_issued);
       if (remaining <= 0) continue;
+      const materialRow = await client.query('SELECT id FROM inventory_materials WHERE id = $1 AND site_id = $2 FOR UPDATE', [it.material_id, request.site_id]);
+      if (!materialRow.rows[0]) continue;
       const stock = await inventoryModel.stockFor(it.material_id, client); // sees this txn's inserts
       const toIssue = Math.min(remaining, Math.max(0, stock.available));
       if (toIssue <= 0) continue;
-      const mat = await client.query('SELECT rate FROM inventory_materials WHERE id = $1', [it.material_id]);
+      const mat = await client.query(
+        'SELECT rate FROM inventory_materials WHERE id = $1 AND site_id = $2',
+        [it.material_id, siteId],
+      );
       await inventoryModel.insertMovement({
         site_id: request.site_id, material_id: it.material_id, movement_type: 'ISSUE',
         qty: toIssue, rate: parseFloat(mat.rows[0]?.rate) || 0,
@@ -283,7 +439,10 @@ export const issueMaterialRequest = asyncHandler(async (req, res) => {
 
     const fresh = await client.query('SELECT qty_requested, qty_issued FROM construction_material_request_items WHERE request_id = $1', [id]);
     const status = deriveRequestStatus(fresh.rows);
-    await client.query('UPDATE construction_material_requests SET status = $1, updated_at = NOW() WHERE id = $2', [status, id]);
+    await client.query(
+      'UPDATE construction_material_requests SET status = $1, updated_at = NOW() WHERE id = $2 AND site_id = $3',
+      [status, id, siteId],
+    );
 
     await client.query('COMMIT');
     const shortages = fresh.rows
@@ -300,15 +459,24 @@ export const issueMaterialRequest = asyncHandler(async (req, res) => {
 
 export const updateMaterialRequest = asyncHandler(async (req, res) => {
   const id = parseInt(req.params.reqId, 10);
+  const siteId = requireSite(req, res); if (!siteId) return;
+  const { organizationId } = constructionScope(req);
   const { status, note } = req.body;
   const sets = [];
   const params = [];
   if (status !== undefined) { params.push(String(status).toUpperCase()); sets.push(`status = $${params.length}`); }
   if (note !== undefined) { params.push(note?.trim() || null); sets.push(`note = $${params.length}`); }
   if (sets.length === 0) return res.status(400).json({ message: 'Nothing to update' });
-  params.push(id);
+  params.push(id, siteId, organizationId);
+  const idIndex = params.length - 2;
+  const siteIndex = params.length - 1;
+  const orgIndex = params.length;
   const { rows } = await pool.query(
-    `UPDATE construction_material_requests SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length} RETURNING *`,
+    `UPDATE construction_material_requests r SET ${sets.join(', ')}, updated_at = NOW()
+      FROM sites s
+     WHERE r.id = $${idIndex} AND r.site_id = $${siteIndex}
+       AND s.id = r.site_id AND s.organization_id = $${orgIndex}
+     RETURNING r.*`,
     params
   );
   if (!rows[0]) return res.status(404).json({ message: 'Request not found' });
@@ -319,13 +487,26 @@ export const updateMaterialRequest = asyncHandler(async (req, res) => {
 
 export const consumeMaterial = asyncHandler(async (req, res) => {
   const projectId = parseInt(req.params.id, 10);
+  const siteId = requireSite(req, res); if (!siteId) return;
+  const { organizationId } = constructionScope(req);
   const { material_id, qty, task_id, note, rate } = req.body;
   const q = Number(qty);
   if (!material_id || !Number.isFinite(q) || q <= 0) return res.status(400).json({ message: 'material_id and a positive qty are required' });
 
-  const proj = await pool.query('SELECT site_id FROM construction_projects WHERE id = $1', [projectId]);
+  const proj = await pool.query(
+    `SELECT p.site_id FROM construction_projects p
+      JOIN sites s ON s.id = p.site_id AND s.organization_id = $3
+     WHERE p.id = $1 AND p.site_id = $2`,
+    [projectId, siteId, organizationId],
+  );
   if (!proj.rows[0]) return res.status(404).json({ message: 'Project not found' });
-  const siteId = proj.rows[0].site_id;
+  if (task_id) {
+    const task = await pool.query(
+      'SELECT 1 FROM construction_tasks WHERE id = $1 AND project_id = $2 LIMIT 1',
+      [parseInt(task_id, 10), projectId],
+    );
+    if (!task.rows[0]) return res.status(400).json({ message: 'Task does not belong to this project' });
+  }
 
   const mat = await pool.query('SELECT rate FROM inventory_materials WHERE id = $1 AND site_id = $2', [material_id, siteId]);
   if (!mat.rows[0]) return res.status(404).json({ message: 'Material not found for this site' });
@@ -346,18 +527,33 @@ export const consumeMaterial = asyncHandler(async (req, res) => {
 
 export const constructionSummary = asyncHandler(async (req, res) => {
   const siteId = requireSite(req, res); if (!siteId) return;
+  const { organizationId } = constructionScope(req);
   const { rows } = await pool.query(
     `SELECT
-       COUNT(*) FILTER (WHERE status = 'ACTIVE')::int AS active_projects,
-       COUNT(*) FILTER (WHERE status = 'DELAYED' OR (target_end_date IS NOT NULL AND target_end_date < CURRENT_DATE AND status <> 'COMPLETED'))::int AS delayed_projects,
-       COALESCE(ROUND(AVG(progress_pct) FILTER (WHERE status IN ('ACTIVE','DELAYED'))), 0)::int AS avg_progress,
-       COALESCE(SUM(budget), 0) AS total_budget
-     FROM construction_projects WHERE site_id = $1`,
-    [siteId]
+       COUNT(*) FILTER (WHERE p.status = 'ACTIVE')::int AS active_projects,
+       COUNT(*) FILTER (WHERE p.status = 'DELAYED' OR (p.target_end_date IS NOT NULL AND p.target_end_date < CURRENT_DATE AND p.status <> 'COMPLETED'))::int AS delayed_projects,
+       COALESCE(ROUND(AVG(p.progress_pct) FILTER (WHERE p.status IN ('ACTIVE','DELAYED'))), 0)::int AS avg_progress,
+       COALESCE(SUM(p.budget), 0) AS total_budget
+     FROM construction_projects p
+     JOIN sites s ON s.id = p.site_id AND s.organization_id = $2
+     WHERE p.site_id = $1`,
+    [siteId, organizationId]
   );
   const [pendingReq, actual] = await Promise.all([
-    pool.query(`SELECT COUNT(*)::int AS pending_material_requests FROM construction_material_requests WHERE site_id = $1 AND status IN ('REQUESTED','PARTIALLY_FULFILLED')`, [siteId]),
-    pool.query(`SELECT COALESCE(SUM(qty*rate),0) AS actual_cost FROM inventory_movements WHERE movement_type='CONSUMPTION' AND site_id = $1`, [siteId]),
+    pool.query(
+      `SELECT COUNT(*)::int AS pending_material_requests
+         FROM construction_material_requests r
+         JOIN sites s ON s.id = r.site_id AND s.organization_id = $2
+        WHERE r.site_id = $1 AND r.status IN ('REQUESTED','PARTIALLY_FULFILLED')`,
+      [siteId, organizationId],
+    ),
+    pool.query(
+      `SELECT COALESCE(SUM(im.qty*im.rate),0) AS actual_cost
+         FROM inventory_movements im
+         JOIN sites s ON s.id = im.site_id AND s.organization_id = $2
+        WHERE im.movement_type='CONSUMPTION' AND im.site_id = $1`,
+      [siteId, organizationId],
+    ),
   ]);
   res.json({
     summary: {

@@ -9,31 +9,38 @@ import {
 } from '../controllers/construction.controller.js';
 import authMiddleware from '../middlewares/auth.middleware.js';
 import requirePermission from '../middlewares/permission.middleware.js';
+import requireConstructionSiteAccess from '../middlewares/constructionSiteAccess.middleware.js';
+
+const accessByQuerySite = requireConstructionSiteAccess({ entity: 'site', source: 'query', key: 'site_id' });
+const accessByBodySite = requireConstructionSiteAccess({ entity: 'site', source: 'body', key: 'site_id' });
+const accessByProject = requireConstructionSiteAccess({ entity: 'project', source: 'params', key: 'id' });
+const accessByTask = requireConstructionSiteAccess({ entity: 'task', source: 'params', key: 'taskId' });
+const accessByRequest = requireConstructionSiteAccess({ entity: 'request', source: 'params', key: 'reqId' });
 
 router.use(authMiddleware);
 
 // Dashboard summary
-router.get('/summary', requirePermission('construction', 'read'), constructionSummary);
+router.get('/summary', accessByQuerySite, requirePermission('construction', 'read'), constructionSummary);
 
 // Projects
-router.get('/projects', requirePermission('construction', 'read'), listProjects);
-router.post('/projects', requirePermission('construction', 'write'), createProject);
-router.get('/projects/:id', requirePermission('construction', 'read'), getProject);
-router.put('/projects/:id', requirePermission('construction', 'update'), updateProject);
-router.delete('/projects/:id', requirePermission('construction', 'delete'), deleteProject);
+router.get('/projects', accessByQuerySite, requirePermission('construction', 'read'), listProjects);
+router.post('/projects', accessByBodySite, requirePermission('construction', 'write'), createProject);
+router.get('/projects/:id', accessByProject, requirePermission('construction', 'read'), getProject);
+router.put('/projects/:id', accessByProject, requirePermission('construction', 'update'), updateProject);
+router.delete('/projects/:id', accessByProject, requirePermission('construction', 'delete'), deleteProject);
 
 // Tasks (nested create, flat update/delete)
-router.post('/projects/:id/tasks', requirePermission('construction', 'write'), createTask);
-router.put('/tasks/:taskId', requirePermission('construction', 'update'), updateTask);
-router.delete('/tasks/:taskId', requirePermission('construction', 'delete'), deleteTask);
+router.post('/projects/:id/tasks', accessByProject, requirePermission('construction', 'write'), createTask);
+router.put('/tasks/:taskId', accessByTask, requirePermission('construction', 'update'), updateTask);
+router.delete('/tasks/:taskId', accessByTask, requirePermission('construction', 'delete'), deleteTask);
 
 // Material requests + issue flow
-router.post('/projects/:id/material-requests', requirePermission('construction', 'write'), createMaterialRequest);
-router.get('/material-requests/:reqId', requirePermission('construction', 'read'), getMaterialRequest);
-router.put('/material-requests/:reqId', requirePermission('construction', 'update'), updateMaterialRequest);
-router.post('/material-requests/:reqId/issue', requirePermission('construction', 'write'), issueMaterialRequest);
+router.post('/projects/:id/material-requests', accessByProject, requirePermission('construction', 'write'), createMaterialRequest);
+router.get('/material-requests/:reqId', accessByRequest, requirePermission('construction', 'read'), getMaterialRequest);
+router.put('/material-requests/:reqId', accessByRequest, requirePermission('construction', 'update'), updateMaterialRequest);
+router.post('/material-requests/:reqId/issue', accessByRequest, requirePermission('construction', 'write'), issueMaterialRequest);
 
 // Consumption (draws stock, feeds actual cost)
-router.post('/projects/:id/consume', requirePermission('construction', 'write'), consumeMaterial);
+router.post('/projects/:id/consume', accessByProject, requirePermission('construction', 'write'), consumeMaterial);
 
 export default router;

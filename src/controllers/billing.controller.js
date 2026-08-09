@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import Razorpay from 'razorpay';
 import asyncHandler from '../utils/asyncHandler.js';
 import pool from '../config/db.js';
+import { sendPlanPurchaseEmail, sendOwnerNotificationEmail } from '../utils/mailer.js';
 
 const PERIOD_DAYS = { monthly: 30, annual: 365 };
 const ANNUAL_DISCOUNT_PERCENT = 15;
@@ -25,7 +26,9 @@ const razorpay = () => {
 
 /** GET /billing/plans — public (signup page shows pricing before login) */
 export const listPlans = asyncHandler(async (req, res) => {
-  const { rows } = await pool.query('SELECT id, code, name, price_inr, site_limit FROM plans ORDER BY price_inr ASC');
+  const { rows } = await pool.query(
+    'SELECT id, code, name, price_inr, site_limit, features, max_users FROM plans WHERE is_active = true ORDER BY price_inr ASC'
+  );
   res.json({ plans: rows });
 });
 
@@ -150,6 +153,23 @@ export const verifyPayment = asyncHandler(async (req, res) => {
      RETURNING subscriptions.*`,
     [razorpay_payment_id, pending[0].id, orgId, PERIOD_DAYS[billingCycle]]
   );
+
+  const { rows: [recipient] } = await pool.query(
+    `SELECT u.name, u.email, o.id AS org_id, o.name AS org_name, o.subdomain AS org_subdomain, p.name AS plan_name
+     FROM users u JOIN organizations o ON o.id = u.organization_id
+     JOIN plans p ON p.id = $2 WHERE u.id = $1`,
+    [req.user.id, activated[0].plan_id]
+  );
+  if (recipient) {
+    sendPlanPurchaseEmail({
+      to: recipient.email, name: recipient.name, companyName: recipient.org_name,
+      planName: recipient.plan_name, amount: activated[0].amount_inr, orgSubdomain: recipient.org_subdomain,
+    }).catch((err) => console.error('[mailer] purchase email failed:', err.message));
+    sendOwnerNotificationEmail({
+      kind: 'purchase', companyName: recipient.org_name, contactName: recipient.name,
+      contactEmail: recipient.email, planName: recipient.plan_name, amount: activated[0].amount_inr, orgId: recipient.org_id,
+    }).catch((err) => console.error('[mailer] owner notify failed:', err.message));
+  }
 
   res.json({ message: 'Subscription activated', subscription: activated[0] });
 });

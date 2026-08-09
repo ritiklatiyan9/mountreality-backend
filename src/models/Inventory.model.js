@@ -27,7 +27,7 @@ export const inventoryModel = {
   /** Materials for a site, each with live on_hand / reserved / available / value. */
   async listMaterials(siteId, { search, lowStock } = {}) {
     const params = [siteId];
-    let where = 'WHERE m.site_id = $1';
+    let where = 'WHERE m.site_id = $1 AND m.is_active = TRUE';
     if (search) {
       params.push(`%${search}%`);
       where += ` AND (m.name ILIKE $${params.length} OR m.code ILIKE $${params.length} OR m.category ILIKE $${params.length})`;
@@ -114,7 +114,7 @@ export const inventoryModel = {
            COALESCE(s.on_hand, 0) AS on_hand
          FROM inventory_materials m
          LEFT JOIN (${STOCK_AGG}) s ON s.material_id = m.id
-         WHERE m.site_id = $1
+           WHERE m.site_id = $1 AND m.is_active = TRUE
        )
        SELECT
          COUNT(*)::int AS material_count,

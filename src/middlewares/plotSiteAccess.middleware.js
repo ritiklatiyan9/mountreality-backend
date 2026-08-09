@@ -1,7 +1,5 @@
 import pool from '../config/db.js';
-import { siteInOrg } from '../utils/orgScope.js';
-
-const ADMIN_ROLES = new Set(['admin', 'super_admin']);
+import { enforceEntitySiteAccess } from '../utils/siteAccessPolicy.js';
 
 const SITE_LOOKUPS = Object.freeze({
   site: null,
@@ -43,24 +41,18 @@ const requirePlotSiteAccess = ({ entity, source, key }) => {
         if (!rows[0]) return next();
         siteId = parsePositiveId(rows[0].site_id);
       }
-      if (!siteId) return next();
-
-      // Admins see every site of their own organization — never another tenant's.
-      if (ADMIN_ROLES.has(req.user?.role)) {
-        if (!(await siteInOrg(siteId, req.user.organization_id))) {
-          return res.status(403).json({ message: 'Access denied to this site' });
-        }
-        req.plotSiteId = siteId;
-        return next();
+      if (!siteId) {
+        return res.status(409).json({ message: 'This record is not linked to a site' });
       }
 
-      const { rows } = await pool.query(
-        'SELECT 1 FROM user_sites WHERE user_id = $1 AND site_id = $2 LIMIT 1',
-        [req.user.id, siteId]
-      );
-      if (!rows[0]) return res.status(403).json({ message: 'Access denied to this site' });
-
-      req.plotSiteId = siteId;
+      const allowed = await enforceEntitySiteAccess({
+        req,
+        res,
+        siteId,
+        module: 'plot_payments',
+        contextProperty: 'plotSiteId',
+      });
+      if (!allowed) return;
       return next();
     } catch (error) {
       return next(error);

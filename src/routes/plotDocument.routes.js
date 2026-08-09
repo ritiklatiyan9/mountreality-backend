@@ -8,6 +8,8 @@ import {
 import authMiddleware from '../middlewares/auth.middleware.js';
 import requireRole from '../middlewares/role.middleware.js';
 import requirePermission from '../middlewares/permission.middleware.js';
+import pool from '../config/db.js';
+import { enforceEntitySiteAccess, parseSiteId } from '../utils/siteAccessPolicy.js';
 
 const router = express.Router();
 const MIME_BY_EXTENSION = new Map([
@@ -47,12 +49,63 @@ const receivePlotDocument = (req, res, next) => {
   });
 };
 
+const PLOT_DOCUMENT_SITE_LOOKUPS = Object.freeze({
+  plot: 'SELECT site_id FROM plots WHERE id = $1 LIMIT 1',
+  document: `SELECT COALESCE(d.site_id, p.site_id, k.site_id, b.site_id) AS site_id
+               FROM documents d
+               LEFT JOIN plots p ON p.id = d.plot_id
+               LEFT JOIN kyc_cases k ON k.id = d.kyc_case_id
+               LEFT JOIN bookings b ON b.id = k.booking_id
+              WHERE d.id = $1
+                AND COALESCE(d.uploaded_source, 'BOOKING') NOT IN ('DMS', 'PLOT_REGISTRY')
+                AND UPPER(COALESCE(d.category, '')) NOT IN ('REGISTRY', 'NOC')
+                AND (d.plot_id IS NOT NULL OR b.plot_id IS NOT NULL)
+              LIMIT 1`,
+});
+
+const requirePlotDocumentSite = ({ entity, source, key }) => async (req, res, next) => {
+  try {
+    const entityId = parseSiteId(req[source]?.[key]);
+    if (!entityId) return res.status(400).json({ message: `A valid ${key} is required` });
+
+    let siteId = entityId;
+    if (entity !== 'site') {
+      const lookup = PLOT_DOCUMENT_SITE_LOOKUPS[entity];
+      if (!lookup) throw new Error(`Unsupported plot-document access entity: ${entity}`);
+      const { rows } = await pool.query(lookup, [entityId]);
+      // Preserve the controller's endpoint-specific 404 response.
+      if (!rows[0]) return next();
+      siteId = parseSiteId(rows[0].site_id);
+      if (!siteId) {
+        return res.status(409).json({ message: 'This record is not linked to a Site' });
+      }
+    }
+
+    const allowed = await enforceEntitySiteAccess({
+      req,
+      res,
+      siteId,
+      module: 'plot_payments',
+      contextProperty: 'plotDocumentSiteId',
+    });
+    if (!allowed) return;
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const accessByQuerySite = requirePlotDocumentSite({ entity: 'site', source: 'query', key: 'site_id' });
+const accessByPlot = requirePlotDocumentSite({ entity: 'plot', source: 'params', key: 'plotId' });
+const accessByDocument = requirePlotDocumentSite({ entity: 'document', source: 'params', key: 'docId' });
+
 // All plot-document routes require auth. Access reuses the plot_payments permission.
 router.use(authMiddleware);
 
-router.get('/', requireRole('admin', 'sub_admin'), requirePermission('plot_payments', 'read'), listPlotsWithDocs);                          // ?site_id=X
-router.get('/:plotId', requireRole('admin', 'sub_admin'), requirePermission('plot_payments', 'read'), getPlotDocuments);
-router.post('/:plotId', requireRole('admin', 'sub_admin'), requirePermission('plot_payments', 'write'), receivePlotDocument, uploadPlotDocument);
-router.delete('/doc/:docId', requireRole('admin', 'sub_admin'), requirePermission('plot_payments', 'delete'), deletePlotDocument);
+router.get('/', requireRole('admin', 'sub_admin'), accessByQuerySite, requirePermission('plot_payments', 'read'), listPlotsWithDocs);                          // ?site_id=X
+router.get('/:plotId', requireRole('admin', 'sub_admin'), accessByPlot, requirePermission('plot_payments', 'read'), getPlotDocuments);
+// Resolve authorization before Multer buffers an uploaded file.
+router.post('/:plotId', requireRole('admin', 'sub_admin'), accessByPlot, requirePermission('plot_payments', 'write'), receivePlotDocument, uploadPlotDocument);
+router.delete('/doc/:docId', requireRole('admin', 'sub_admin'), accessByDocument, requirePermission('plot_payments', 'delete'), deletePlotDocument);
 
 export default router;

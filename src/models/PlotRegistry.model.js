@@ -71,9 +71,21 @@ class PlotRegistryModel extends MasterModel {
         COALESCE(docs.registry_doc_count, 0) AS registry_doc_count,
         ${handoverSelect}
         p.team AS plot_team,
-        p.booking_by AS agent_name
+        p.booking_by AS agent_name,
+        COALESCE(m.full_name,pr.customer_name) AS lifecycle_customer_name,
+        m.phone AS customer_phone,m.photo AS customer_photo,
+        rp.name AS project_name,rpp.name AS phase_name,
+        ba.status AS agreement_lifecycle_status,ba.execution_date AS agreement_execution_date,
+        pos.id AS possession_id,pos.status AS possession_lifecycle_status,
+        pos.scheduled_at AS possession_scheduled_at
       FROM plot_registries pr
       LEFT JOIN plots p ON pr.plot_id = p.id
+      LEFT JOIN bookings b ON b.id=pr.booking_id AND b.site_id=pr.site_id
+      LEFT JOIN members m ON m.id=COALESCE(pr.allottee_member_id,b.client_member_id) AND m.site_id=pr.site_id
+      LEFT JOIN rera_projects rp ON rp.id=pr.rera_project_id AND rp.site_id=pr.site_id AND rp.deleted_at IS NULL
+      LEFT JOIN rera_project_phases rpp ON rpp.id=pr.rera_project_phase_id AND rpp.site_id=pr.site_id AND rpp.deleted_at IS NULL
+      LEFT JOIN booking_agreements ba ON ba.id=pr.agreement_id
+      LEFT JOIN plot_possessions pos ON pos.registry_id=pr.id
       LEFT JOIN LATERAL (
         SELECT
           SUM(${REGISTRY_PAYMENT_AMOUNT_SQL})::numeric AS total_paid,
@@ -123,8 +135,20 @@ class PlotRegistryModel extends MasterModel {
     const query = `
       SELECT pr.*,
         COALESCE(agg.total_paid,    0) AS total_paid,
-        COALESCE(agg.payment_count, 0) AS payment_count
+        COALESCE(agg.payment_count, 0) AS payment_count,
+        COALESCE(m.full_name,pr.customer_name) AS lifecycle_customer_name,
+        m.phone AS customer_phone,m.photo AS customer_photo,
+        rp.name AS project_name,rpp.name AS phase_name,
+        ba.status AS agreement_lifecycle_status,ba.execution_date AS agreement_execution_date,
+        pos.id AS possession_id,pos.status AS possession_lifecycle_status,
+        pos.scheduled_at AS possession_scheduled_at,pos.possession_date
       FROM plot_registries pr
+      LEFT JOIN bookings b ON b.id=pr.booking_id AND b.site_id=pr.site_id
+      LEFT JOIN members m ON m.id=COALESCE(pr.allottee_member_id,b.client_member_id) AND m.site_id=pr.site_id
+      LEFT JOIN rera_projects rp ON rp.id=pr.rera_project_id AND rp.site_id=pr.site_id AND rp.deleted_at IS NULL
+      LEFT JOIN rera_project_phases rpp ON rpp.id=pr.rera_project_phase_id AND rpp.site_id=pr.site_id AND rpp.deleted_at IS NULL
+      LEFT JOIN booking_agreements ba ON ba.id=pr.agreement_id
+      LEFT JOIN plot_possessions pos ON pos.registry_id=pr.id
       LEFT JOIN LATERAL (
         SELECT
           SUM(${REGISTRY_PAYMENT_AMOUNT_SQL})::numeric AS total_paid,

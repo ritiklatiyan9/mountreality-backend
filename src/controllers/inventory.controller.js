@@ -31,12 +31,16 @@ export const createMaterial = asyncHandler(async (req, res) => {
   const siteId = requireSite(req, res); if (!siteId) return;
   const { name, code, unit, category, min_stock, rate, notes } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ message: 'Material name is required' });
+  const minStock = num(min_stock);
+  const materialRate = num(rate);
+  if (minStock !== null && (!Number.isFinite(minStock) || minStock < 0)) return res.status(400).json({ message: 'min_stock cannot be negative' });
+  if (materialRate !== null && (!Number.isFinite(materialRate) || materialRate < 0)) return res.status(400).json({ message: 'rate cannot be negative' });
   try {
     const { rows } = await pool.query(
       `INSERT INTO inventory_materials (site_id, name, code, unit, category, min_stock, rate, notes, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
       [siteId, name.trim().toUpperCase(), code?.trim() || null, (unit?.trim() || 'NOS').toUpperCase(),
-       category?.trim() || null, num(min_stock) || 0, num(rate) || 0, notes?.trim() || null, req.user.id]
+       category?.trim() || null, minStock || 0, materialRate || 0, notes?.trim() || null, req.user.id]
     );
     res.status(201).json({ material: rows[0] });
   } catch (err) {
@@ -47,6 +51,7 @@ export const createMaterial = asyncHandler(async (req, res) => {
 
 export const updateMaterial = asyncHandler(async (req, res) => {
   const id = parseInt(req.params.id, 10);
+  const siteId = requireSite(req, res); if (!siteId) return;
   const fields = ['name', 'code', 'unit', 'category', 'min_stock', 'rate', 'notes', 'is_active'];
   const sets = [];
   const params = [];
@@ -54,7 +59,10 @@ export const updateMaterial = asyncHandler(async (req, res) => {
     if (req.body[f] === undefined) continue;
     let v = req.body[f];
     if (f === 'name' || f === 'unit') v = String(v).trim().toUpperCase();
-    else if (f === 'min_stock' || f === 'rate') v = num(v) || 0;
+    else if (f === 'min_stock' || f === 'rate') {
+      v = num(v);
+      if (v === null || !Number.isFinite(v) || v < 0) return res.status(400).json({ message: `${f} cannot be negative` });
+    }
     else if (f === 'is_active') v = Boolean(v);
     else v = v === null ? null : String(v).trim() || null;
     params.push(v);
@@ -63,8 +71,9 @@ export const updateMaterial = asyncHandler(async (req, res) => {
   if (sets.length === 0) return res.status(400).json({ message: 'Nothing to update' });
   params.push(id);
   const { rows } = await pool.query(
-    `UPDATE inventory_materials SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length} RETURNING *`,
-    params
+    `UPDATE inventory_materials SET ${sets.join(', ')}, updated_at = NOW()
+       WHERE id = $${params.length} AND site_id = $${params.length + 1} RETURNING *`,
+    [...params, siteId]
   );
   if (!rows[0]) return res.status(404).json({ message: 'Material not found' });
   res.json({ material: rows[0] });
@@ -72,16 +81,20 @@ export const updateMaterial = asyncHandler(async (req, res) => {
 
 export const deleteMaterial = asyncHandler(async (req, res) => {
   const id = parseInt(req.params.id, 10);
-  const { rows } = await pool.query('SELECT 1 FROM inventory_movements WHERE material_id = $1 LIMIT 1', [id]);
+  const siteId = requireSite(req, res); if (!siteId) return;
+  const material = await pool.query('SELECT id FROM inventory_materials WHERE id = $1 AND site_id = $2', [id, siteId]);
+  if (!material.rows[0]) return res.status(404).json({ message: 'Material not found' });
+  const { rows } = await pool.query('SELECT 1 FROM inventory_movements WHERE material_id = $1 AND site_id = $2 LIMIT 1', [id, siteId]);
   if (rows.length) return res.status(409).json({ message: 'Cannot delete — this material has stock movements. Deactivate it instead.' });
-  const del = await pool.query('DELETE FROM inventory_materials WHERE id = $1 RETURNING id', [id]);
+  const del = await pool.query('DELETE FROM inventory_materials WHERE id = $1 AND site_id = $2 RETURNING id', [id, siteId]);
   if (!del.rows[0]) return res.status(404).json({ message: 'Material not found' });
   res.json({ success: true });
 });
 
 export const getMaterial = asyncHandler(async (req, res) => {
   const id = parseInt(req.params.id, 10);
-  const { rows } = await pool.query('SELECT * FROM inventory_materials WHERE id = $1', [id]);
+  const siteId = requireSite(req, res); if (!siteId) return;
+  const { rows } = await pool.query('SELECT * FROM inventory_materials WHERE id = $1 AND site_id = $2', [id, siteId]);
   if (!rows[0]) return res.status(404).json({ message: 'Material not found' });
   const stock = await inventoryModel.stockFor(id);
   const movements = await inventoryModel.listMovements(rows[0].site_id, { materialId: id, limit: 50 });
@@ -109,23 +122,42 @@ export const createMovement = asyncHandler(async (req, res) => {
   if (!Number.isFinite(q) || q === 0) return res.status(400).json({ message: 'qty must be a non-zero number' });
   // Only ADJUSTMENT may be negative; everything else is a positive magnitude.
   if (type !== 'ADJUSTMENT' && q < 0) return res.status(400).json({ message: 'qty must be positive for this movement type' });
-
-  const mat = await pool.query('SELECT id, rate FROM inventory_materials WHERE id = $1 AND site_id = $2', [material_id, siteId]);
-  if (!mat.rows[0]) return res.status(404).json({ message: 'Material not found for this site' });
-
-  // Guard stock-reducing movements against going negative.
-  if (REDUCING.has(type) || type === 'RESERVE') {
-    const { on_hand, available } = await inventoryModel.stockFor(material_id);
-    const cap = type === 'RESERVE' ? available : on_hand;
-    if (q > cap) return res.status(400).json({ message: `Only ${cap} in stock — cannot ${type.toLowerCase()} ${q}` });
+  if (type === 'RECEIPT' && String(ref_type || '').toUpperCase() === 'VENDOR_ORDER') {
+    return res.status(400).json({ message: 'Vendor-order receipts must use the procurement receive workflow' });
   }
 
-  const movement = await inventoryModel.insertMovement({
-    site_id: siteId, material_id, movement_type: type, qty: q,
-    rate: rate !== undefined ? Number(rate) : parseFloat(mat.rows[0].rate) || 0,
-    project_id, task_id, ref_type, ref_id, note, created_by: req.user.id,
-  });
-  res.status(201).json({ movement });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Lock the material row before reading the ledger. This serializes all
+    // stock-reducing writes for one material and prevents negative stock when
+    // two issue/consume requests arrive at the same time.
+    const mat = await client.query(
+      'SELECT id, rate FROM inventory_materials WHERE id = $1 AND site_id = $2 FOR UPDATE',
+      [material_id, siteId]
+    );
+    if (!mat.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Material not found for this site' }); }
+
+    if (REDUCING.has(type) || type === 'RESERVE') {
+      const { on_hand, available } = await inventoryModel.stockFor(material_id, client);
+      const cap = type === 'RESERVE' ? available : on_hand;
+      if (q > cap) { await client.query('ROLLBACK'); return res.status(400).json({ message: `Only ${cap} in stock — cannot ${type.toLowerCase()} ${q}` }); }
+    }
+
+    const movementRate = rate === undefined || rate === '' ? parseFloat(mat.rows[0].rate) || 0 : Number(rate);
+    if (!Number.isFinite(movementRate) || movementRate < 0) { await client.query('ROLLBACK'); return res.status(400).json({ message: 'rate must be a non-negative number' }); }
+    const movement = await inventoryModel.insertMovement({
+      site_id: siteId, material_id, movement_type: type, qty: q,
+      rate: movementRate, project_id, task_id, ref_type, ref_id, note, created_by: req.user.id,
+    }, client);
+    await client.query('COMMIT');
+    res.status(201).json({ movement });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 });
 
 // ── Vendor order → stock (procurement link) ─────────────────

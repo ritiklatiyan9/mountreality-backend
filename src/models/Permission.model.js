@@ -34,6 +34,14 @@ export const ALL_MODULES = Object.freeze([
     'legal',
     'compliance_templates',
     'compliance_settings',
+    // Site operating behavior and the Phase 1 regulatory foundation. These
+    // stable keys are intentionally separate from the legacy compliance and
+    // construction domains.
+    'operating_profile',
+    'rera_projects',
+    'rera_approvals',
+    'rera_evidence',
+    'rera_rulesets',
 ]);
 
 const READ_ONLY_MODULES = new Set(['dashboard', 'balance_sheet', 'reports', 'settings', 'finance_forecast']);
@@ -53,6 +61,11 @@ const RESTRICTED_MODULES = new Set([
     'legal',
     'compliance_templates',
     'compliance_settings',
+    'operating_profile',
+    'rera_projects',
+    'rera_approvals',
+    'rera_evidence',
+    'rera_rulesets',
 ]);
 
 const getDefaultPermissions = (module) => {

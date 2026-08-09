@@ -7,6 +7,8 @@ import siteModel from '../models/Site.model.js';
 import permissionModel from '../models/Permission.model.js';
 import pool from '../config/db.js';
 import { generateUniqueSubdomain } from '../utils/subdomain.js';
+import { loadKyc, presentKyc } from './orgKyc.controller.js';
+import { sendRegistrationEmail, sendOwnerNotificationEmail } from '../utils/mailer.js';
 
 /**
  * Everything a successful sign-in returns (tokens + sites + permissions + session).
@@ -55,7 +57,11 @@ const fetchOrganization = async (organizationId) => {
     'SELECT id, name, subdomain FROM organizations WHERE id = $1',
     [organizationId]
   );
-  return rows[0] || null;
+  if (!rows[0]) return null;
+  // Only the two flags the shell needs; the full record comes from
+  // GET /org/kyc when the timeline or the wizard actually opens.
+  const kyc = presentKyc(await loadKyc(organizationId));
+  return { ...rows[0], kyc_status: kyc.status, kyc_complete: kyc.is_complete };
 };
 
 /**
@@ -125,17 +131,20 @@ export const signup = asyncHandler(async (req, res) => {
 
   const client = await pool.connect();
   let user;
+  let subdomain;
+  let orgId;
   try {
     await client.query('BEGIN');
-    const subdomain = await generateUniqueSubdomain(client, company_name);
+    subdomain = await generateUniqueSubdomain(client, company_name);
     const orgResult = await client.query(
       'INSERT INTO organizations (name, subdomain) VALUES ($1, $2) RETURNING *',
       [String(company_name).trim(), subdomain]
     );
+    orgId = orgResult.rows[0].id;
     const userResult = await client.query(
       `INSERT INTO users (name, email, password, phone, role, organization_id, is_active, token_version)
        VALUES ($1, $2, $3, $4, 'super_admin', $5, true, 1) RETURNING *`,
-      [name, email, hashedPassword, phone || null, orgResult.rows[0].id]
+      [name, email, hashedPassword, phone || null, orgId]
     );
     user = userResult.rows[0];
     await client.query('COMMIT');
@@ -145,6 +154,12 @@ export const signup = asyncHandler(async (req, res) => {
   } finally {
     client.release();
   }
+
+  sendRegistrationEmail({ to: email, name, companyName: company_name, orgSubdomain: subdomain })
+    .catch((err) => console.error('[mailer] registration email failed:', err.message));
+  sendOwnerNotificationEmail({
+    kind: 'registration', companyName: company_name, contactName: name, contactEmail: email, contactPhone: phone, orgId,
+  }).catch((err) => console.error('[mailer] owner notify failed:', err.message));
 
   res.status(201).json(await buildLoginPayload(user, req));
 });
@@ -319,7 +334,7 @@ export const updateProfile = asyncHandler(async (req, res) => {
   if (phone !== undefined) updateData.phone = phone;
   if (password) updateData.password = await hashPassword(password);
   if (req.file) {
-    const photoUrl = await uploadSingle(req.file, 'cloudinary');
+    const photoUrl = await uploadSingle(req.file, 's3', { folder: 'profile-photos' });
     updateData.photo = photoUrl;
   }
 

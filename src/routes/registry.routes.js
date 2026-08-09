@@ -38,6 +38,7 @@ const accessByParamPayment = requireRegistrySiteAccess({ entity: 'payment', sour
 const accessByQueryPlot = requireRegistrySiteAccess({ entity: 'plot', source: 'query', key: 'plot_id' });
 const accessByBodyPlot = requireRegistrySiteAccess({ entity: 'plot', source: 'body', key: 'plot_id' });
 const accessByParamDocumentPlot = requireRegistrySiteAccess({ entity: 'plot', source: 'params', key: 'plotId' });
+const accessByParamDocument = requireRegistrySiteAccess({ entity: 'document', source: 'params', key: 'docId' });
 const accessByBodySourcePlotPayment = requireRegistrySiteAccess({ entity: 'plotPayment', source: 'body', key: 'source_plot_payment_id' });
 
 const registryDocumentUpload = multer({
@@ -81,7 +82,7 @@ router.get('/documents/plots', requireRole('admin', 'sub_admin'), requirePermiss
 router.get('/documents/plot/:plotId', requireRole('admin', 'sub_admin'), requirePermission('plot_registry', 'read'), accessByParamDocumentPlot, getRegistryDocuments);
 // Resolve site access before Multer buffers the file in memory.
 router.post('/documents/plot/:plotId', requireRole('admin', 'sub_admin'), requirePermission('plot_registry', 'write'), accessByParamDocumentPlot, receiveRegistryDocument, bustRegistryCache, uploadRegistryDocument);
-router.delete('/documents/:docId', requireRole('admin', 'sub_admin'), requirePermission('plot_registry', 'delete'), bustRegistryCache, deleteRegistryDocument);
+router.delete('/documents/:docId', requireRole('admin', 'sub_admin'), requirePermission('plot_registry', 'delete'), accessByParamDocument, bustRegistryCache, deleteRegistryDocument);
 
 // ── Registry Payment endpoints (BEFORE /:id to avoid route conflict) ──
 router.get('/payments/list', requireRole('admin', 'sub_admin'), requirePermission('plot_registry', 'read'), accessByQueryRegistry, registryReadCache, listRegistryPayments);                        // ?registry_id=X

@@ -5,12 +5,47 @@ import pool from '../config/db.js';
 import { buildVerifyUrl, ReceiptType } from '../utils/receiptToken.js';
 import { classifyPaymentMode } from '../utils/paymentMode.js';
 
+const commissionScope = (req) => ({
+  siteId: Number.parseInt(req.commissionSiteId ?? req.siteContextId, 10),
+  organizationId: Number.parseInt(req.user?.organization_id, 10),
+});
+
+const memberBelongsToSite = async (memberId, siteId, organizationId) => {
+  if (!memberId) return true;
+  const { rows } = await pool.query(
+    `SELECT 1 FROM members m
+      JOIN sites s ON s.id = m.site_id AND s.organization_id = $3
+     WHERE m.id = $1 AND m.site_id = $2 LIMIT 1`,
+    [memberId, siteId, organizationId],
+  );
+  return Boolean(rows[0]);
+};
+
+const userBelongsToSite = async (userId, siteId, organizationId) => {
+  if (!userId) return true;
+  const { rows } = await pool.query(
+    `SELECT 1 FROM users u
+      WHERE u.id = $1 AND u.organization_id = $3 AND u.is_active = true
+        AND (u.role IN ('admin', 'super_admin') OR EXISTS (
+          SELECT 1 FROM user_sites us WHERE us.user_id = u.id AND us.site_id = $2
+        ))
+      LIMIT 1`,
+    [userId, siteId, organizationId],
+  );
+  return Boolean(rows[0]);
+};
+
 /**
  * Helper: Auto-update commission status based on payment completion.
  * Single round-trip — derives the new status from the live SUM(amount) and
  * UPDATEs in one statement. Previously this was SELECT + UPDATE (2 RTTs).
  */
-const autoUpdateCommissionStatus = async (commissionId, poolConn) => {
+const autoUpdateCommissionStatus = async (
+  commissionId,
+  siteId,
+  organizationId,
+  poolConn,
+) => {
   try {
     await poolConn.query(
       `UPDATE plot_commissions_v2 pc
@@ -24,11 +59,17 @@ const autoUpdateCommissionStatus = async (commissionId, poolConn) => {
           SELECT COALESCE(SUM(amount), 0) AS total_paid
           FROM plot_commission_payments
           WHERE plot_commission_id = $1
+            AND (site_id = $2 OR site_id IS NULL)
             AND LOWER(COALESCE(status, 'approved')) = 'approved'
             AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
         ) agg
-        WHERE pc.id = $1`,
-      [commissionId]
+        WHERE pc.id = $1
+          AND pc.site_id = $2
+          AND EXISTS (
+            SELECT 1 FROM sites s
+             WHERE s.id = pc.site_id AND s.organization_id = $3
+          )`,
+      [commissionId, siteId, organizationId]
     );
   } catch (err) {
     console.error('Error auto-updating commission status:', err);
@@ -45,13 +86,15 @@ export const getPlotsForCommission = asyncHandler(async (req, res) => {
   if (!site_id) return res.status(400).json({ message: 'site_id is required' });
 
   // Get active plots where there's no commission assigned yet, or you can allow multiple
+  const { siteId, organizationId } = commissionScope(req);
   const query = `
     SELECT p.id, p.plot_no, p.plot_size, p.plot_rate, p.buyer_name, p.block
     FROM plots p
+    JOIN sites s ON s.id = p.site_id AND s.organization_id = $2
     WHERE p.site_id = $1
     ORDER BY p.plot_no ASC
   `;
-  const result = await pool.query(query, [parseInt(site_id)]);
+  const result = await pool.query(query, [siteId, organizationId]);
   
   res.json({ plots: result.rows });
 });
@@ -69,40 +112,57 @@ export const createPlotCommission = asyncHandler(async (req, res) => {
 
   const plotIdInt = parseInt(plot_id);
   const agentIdInt = parseInt(agent_id);
+  const { siteId, organizationId } = commissionScope(req);
+  if (siteId !== parseInt(site_id)) {
+    return res.status(409).json({ message: 'Selected site does not match the requested site' });
+  }
 
   // Single-round-trip duplicate check: try the INSERT optimistically inside
   // a CTE and let it return 0 rows if the (plot_id, agent_id) pair already
   // exists. Saves one round-trip vs the previous SELECT-then-INSERT.
   const result = await pool.query(
-    `WITH existing AS (
-       SELECT 1 FROM plot_commissions_v2
-        WHERE plot_id = $1 AND agent_id = $2
+    `WITH eligible AS (
+       SELECT p.id AS plot_id, m.id AS agent_id
+         FROM plots p
+         JOIN sites s ON s.id = p.site_id AND s.organization_id = $7
+         JOIN members m ON m.id = $2 AND m.site_id = p.site_id
+        WHERE p.id = $1 AND p.site_id = $3
+     ),
+     existing AS (
+       SELECT 1 FROM plot_commissions_v2 pc
+        JOIN eligible e ON e.plot_id = pc.plot_id AND e.agent_id = pc.agent_id
         LIMIT 1
      ),
      ins AS (
        INSERT INTO plot_commissions_v2 (
          site_id, plot_id, agent_id, total_commission, remarks, status, created_by
        )
-       SELECT $3, $1, $2, $4, $5, 'Pending', $6
+       SELECT $3, e.plot_id, e.agent_id, $4, $5, 'Pending', $6
+       FROM eligible e
        WHERE NOT EXISTS (SELECT 1 FROM existing)
        RETURNING *
      )
      SELECT
        (SELECT row_to_json(ins) FROM ins) AS master,
-       EXISTS (SELECT 1 FROM existing) AS dup`,
+       EXISTS (SELECT 1 FROM existing) AS dup,
+       EXISTS (SELECT 1 FROM eligible) AS eligible`,
     [
       plotIdInt,
       agentIdInt,
-      parseInt(site_id),
+      siteId,
       parseFloat(total_commission),
       remarks ? remarks.trim() : null,
       req.user.id,
+      organizationId,
     ]
   );
 
   const row = result.rows[0];
   if (row.dup) {
     return res.status(409).json({ message: 'This agent already has a commission assigned for this plot' });
+  }
+  if (!row.eligible || !row.master) {
+    return res.status(400).json({ message: 'Plot or agent is not available for this Site' });
   }
   res.status(201).json({ master: row.master, message: 'Plot commission created successfully' });
 });
@@ -115,7 +175,12 @@ export const listPlotCommissions = asyncHandler(async (req, res) => {
   const { site_id } = req.query;
   if (!site_id) return res.status(400).json({ message: 'site_id is required' });
 
-  const commissions = await plotCommissionV2Model.findBySiteIdGroupedByPlot(parseInt(site_id), pool);
+  const { siteId, organizationId } = commissionScope(req);
+  const commissions = await plotCommissionV2Model.findBySiteIdGroupedByPlot(
+    siteId,
+    organizationId,
+    pool,
+  );
   res.json({ commissions });
 });
 
@@ -127,10 +192,11 @@ export const getPlotCommissionDetail = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const numId = parseInt(id);
   if (isNaN(numId)) return res.status(400).json({ message: 'Invalid commission ID' });
+  const { siteId, organizationId } = commissionScope(req);
   
   const [master, payments] = await Promise.all([
-    plotCommissionV2Model.findByIdWithDetails(numId, pool),
-    plotCommissionPaymentModel.findByCommissionId(numId, pool)
+    plotCommissionV2Model.findByIdWithDetails(numId, siteId, organizationId, pool),
+    plotCommissionPaymentModel.findByCommissionId(numId, siteId, organizationId, pool)
   ]);
 
   if (!master) return res.status(404).json({ message: 'Commission not found' });
@@ -147,12 +213,20 @@ export const getPlotCommissionByPlot = asyncHandler(async (req, res) => {
   const { plotId } = req.params;
   const { site_id } = req.query;
   const numPlotId = parseInt(plotId);
-  const numSiteId = parseInt(site_id);
+  const { siteId: numSiteId, organizationId } = commissionScope(req);
   if (isNaN(numPlotId)) return res.status(400).json({ message: 'Invalid plot ID' });
   if (!site_id) return res.status(400).json({ message: 'site_id is required' });
 
   // Step 1: load commissions for the VIEWED booking (we need the IDs to fetch payments).
-  const commissions = await plotCommissionV2Model.findAllCommissionsByPlotId(numPlotId, numSiteId, pool);
+  if (parseInt(site_id) !== numSiteId) {
+    return res.status(409).json({ message: 'Selected site does not match the requested site' });
+  }
+  const commissions = await plotCommissionV2Model.findAllCommissionsByPlotId(
+    numPlotId,
+    numSiteId,
+    organizationId,
+    pool,
+  );
 
   // The viewed booking may legitimately have NO commission rows (e.g. a previous
   // owner of a resold plot whose agents were removed). We still render the plot
@@ -164,9 +238,10 @@ export const getPlotCommissionByPlot = asyncHandler(async (req, res) => {
       `SELECT p.id AS plot_id, p.plot_no, p.plot_size, p.plot_rate, p.buyer_name,
               p.commission_rate, p.plot_tag, COALESCE(p.plot_commission, 0) AS plot_commission,
               s.name AS site_name, p.site_id
-         FROM plots p JOIN sites s ON p.site_id = s.id
+         FROM plots p
+         JOIN sites s ON p.site_id = s.id AND s.organization_id = $3
         WHERE p.id = $1 AND p.site_id = $2`,
-      [numPlotId, numSiteId]
+      [numPlotId, numSiteId, organizationId]
     );
     plotMeta = metaRes.rows[0] || null;
     if (!plotMeta) return res.status(404).json({ message: 'Plot not found' });
@@ -181,17 +256,19 @@ export const getPlotCommissionByPlot = asyncHandler(async (req, res) => {
     `SELECT pcp.*, u.name AS created_by_name, a.name AS approved_by_name
        FROM plot_commission_payments pcp
        JOIN plot_commissions_v2 pc ON pcp.plot_commission_id = pc.id
-       JOIN plots p ON pc.plot_id = p.id
-       LEFT JOIN users u ON pcp.created_by = u.id
-       LEFT JOIN users a ON pcp.approved_by = a.id
+       JOIN sites scope_site ON scope_site.id = pc.site_id AND scope_site.organization_id = $3
+       JOIN plots p ON pc.plot_id = p.id AND p.site_id = pc.site_id
+       LEFT JOIN users u ON pcp.created_by = u.id AND u.organization_id = $3
+       LEFT JOIN users a ON pcp.approved_by = a.id AND a.organization_id = $3
       WHERE p.plot_no = $1 AND pc.site_id = $2
+        AND (pcp.site_id = $2 OR pcp.site_id IS NULL)
       ORDER BY pcp.date DESC, pcp.created_at DESC`,
-    [plotNoForPayments, numSiteId]
+    [plotNoForPayments, numSiteId, organizationId]
   );
 
   const sitePromise = pool.query(
-    'SELECT name, city, state FROM sites WHERE id = $1',
-    [numSiteId]
+    'SELECT name, city, state FROM sites WHERE id = $1 AND organization_id = $2',
+    [numSiteId, organizationId]
   );
 
   // We'll also kick off the timeline query in parallel using the plot_no
@@ -227,8 +304,9 @@ export const getPlotCommissionByPlot = asyncHandler(async (req, res) => {
          '[]'
        ) AS agents_detail
      FROM plots p
+     JOIN sites scope_site ON scope_site.id = p.site_id AND scope_site.organization_id = $3
      LEFT JOIN plot_commissions_v2 pc ON pc.plot_id = p.id AND pc.site_id = $2
-     LEFT JOIN members m ON pc.agent_id = m.id
+     LEFT JOIN members m ON pc.agent_id = m.id AND m.site_id = $2
      LEFT JOIN (
        SELECT plot_commission_id,
               SUM(amount) FILTER (WHERE LOWER(COALESCE(status, 'approved')) = 'approved') AS total_paid,
@@ -241,7 +319,7 @@ export const getPlotCommissionByPlot = asyncHandler(async (req, res) => {
      WHERE p.plot_no = $1 AND p.site_id = $2
      GROUP BY p.id, p.plot_no, p.buyer_name, p.plot_size, p.plot_rate, p.plot_commission, p.created_at
      ORDER BY p.id ASC`,
-    [plotNoForTimeline, numSiteId]
+    [plotNoForTimeline, numSiteId, organizationId]
   );
 
   const [paymentsResult, siteResult, timelineResult] = await Promise.all([
@@ -403,6 +481,18 @@ export const createPlotCommissionPayment = asyncHandler(async (req, res) => {
   }
 
   const masterIdInt = parseInt(master_id);
+  const { siteId, organizationId } = commissionScope(req);
+  const assignedAdminId = assigned_admin_id ? parseInt(assigned_admin_id) : null;
+  const mappedMemberId = mapped_member_id ? parseInt(mapped_member_id) : null;
+  const mappedUserId = mapped_user_id ? parseInt(mapped_user_id) : null;
+  const [memberAllowed, mappedUserAllowed, assignedAdminAllowed] = await Promise.all([
+    memberBelongsToSite(mappedMemberId, siteId, organizationId),
+    userBelongsToSite(mappedUserId, siteId, organizationId),
+    userBelongsToSite(assignedAdminId, siteId, organizationId),
+  ]);
+  if (!memberAllowed) return res.status(400).json({ message: 'Mapped client is not available for this Site' });
+  if (!mappedUserAllowed) return res.status(400).json({ message: 'Mapped user is not available for this Site' });
+  if (!assignedAdminAllowed) return res.status(400).json({ message: 'Assigned admin is not available for this Site' });
   const numericAmount = parseFloat(amount);
   const mode = String(payment_mode || 'BANK').trim().toUpperCase();
   const isCheque = classifyPaymentMode(mode) === 'cheque';
@@ -414,16 +504,18 @@ export const createPlotCommissionPayment = asyncHandler(async (req, res) => {
   // outstanding until approval. Status refresh still runs in parallel after.
   const result = await pool.query(
     `WITH master AS (
-       SELECT id, site_id, total_commission,
+       SELECT pc.id, pc.site_id, pc.total_commission,
               COALESCE((
                 SELECT SUM(amount)
                 FROM plot_commission_payments
                 WHERE plot_commission_id = $1
+                  AND (site_id = $16 OR site_id IS NULL)
                   AND LOWER(COALESCE(status, 'approved')) = 'approved'
                   AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
               ), 0) AS already_paid
-       FROM plot_commissions_v2
-       WHERE id = $1
+       FROM plot_commissions_v2 pc
+       JOIN sites s ON s.id = pc.site_id AND s.organization_id = $17
+       WHERE pc.id = $1 AND pc.site_id = $16
      ),
      ins AS (
        INSERT INTO plot_commission_payments (
@@ -452,12 +544,14 @@ export const createPlotCommissionPayment = asyncHandler(async (req, res) => {
       remarks ? remarks.trim() : null,                            // $7
       voucher_number ? voucher_number.trim() : null,              // $8
       voucher_url || null,                                        // $9
-      assigned_admin_id ? parseInt(assigned_admin_id) : null,     // $10
+      assignedAdminId,                                            // $10
       req.user.id,                                                // $11
       chequeNumber,                                               // $12
       chequeStatus,                                               // $13
-      mapped_member_id ? parseInt(mapped_member_id) : null,       // $14
-      mapped_user_id ? parseInt(mapped_user_id) : null,           // $15
+      mappedMemberId,                                              // $14
+      mappedUserId,                                                // $15
+      siteId,                                                     // $16
+      organizationId,                                             // $17
     ]
   );
 
@@ -470,7 +564,7 @@ export const createPlotCommissionPayment = asyncHandler(async (req, res) => {
   // Pending payments don't change `Pending → Partial → Completed` derivation
   // (which only counts approved), so this is purely an observability touch
   // (`updated_at`). Run it in the background.
-  autoUpdateCommissionStatus(masterIdInt, pool).catch(() => {});
+  autoUpdateCommissionStatus(masterIdInt, siteId, organizationId, pool).catch(() => {});
 
   res.status(201).json({ payment, message: 'Payment recorded and is pending approval' });
 });
@@ -483,11 +577,16 @@ export const getPlotCommissionAnalytics = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const numId = parseInt(id);
   if (isNaN(numId)) return res.status(400).json({ message: 'Invalid commission ID' });
+  const { siteId, organizationId } = commissionScope(req);
   
-  const master = await plotCommissionV2Model.findByIdWithDetails(numId, pool);
+  const master = await plotCommissionV2Model.findByIdWithDetails(
+    numId, siteId, organizationId, pool,
+  );
   if (!master) return res.status(404).json({ message: 'Commission not found' });
 
-  const payments = await plotCommissionPaymentModel.findByCommissionId(numId, pool);
+  const payments = await plotCommissionPaymentModel.findByCommissionId(
+    numId, siteId, organizationId, pool,
+  );
 
   // Analytics calculations
   let cashPaid = 0;
@@ -521,20 +620,27 @@ export const getPlotCommissionAnalytics = asyncHandler(async (req, res) => {
  */
 export const updatePlotCommission = asyncHandler(async (req, res) => {
   const { total_commission, remarks } = req.body;
+  const { siteId, organizationId } = commissionScope(req);
 
   // Atomic UPDATE — saves a SELECT round-trip. UPDATE returns the row or
   // none (404).
   const result = await pool.query(
-    `UPDATE plot_commissions_v2
+    `UPDATE plot_commissions_v2 pc
         SET total_commission = $1,
             remarks          = $2,
             updated_at       = NOW()
-      WHERE id = $3
-      RETURNING *`,
+       FROM sites s
+      WHERE pc.id = $3
+        AND pc.site_id = $4
+        AND s.id = pc.site_id
+        AND s.organization_id = $5
+      RETURNING pc.*`,
     [
       parseFloat(total_commission),
       remarks ? remarks.trim() : null,
       parseInt(req.params.id),
+      siteId,
+      organizationId,
     ]
   );
   if (!result.rows[0]) return res.status(404).json({ message: 'Commission not found' });
@@ -547,10 +653,21 @@ export const updatePlotCommission = asyncHandler(async (req, res) => {
  */
 export const deletePlotCommission = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const { siteId, organizationId } = commissionScope(req);
 
   // Since we have ON DELETE CASCADE in the schema for plot_commission_payments, 
   // deleting the master will automatically delete payments.
-  const deleted = await plotCommissionV2Model.delete(parseInt(id), pool);
+  const { rows } = await pool.query(
+    `DELETE FROM plot_commissions_v2 pc
+      USING sites s
+      WHERE pc.id = $1
+        AND pc.site_id = $2
+        AND s.id = pc.site_id
+        AND s.organization_id = $3
+      RETURNING pc.*`,
+    [parseInt(id), siteId, organizationId],
+  );
+  const deleted = rows[0];
   if (!deleted) return res.status(404).json({ message: 'Commission not found' });
 
   res.json({ message: 'Commission and all associated payments deleted' });
@@ -563,8 +680,15 @@ export const deletePlotCommission = asyncHandler(async (req, res) => {
 export const updatePlotCommissionPayment = asyncHandler(async (req, res) => {
   const numId = parseInt(req.params.id);
   if (isNaN(numId)) return res.status(400).json({ message: 'Invalid payment ID' });
+  const { siteId, organizationId } = commissionScope(req);
 
   const { date, amount, payment_mode, bank_name, transaction_id, cheque_no, remarks, voucher_url, assigned_admin_id } = req.body;
+  if (assigned_admin_id !== undefined) {
+    const assignedAdminId = assigned_admin_id ? parseInt(assigned_admin_id) : null;
+    if (!await userBelongsToSite(assignedAdminId, siteId, organizationId)) {
+      return res.status(400).json({ message: 'Assigned admin is not available for this Site' });
+    }
+  }
 
   // Build the SET-list dynamically. The cheque_status update needs the
   // existing row's value when payment_mode stays CHEQUE — handled below
@@ -600,8 +724,8 @@ export const updatePlotCommissionPayment = asyncHandler(async (req, res) => {
       } else {
         fields.push(
           `cheque_no = CASE
-             WHEN ledger_bucket(plot_commission_payments.payment_mode) = 'cheque'
-               THEN plot_commission_payments.cheque_no
+             WHEN ledger_bucket(pcp.payment_mode) = 'cheque'
+               THEN pcp.cheque_no
              ELSE NULL
            END`
         );
@@ -614,8 +738,8 @@ export const updatePlotCommissionPayment = asyncHandler(async (req, res) => {
       `cheque_status = CASE
          WHEN ledger_bucket($${paymentModeParamIndex}::text) = 'cheque'
            THEN CASE
-             WHEN ledger_bucket(plot_commission_payments.payment_mode) = 'cheque'
-               THEN COALESCE(NULLIF(UPPER(TRIM(plot_commission_payments.cheque_status)), ''), 'PENDING')
+             WHEN ledger_bucket(pcp.payment_mode) = 'cheque'
+               THEN COALESCE(NULLIF(UPPER(TRIM(pcp.cheque_status)), ''), 'PENDING')
              ELSE 'PENDING'
            END
          ELSE NULL
@@ -626,15 +750,15 @@ export const updatePlotCommissionPayment = asyncHandler(async (req, res) => {
     const chequeNoParamIndex = values.length;
     fields.push(
       `cheque_no = CASE
-         WHEN ledger_bucket(plot_commission_payments.payment_mode) = 'cheque'
+         WHEN ledger_bucket(pcp.payment_mode) = 'cheque'
            THEN $${chequeNoParamIndex}
          ELSE NULL
        END`
     );
     fields.push(
       `cheque_status = CASE
-         WHEN ledger_bucket(plot_commission_payments.payment_mode) = 'cheque'
-           THEN COALESCE(NULLIF(UPPER(TRIM(plot_commission_payments.cheque_status)), ''), 'PENDING')
+         WHEN ledger_bucket(pcp.payment_mode) = 'cheque'
+           THEN COALESCE(NULLIF(UPPER(TRIM(pcp.cheque_status)), ''), 'PENDING')
          ELSE NULL
        END`
     );
@@ -643,13 +767,22 @@ export const updatePlotCommissionPayment = asyncHandler(async (req, res) => {
   if (fields.length === 0) return res.status(400).json({ message: 'Nothing to update' });
 
   fields.push(`updated_at = NOW()`);
-  values.push(numId);
+  values.push(numId, siteId, organizationId);
+  const idIndex = values.length - 2;
+  const siteIndex = values.length - 1;
+  const orgIndex = values.length;
 
   const result = await pool.query(
-    `UPDATE plot_commission_payments
+    `UPDATE plot_commission_payments pcp
         SET ${fields.join(', ')}
-      WHERE id = $${values.length}
-      RETURNING *`,
+       FROM plot_commissions_v2 pc, sites s
+      WHERE pcp.id = $${idIndex}
+        AND (pcp.site_id = $${siteIndex} OR pcp.site_id IS NULL)
+        AND pc.id = pcp.plot_commission_id
+        AND pc.site_id = $${siteIndex}
+        AND s.id = pc.site_id
+        AND s.organization_id = $${orgIndex}
+      RETURNING pcp.*`,
     values
   );
 
@@ -657,7 +790,9 @@ export const updatePlotCommissionPayment = asyncHandler(async (req, res) => {
   if (!updated) return res.status(404).json({ message: 'Payment not found' });
 
   // Auto-update commission status in the background (response returns sooner).
-  autoUpdateCommissionStatus(updated.plot_commission_id, pool).catch(() => {});
+  autoUpdateCommissionStatus(
+    updated.plot_commission_id, siteId, organizationId, pool,
+  ).catch(() => {});
 
   res.json({ payment: updated, message: 'Payment updated successfully' });
 });
@@ -669,21 +804,30 @@ export const updatePlotCommissionPayment = asyncHandler(async (req, res) => {
 export const deletePlotCommissionPayment = asyncHandler(async (req, res) => {
   const numId = parseInt(req.params.id);
   if (isNaN(numId)) return res.status(400).json({ message: 'Invalid payment ID' });
+  const { siteId, organizationId } = commissionScope(req);
 
   // Atomic DELETE with the commission_id returned in the same round-trip.
   // Previously: SELECT plot_commission_id + DELETE (2 RTTs); now 1 RTT.
   const deleted = await pool.query(
-    `DELETE FROM plot_commission_payments
-      WHERE id = $1
-      RETURNING plot_commission_id`,
-    [numId]
+    `DELETE FROM plot_commission_payments pcp
+      USING plot_commissions_v2 pc, sites s
+      WHERE pcp.id = $1
+        AND (pcp.site_id = $2 OR pcp.site_id IS NULL)
+        AND pc.id = pcp.plot_commission_id
+        AND pc.site_id = $2
+        AND s.id = pc.site_id
+        AND s.organization_id = $3
+      RETURNING pcp.plot_commission_id`,
+    [numId, siteId, organizationId]
   );
   if (deleted.rows.length === 0) {
     return res.status(404).json({ message: 'Payment not found' });
   }
 
   // Recalculate status in background — response is already on its way.
-  autoUpdateCommissionStatus(deleted.rows[0].plot_commission_id, pool).catch(() => {});
+  autoUpdateCommissionStatus(
+    deleted.rows[0].plot_commission_id, siteId, organizationId, pool,
+  ).catch(() => {});
 
   res.json({ message: 'Payment deleted successfully' });
 });
@@ -693,15 +837,26 @@ export const deletePlotCommissionPayment = asyncHandler(async (req, res) => {
  * Body: { ids: number[] }
  */
 export const bulkDeletePlotCommissionPayments = asyncHandler(async (req, res) => {
+  const { siteId, organizationId } = commissionScope(req);
   const ids = Array.isArray(req.body.ids) ? req.body.ids.map((id) => parseInt(id)).filter(Number.isInteger) : [];
   if (ids.length === 0) return res.status(400).json({ message: 'ids array is required' });
 
   const deleted = await pool.query(
-    `DELETE FROM plot_commission_payments WHERE id = ANY($1::int[]) RETURNING plot_commission_id`,
-    [ids]
+    `DELETE FROM plot_commission_payments pcp
+      USING plot_commissions_v2 pc, sites s
+      WHERE pcp.id = ANY($1::int[])
+        AND (pcp.site_id = $2 OR pcp.site_id IS NULL)
+        AND pc.id = pcp.plot_commission_id
+        AND pc.site_id = $2
+        AND s.id = pc.site_id
+        AND s.organization_id = $3
+      RETURNING pcp.plot_commission_id`,
+    [ids, siteId, organizationId]
   );
   const commissionIds = [...new Set(deleted.rows.map((r) => r.plot_commission_id))];
-  commissionIds.forEach((cid) => autoUpdateCommissionStatus(cid, pool).catch(() => {}));
+  commissionIds.forEach((cid) => {
+    autoUpdateCommissionStatus(cid, siteId, organizationId, pool).catch(() => {});
+  });
 
   res.json({ message: `${deleted.rows.length} payment(s) deleted successfully`, deleted: deleted.rows.length });
 });

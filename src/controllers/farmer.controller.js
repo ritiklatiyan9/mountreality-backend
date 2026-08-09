@@ -7,6 +7,43 @@ import { classifyPaymentMode } from '../utils/paymentMode.js';
 
 const SPLIT_EPSILON = 1e-9;
 
+const farmerScope = (req) => ({
+  siteId: Number.parseInt(req.farmerSiteId ?? req.siteContextId, 10),
+  organizationId: Number.parseInt(req.user?.organization_id, 10),
+});
+
+const memberBelongsToSite = async (memberId, siteId, organizationId, db = pool) => {
+  const { rows } = await db.query(
+    `SELECT 1
+       FROM members m
+       JOIN sites s ON s.id = m.site_id AND s.organization_id = $3
+      WHERE m.id = $1 AND m.site_id = $2
+      LIMIT 1`,
+    [memberId, siteId, organizationId],
+  );
+  return Boolean(rows[0]);
+};
+
+const userAvailableForSite = async (userId, siteId, organizationId, db = pool) => {
+  const { rows } = await db.query(
+    `SELECT 1
+       FROM users u
+      WHERE u.id = $1
+        AND u.organization_id = $3
+        AND u.is_active = true
+        AND (
+          u.role IN ('admin', 'super_admin')
+          OR EXISTS (
+            SELECT 1 FROM user_sites us
+             WHERE us.user_id = u.id AND us.site_id = $2
+          )
+        )
+      LIMIT 1`,
+    [userId, siteId, organizationId],
+  );
+  return Boolean(rows[0]);
+};
+
 /**
  * Normalise the farmer allocation while retaining SPLIT as the only special
  * mode. Physical cash must be explicit; blank and every other non-cheque mode
@@ -81,6 +118,14 @@ export const createFarmer = asyncHandler(async (req, res) => {
   if (!site_id) {
     return res.status(400).json({ message: 'Site is required' });
   }
+  const { siteId, organizationId } = farmerScope(req);
+  if (!siteId || Number.parseInt(site_id, 10) !== siteId) {
+    return res.status(409).json({ message: 'Selected site does not match the requested site' });
+  }
+  const parsedMemberId = member_id ? Number.parseInt(member_id, 10) : null;
+  if (parsedMemberId && !await memberBelongsToSite(parsedMemberId, siteId, organizationId)) {
+    return res.status(400).json({ message: 'Selected farmer member is not available for this Site' });
+  }
 
   const allocation = normalizeFarmerAllocation({
     paymentMode: payment_mode,
@@ -96,11 +141,11 @@ export const createFarmer = asyncHandler(async (req, res) => {
     address: address || null,
     total_amount: allocation.total,
     interest_rate: interest_rate || 0,
-    site_id: parseInt(site_id),
+    site_id: siteId,
     created_by: req.user.id,
     notes: notes || null,
     status: status || 'active',
-    member_id: member_id ? parseInt(member_id) : null,
+    member_id: parsedMemberId,
     payment_mode: allocation.mode,
     cash_amount: allocation.cash,
     bank_amount: allocation.bank,
@@ -131,7 +176,8 @@ export const listFarmers = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'site_id query param is required' });
   }
 
-  const farmers = await farmerModel.findBySiteId(parseInt(site_id), pool);
+  const { siteId, organizationId } = farmerScope(req);
+  const farmers = await farmerModel.findBySiteIdScoped(siteId, organizationId, pool);
   res.json({ farmers });
 });
 
@@ -141,7 +187,13 @@ export const listFarmers = asyncHandler(async (req, res) => {
  */
 export const getFarmer = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const farmer = await farmerModel.findByIdWithSummary(parseInt(id), pool);
+  const { siteId, organizationId } = farmerScope(req);
+  const farmer = await farmerModel.findByIdWithSummaryScoped(
+    parseInt(id),
+    siteId,
+    organizationId,
+    pool,
+  );
 
   if (!farmer) {
     return res.status(404).json({ message: 'Farmer not found' });
@@ -156,6 +208,7 @@ export const getFarmer = asyncHandler(async (req, res) => {
  */
 export const updateFarmer = asyncHandler(async (req, res) => {
   const farmerId = parseInt(req.params.id);
+  const { siteId, organizationId } = farmerScope(req);
   const {
     name, phone, address, total_amount, interest_rate, notes, status, member_id,
     payment_mode, cash_amount, bank_amount, bank_name, bank_account_no, bank_reference, bank_ifsc,
@@ -172,12 +225,21 @@ export const updateFarmer = asyncHandler(async (req, res) => {
   if (interest_rate !== undefined) updateData.interest_rate = interest_rate;
   if (notes !== undefined) updateData.notes = notes;
   if (status !== undefined) updateData.status = status;
-  if (member_id !== undefined) updateData.member_id = member_id ? parseInt(member_id) : null;
+  if (member_id !== undefined) {
+    const parsedMemberId = member_id ? parseInt(member_id) : null;
+    if (parsedMemberId && !await memberBelongsToSite(parsedMemberId, siteId, organizationId)) {
+      return res.status(400).json({ message: 'Selected farmer member is not available for this Site' });
+    }
+    updateData.member_id = parsedMemberId;
+  }
   const allocationChanged = [payment_mode, total_amount, cash_amount, bank_amount].some((value) => value !== undefined);
   if (allocationChanged) {
     const currentResult = await pool.query(
-      `SELECT payment_mode, total_amount, cash_amount, bank_amount FROM farmers WHERE id = $1`,
-      [farmerId]
+      `SELECT f.payment_mode, f.total_amount, f.cash_amount, f.bank_amount
+         FROM farmers f
+         JOIN sites s ON s.id = f.site_id AND s.organization_id = $3
+        WHERE f.id = $1 AND f.site_id = $2`,
+      [farmerId, siteId, organizationId]
     );
     const current = currentResult.rows[0];
     if (!current) return res.status(404).json({ message: 'Farmer not found' });
@@ -209,7 +271,13 @@ export const updateFarmer = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Nothing to update' });
   }
 
-  const updated = await farmerModel.update(farmerId, updateData, pool);
+  const updated = await farmerModel.updateScoped(
+    farmerId,
+    updateData,
+    siteId,
+    organizationId,
+    pool,
+  );
   if (!updated) {
     return res.status(404).json({ message: 'Farmer not found' });
   }
@@ -221,10 +289,17 @@ export const updateFarmer = asyncHandler(async (req, res) => {
  * Delete a farmer and all payments
  */
 export const deleteFarmer = asyncHandler(async (req, res) => {
+  const { siteId, organizationId } = farmerScope(req);
   // Atomic DELETE — if no row was deleted, return 404. Saves a SELECT round-trip.
   const result = await pool.query(
-    `DELETE FROM farmers WHERE id = $1 RETURNING id`,
-    [parseInt(req.params.id)]
+    `DELETE FROM farmers f
+      USING sites s
+      WHERE f.id = $1
+        AND f.site_id = $2
+        AND s.id = f.site_id
+        AND s.organization_id = $3
+      RETURNING f.id`,
+    [parseInt(req.params.id), siteId, organizationId]
   );
   if (!result.rows[0]) {
     return res.status(404).json({ message: 'Farmer not found' });
@@ -242,7 +317,17 @@ export const bulkDeleteFarmers = asyncHandler(async (req, res) => {
   const ids = Array.isArray(req.body.ids) ? req.body.ids.map((id) => parseInt(id)).filter(Number.isInteger) : [];
   if (ids.length === 0) return res.status(400).json({ message: 'ids array is required' });
 
-  const result = await pool.query(`DELETE FROM farmers WHERE id = ANY($1::int[]) RETURNING id`, [ids]);
+  const { siteId, organizationId } = farmerScope(req);
+  const result = await pool.query(
+    `DELETE FROM farmers f
+      USING sites s
+      WHERE f.id = ANY($1::int[])
+        AND f.site_id = $2
+        AND s.id = f.site_id
+        AND s.organization_id = $3
+      RETURNING f.id`,
+    [ids, siteId, organizationId],
+  );
   res.json({ message: `${result.rows.length} farmer(s) deleted`, deleted: result.rows.map((r) => r.id) });
 });
 
@@ -257,10 +342,12 @@ export const bulkDeleteFarmers = asyncHandler(async (req, res) => {
  */
 export const createPayment = asyncHandler(async (req, res) => {
   const { farmerId } = req.params;
+  const { siteId, organizationId } = farmerScope(req);
   const {
     date, particular, amount, by_note, remarks,
     payment_mode, cash_amount, bank_amount, bank_name, bank_account_no, bank_reference, bank_ifsc,
     voucher_url, assigned_admin_id, mapped_member_id, mapped_user_id,
+    idempotency_key, schedule_item_id,
   } = req.body;
 
   if (!particular) {
@@ -268,6 +355,21 @@ export const createPayment = asyncHandler(async (req, res) => {
   }
   if (mapped_member_id && mapped_user_id) {
     return res.status(400).json({ message: 'Map this payment to either a client or a user, not both' });
+  }
+
+  const parsedMappedMemberId = mapped_member_id ? parseInt(mapped_member_id) : null;
+  const parsedMappedUserId = mapped_user_id ? parseInt(mapped_user_id) : null;
+  const parsedAdminId = assigned_admin_id ? parseInt(assigned_admin_id) : null;
+  if (parsedMappedMemberId
+      && !await memberBelongsToSite(parsedMappedMemberId, siteId, organizationId)) {
+    return res.status(400).json({ message: 'Mapped client is not available for this Site' });
+  }
+  if (parsedMappedUserId
+      && !await userAvailableForSite(parsedMappedUserId, siteId, organizationId)) {
+    return res.status(400).json({ message: 'Mapped user is not available for this Site' });
+  }
+  if (parsedAdminId && !await userAvailableForSite(parsedAdminId, siteId, organizationId)) {
+    return res.status(400).json({ message: 'Assigned admin is not available for this Site' });
   }
 
   const farmerIdInt = parseInt(farmerId);
@@ -279,12 +381,15 @@ export const createPayment = asyncHandler(async (req, res) => {
   });
   if (allocation.error) return res.status(400).json({ message: allocation.error });
   const totalAmount = allocation.total;
+  if (req.landAcquisitionId && totalAmount <= 0) {
+    return res.status(400).json({ message: 'Use the audited reversal action to correct an acquisition payment' });
+  }
   const mode = allocation.mode;
   const cashAmt = allocation.cash;
   const bankAmt = allocation.bank;
   const canSetCustomDate = req.user.role === 'admin' || req.user.role === 'super_admin';
   const paymentDate = (canSetCustomDate && date) ? date : new Date().toISOString().split('T')[0];
-  const adminId = assigned_admin_id ? parseInt(assigned_admin_id) : null;
+  const adminId = parsedAdminId;
   const chequeNo = mode === 'CHEQUE' && req.body.cheque_no
     ? String(req.body.cheque_no).trim()
     : null;
@@ -293,6 +398,11 @@ export const createPayment = asyncHandler(async (req, res) => {
   const trimmedRemarks = remarks ? remarks.trim() : null;
   const bankNameUpper = bank_name ? String(bank_name).toUpperCase() : null;
   const bankRemarks = [remarks, bank_reference ? `Ref: ${bank_reference}` : null, bank_name ? `Bank: ${bank_name}` : null].filter(Boolean).join(' | ') || null;
+  const idempotencyKey = idempotency_key ? String(idempotency_key).trim().slice(0, 120) : null;
+  const scheduleItemId = schedule_item_id ? Number.parseInt(schedule_item_id, 10) : null;
+  if (schedule_item_id && (!Number.isSafeInteger(scheduleItemId) || scheduleItemId <= 0)) {
+    return res.status(400).json({ message: 'Selected payment schedule item is invalid' });
+  }
 
   // ─────────────────────────────────────────────────────────────
   // SINGLE-ROUND-TRIP create: farmer lookup + payment INSERT + 0/1/2
@@ -301,18 +411,67 @@ export const createPayment = asyncHandler(async (req, res) => {
   // ─────────────────────────────────────────────────────────────
   const result = await pool.query(
     `WITH f AS (
-       SELECT id, site_id, name FROM farmers WHERE id = $1
+       SELECT f.id, f.site_id, f.name, f.member_id, f.acquisition_reference,
+              f.financial_terms_status, f.completed_at, f.total_amount,
+              COALESCE((
+                SELECT SUM(GREATEST(existing.amount,0))
+                  FROM farmer_payments existing
+                 WHERE existing.farmer_id=f.id
+                   AND LOWER(COALESCE(existing.status,'pending')) IN ('pending','approved')
+                   AND UPPER(COALESCE(existing.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+              ),0)::numeric AS committed_paid,
+              ($30::bigint IS NULL OR EXISTS (
+                SELECT 1 FROM land_acquisition_payment_schedules ps
+                 WHERE ps.id=$30 AND ps.acquisition_id=f.id AND ps.site_id=f.site_id
+                   AND ps.superseded_at IS NULL AND ps.schedule_status <> 'CANCELLED'
+                   AND COALESCE((
+                     SELECT SUM(GREATEST(pa.allocated_amount,0))
+                       FROM land_acquisition_payment_allocations pa
+                       JOIN farmer_payments allocated ON allocated.id=pa.farmer_payment_id
+                      WHERE pa.schedule_item_id=ps.id
+                        AND LOWER(COALESCE(allocated.status,'pending')) IN ('pending','approved')
+                        AND UPPER(COALESCE(allocated.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+                   ),0) + GREATEST($4::numeric,0) <= ps.expected_amount + 0.009
+              )) AS schedule_valid
+         FROM farmers f
+         JOIN sites s ON s.id = f.site_id AND s.organization_id = $28
+        WHERE f.id = $1 AND f.site_id = $27
+     ),
+     existing_payment AS (
+       SELECT fp.* FROM farmer_payments fp JOIN f ON f.id=fp.farmer_id
+        WHERE $29::text IS NOT NULL AND fp.idempotency_key=$29
+        LIMIT 1
      ),
      new_payment AS (
        INSERT INTO farmer_payments (
          farmer_id, date, particular, amount, by_note, remarks,
          payment_mode, cash_amount, bank_amount, bank_name, bank_account_no,
          bank_reference, bank_ifsc, voucher_url, assigned_admin_id, status,
-         cheque_no, cheque_status, created_by, mapped_member_id, mapped_user_id
+         cheque_no, cheque_status, created_by, mapped_member_id, mapped_user_id,idempotency_key
        )
-       SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $17, $18, $25, $26
+       SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $17, $18, $25, $26,$29
        FROM f
+       WHERE f.completed_at IS NULL
+         AND (f.acquisition_reference IS NULL OR f.financial_terms_status='CONFIRMED')
+         AND (f.acquisition_reference IS NULL OR f.committed_paid + GREATEST($4::numeric,0) <= f.total_amount + 0.009)
+         AND f.schedule_valid
+         AND NOT EXISTS (SELECT 1 FROM existing_payment)
+       ON CONFLICT (farmer_id,idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
        RETURNING *
+     ),
+     payment_row AS (
+       SELECT np.*,FALSE AS replayed FROM new_payment np
+       UNION ALL
+       SELECT ep.*,TRUE AS replayed FROM existing_payment ep
+       LIMIT 1
+     ),
+     schedule_allocation AS (
+       INSERT INTO land_acquisition_payment_allocations
+         (acquisition_id,schedule_item_id,farmer_payment_id,allocated_amount,created_by)
+       SELECT f.id,$30,np.id,$4,$18 FROM f,new_payment np
+       WHERE $30::bigint IS NOT NULL
+       ON CONFLICT (schedule_item_id,farmer_payment_id) DO NOTHING
+       RETURNING id
      ),
      db_cash AS (
        INSERT INTO day_book (
@@ -351,12 +510,16 @@ export const createPayment = asyncHandler(async (req, res) => {
        RETURNING *
      )
      SELECT
-       (SELECT row_to_json(np) FROM new_payment np) AS payment,
+       (SELECT row_to_json(pr) FROM payment_row pr) AS payment,
        COALESCE(
          (SELECT json_agg(row_to_json(d)) FROM (SELECT * FROM db_cash UNION ALL SELECT * FROM db_bank) d),
          '[]'::json
        ) AS daybook_entries,
-       (SELECT id FROM f) AS farmer_id`,
+       (SELECT id FROM f) AS farmer_id,
+       (SELECT completed_at IS NOT NULL FROM f) AS acquisition_completed,
+       (SELECT acquisition_reference IS NOT NULL AND financial_terms_status <> 'CONFIRMED' FROM f) AS terms_unconfirmed,
+       (SELECT acquisition_reference IS NOT NULL AND committed_paid + GREATEST($4::numeric,0) > total_amount + 0.009 FROM f) AS exceeds_agreed_value,
+       (SELECT NOT schedule_valid FROM f) AS invalid_schedule`,
     [
       farmerIdInt,                  // $1
       paymentDate,                  // $2
@@ -382,19 +545,31 @@ export const createPayment = asyncHandler(async (req, res) => {
       bankRemarks,                  // $22 (bank remarks)
       mode,                         // $23 (canonical non-cash payment_mode)
       bankNameUpper,                // $24 (bank from_entity)
-      mapped_member_id ? parseInt(mapped_member_id) : null,  // $25
-      mapped_user_id ? parseInt(mapped_user_id) : null,      // $26
+      parsedMappedMemberId,           // $25
+      parsedMappedUserId,             // $26
+      siteId,                       // $27 (canonical Site context)
+      organizationId,               // $28 (tenant boundary)
+      idempotencyKey,               // $29 (duplicate-submit protection)
+      scheduleItemId,               // $30 (optional acquisition schedule allocation)
     ]
   );
 
   const row = result.rows[0];
-  if (!row || !row.payment) {
+  if (!row?.farmer_id) {
     return res.status(404).json({ message: 'Farmer not found' });
   }
+  if (!row.payment) {
+    if (row.acquisition_completed) return res.status(409).json({ message: 'This acquisition is already completed' });
+    if (row.terms_unconfirmed) return res.status(409).json({ message: 'Confirm financial terms before recording acquisition payments' });
+    if (row.exceeds_agreed_value) return res.status(409).json({ message: 'This payment would exceed the confirmed agreed value' });
+    if (row.invalid_schedule) return res.status(400).json({ message: 'Selected payment schedule item is not active for this acquisition' });
+    return res.status(409).json({ message: 'The payment could not be recorded because the acquisition changed' });
+  }
 
-  res.status(201).json({
+  res.status(row.payment.replayed ? 200 : 201).json({
     payment: row.payment,
     daybook_entries: row.daybook_entries || [],
+    replayed: Boolean(row.payment.replayed),
   });
 });
 
@@ -404,6 +579,7 @@ export const createPayment = asyncHandler(async (req, res) => {
  */
 export const listPayments = asyncHandler(async (req, res) => {
   const farmerId = parseInt(req.params.farmerId);
+  const { siteId, organizationId } = farmerScope(req);
 
   // The previous implementation ran 4–5 SERIAL queries:
   //   findByIdWithSummary → findByFarmerId → getTotalPaid → getTotalInterest → site
@@ -425,12 +601,17 @@ export const listPayments = asyncHandler(async (req, res) => {
      LEFT JOIN farmer_payments fp ON fp.farmer_id = f.id
        AND LOWER(COALESCE(fp.status, '')) = 'approved'
        AND UPPER(COALESCE(fp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
-     LEFT JOIN sites s ON s.id = f.site_id
-     WHERE f.id = $1
+     JOIN sites s ON s.id = f.site_id AND s.organization_id = $3
+     WHERE f.id = $1 AND f.site_id = $2
      GROUP BY f.id, s.id`,
-    [farmerId]
+    [farmerId, siteId, organizationId]
   );
-  const paymentsPromise = farmerPaymentModel.findByFarmerId(farmerId, pool);
+  const paymentsPromise = farmerPaymentModel.findByFarmerIdScoped(
+    farmerId,
+    siteId,
+    organizationId,
+    pool,
+  );
 
   const [farmerRes, payments] = await Promise.all([farmerWithSitePromise, paymentsPromise]);
   const farmer = farmerRes.rows[0];
@@ -496,6 +677,7 @@ export const listPayments = asyncHandler(async (req, res) => {
 export const updatePayment = asyncHandler(async (req, res) => {
   const farmerId = parseInt(req.params.farmerId);
   const paymentId = parseInt(req.params.paymentId);
+  const { siteId, organizationId } = farmerScope(req);
   const {
     date, particular, amount, by_note, remarks,
     payment_mode, cash_amount, bank_amount, bank_name, bank_account_no, bank_reference, bank_ifsc,
@@ -503,8 +685,12 @@ export const updatePayment = asyncHandler(async (req, res) => {
   } = req.body;
 
   const existingResult = await pool.query(
-    `SELECT * FROM farmer_payments WHERE id = $1 AND farmer_id = $2`,
-    [paymentId, farmerId]
+    `SELECT fp.*
+       FROM farmer_payments fp
+       JOIN farmers f ON f.id = fp.farmer_id AND f.site_id = $3
+       JOIN sites s ON s.id = f.site_id AND s.organization_id = $4
+      WHERE fp.id = $1 AND fp.farmer_id = $2`,
+    [paymentId, farmerId, siteId, organizationId]
   );
   const existing = existingResult.rows[0];
   if (!existing) return res.status(404).json({ message: 'Payment not found' });
@@ -560,12 +746,18 @@ export const updatePayment = asyncHandler(async (req, res) => {
   // SELECT round-trip to verify ownership.
   const keys = Object.keys(updateData);
   const setClause = keys.map((k, i) => `${k} = $${i + 1}`).join(', ');
-  const values = [...Object.values(updateData), paymentId, farmerId];
+  const values = [...Object.values(updateData), paymentId, farmerId, siteId, organizationId];
   const result = await pool.query(
-    `UPDATE farmer_payments
+    `UPDATE farmer_payments fp
         SET ${setClause}
-      WHERE id = $${keys.length + 1} AND farmer_id = $${keys.length + 2}
-      RETURNING *`,
+       FROM farmers f, sites s
+      WHERE fp.id = $${keys.length + 1}
+        AND fp.farmer_id = $${keys.length + 2}
+        AND f.id = fp.farmer_id
+        AND f.site_id = $${keys.length + 3}
+        AND s.id = f.site_id
+        AND s.organization_id = $${keys.length + 4}
+      RETURNING fp.*`,
     values
   );
   if (!result.rows[0]) {
@@ -581,18 +773,32 @@ export const updatePayment = asyncHandler(async (req, res) => {
 export const deletePayment = asyncHandler(async (req, res) => {
   const farmerId = parseInt(req.params.farmerId);
   const paymentId = parseInt(req.params.paymentId);
+  const { siteId, organizationId } = farmerScope(req);
 
   // Single round-trip: cascade-delete the linked DayBook rows AND the payment
   // in one atomic statement (CTE). Previously: SELECT + DELETE day_book +
   // DELETE payment = 3 serial round-trips.
   const result = await pool.query(
-    `WITH del_daybook AS (
-       DELETE FROM day_book WHERE farmer_payment_id = $1
+    `WITH target AS (
+       SELECT fp.id
+         FROM farmer_payments fp
+         JOIN farmers f ON f.id = fp.farmer_id AND f.site_id = $3
+         JOIN sites s ON s.id = f.site_id AND s.organization_id = $4
+        WHERE fp.id = $1 AND fp.farmer_id = $2
+     ),
+     del_daybook AS (
+       DELETE FROM day_book d
+        USING target t
+        WHERE d.farmer_payment_id = t.id
+     ),
+     deleted AS (
+       DELETE FROM farmer_payments fp
+        USING target t
+        WHERE fp.id = t.id
+        RETURNING fp.id
      )
-     DELETE FROM farmer_payments
-      WHERE id = $1 AND farmer_id = $2
-      RETURNING id`,
-    [paymentId, farmerId]
+     SELECT id FROM deleted`,
+    [paymentId, farmerId, siteId, organizationId]
   );
   if (!result.rows[0]) {
     return res.status(404).json({ message: 'Payment not found' });
@@ -606,17 +812,31 @@ export const deletePayment = asyncHandler(async (req, res) => {
  */
 export const bulkDeletePayments = asyncHandler(async (req, res) => {
   const farmerId = parseInt(req.params.farmerId);
+  const { siteId, organizationId } = farmerScope(req);
   const ids = Array.isArray(req.body.ids) ? req.body.ids.map((id) => parseInt(id)).filter(Number.isInteger) : [];
   if (ids.length === 0) return res.status(400).json({ message: 'ids array is required' });
 
   const result = await pool.query(
-    `WITH del_daybook AS (
-       DELETE FROM day_book WHERE farmer_payment_id = ANY($1::int[])
+    `WITH target AS (
+       SELECT fp.id
+         FROM farmer_payments fp
+         JOIN farmers f ON f.id = fp.farmer_id AND f.site_id = $3
+         JOIN sites s ON s.id = f.site_id AND s.organization_id = $4
+        WHERE fp.id = ANY($1::int[]) AND fp.farmer_id = $2
+     ),
+     del_daybook AS (
+       DELETE FROM day_book d
+        USING target t
+        WHERE d.farmer_payment_id = t.id
+     ),
+     deleted AS (
+       DELETE FROM farmer_payments fp
+        USING target t
+        WHERE fp.id = t.id
+        RETURNING fp.id
      )
-     DELETE FROM farmer_payments
-      WHERE id = ANY($1::int[]) AND farmer_id = $2
-      RETURNING id`,
-    [ids, farmerId]
+     SELECT id FROM deleted`,
+    [ids, farmerId, siteId, organizationId]
   );
   res.json({ message: `${result.rows.length} payment(s) deleted`, deleted: result.rows.map((r) => r.id) });
 });
@@ -633,12 +853,16 @@ export const listFarmerMembers = asyncHandler(async (req, res) => {
   const { site_id } = req.query;
   if (!site_id) return res.status(400).json({ message: 'site_id is required' });
 
+  const { siteId, organizationId } = farmerScope(req);
   const result = await pool.query(
-    `SELECT id, full_name, phone, address, bank_name, branch AS bank_branch, account_no AS bank_account_no, ifsc_code AS bank_ifsc, member_type
-     FROM members
-     WHERE site_id = $1 AND member_type = 'FARMER'
-     ORDER BY full_name ASC`,
-    [parseInt(site_id)]
+    `SELECT m.id, m.full_name, m.phone, m.address, m.bank_name,
+            m.branch AS bank_branch, m.account_no AS bank_account_no,
+            m.ifsc_code AS bank_ifsc, m.member_type
+       FROM members m
+       JOIN sites s ON s.id = m.site_id AND s.organization_id = $2
+      WHERE m.site_id = $1 AND m.member_type = 'FARMER'
+      ORDER BY m.full_name ASC`,
+    [siteId, organizationId]
   );
 
   res.json({ members: result.rows });

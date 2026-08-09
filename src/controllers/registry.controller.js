@@ -173,7 +173,17 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
     return { status: 400, body: { message: 'A valid plot is required' } };
   }
   const { rows: plotRows } = await db.query(
-    'SELECT site_id, plot_no FROM plots WHERE id = $1 LIMIT 1',
+    `SELECT p.site_id,p.plot_no,p.current_booking_id,p.rera_project_id,p.rera_project_phase_id,
+            b.client_member_id,b.buyer_name AS booking_buyer_name,
+            a.id AS agreement_id
+       FROM plots p
+       LEFT JOIN bookings b ON b.id=p.current_booking_id AND b.site_id=p.site_id
+       LEFT JOIN LATERAL (
+         SELECT ba.id FROM booking_agreements ba
+          WHERE ba.booking_id=b.id AND ba.status NOT IN ('SUPERSEDED','CANCELLED')
+          ORDER BY ba.version_number DESC,ba.id DESC LIMIT 1
+       ) a ON TRUE
+      WHERE p.id=$1 LIMIT 1`,
     [plotIdInt]
   );
   if (!plotRows[0]) return { status: 404, body: { message: 'Plot not found' } };
@@ -183,6 +193,7 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
   if (String(plotRows[0].plot_no || '').trim().toUpperCase() !== trimmed) {
     return { status: 400, body: { message: 'Registry plot number does not match the selected plot' } };
   }
+  let plotContext = plotRows[0];
 
   // ── Money-mapped gate ──
   const paymentRows = Array.isArray(payments) ? payments : [];
@@ -231,6 +242,43 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
   let row;
   try {
     if (ownsTransaction) await client.query('BEGIN');
+    await client.query(`SELECT pg_advisory_xact_lock(96096,$1)`, [plotIdInt]);
+    const { rows: lockedPlots } = await client.query(
+      `SELECT p.site_id,p.plot_no,p.current_booking_id,p.rera_project_id,p.rera_project_phase_id,
+              b.client_member_id,b.buyer_name AS booking_buyer_name,a.id AS agreement_id
+         FROM plots p
+         LEFT JOIN bookings b ON b.id=p.current_booking_id AND b.site_id=p.site_id
+         LEFT JOIN LATERAL (
+           SELECT ba.id FROM booking_agreements ba
+            WHERE ba.booking_id=b.id AND ba.status NOT IN ('SUPERSEDED','CANCELLED')
+            ORDER BY ba.version_number DESC,ba.id DESC LIMIT 1
+         ) a ON TRUE
+        WHERE p.id=$1 AND p.site_id=$2 FOR UPDATE OF p`,
+      [plotIdInt, siteIdInt],
+    );
+    if (!lockedPlots[0] || String(lockedPlots[0].plot_no || '').trim().toUpperCase() !== trimmed) {
+      if (ownsTransaction) await client.query('ROLLBACK');
+      return { status: 409, body: { message: 'Plot context changed while the registry form was open' } };
+    }
+    plotContext = lockedPlots[0];
+    if (linkedIds.length) {
+      const { rows: currentLinkable } = await client.query(
+        `SELECT pp.id,pp.site_id,pp.date,pp.amount,pp.payment_from,pp.payment_type,
+                pp.bank_details,pp.narration,pp.cheque_no,pp.cheque_status
+           FROM plot_payments pp
+          WHERE pp.id=ANY($1::int[]) AND pp.site_id=$2 AND pp.plot_id=$3
+            AND LOWER(COALESCE(pp.status,'approved'))='approved'
+            AND UPPER(COALESCE(pp.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+            AND NOT EXISTS (SELECT 1 FROM plot_registry_payments x WHERE x.source_plot_payment_id=pp.id)
+          FOR UPDATE OF pp`,
+        [linkedIds, siteIdInt, plotIdInt],
+      );
+      if (currentLinkable.length !== linkedIds.length) {
+        if (ownsTransaction) await client.query('ROLLBACK');
+        return { status: 409, body: { message: 'A linked receipt changed or was used while this registry form was open' } };
+      }
+      linkable = currentLinkable;
+    }
 
     // Single CTE: dup-check + INSERT + plot-status auto-bump in ONE round-trip.
     const result = await client.query(
@@ -243,15 +291,19 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
          INSERT INTO plot_registries (
            site_id, plot_no, customer_name, size_meter, size_sqyard, registry_date,
            farmer_name, plot_id, circle_rate, firm_name, seller_name, created_entry_date,
-           bank_amount, registry_payment, notes, assigned_admin_id, created_by
+           bank_amount, registry_payment, notes, assigned_admin_id, created_by,
+           booking_id,allottee_member_id,rera_project_id,rera_project_phase_id,agreement_id,
+           lifecycle_status,possession_status
          )
-         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17,
+                $18,$19,$20,$21,$22,'NOT_READY','PENDING'
          WHERE NOT EXISTS (SELECT 1 FROM dup)
          RETURNING *
        ),
        plot_bump AS (
          UPDATE plots
-            SET status = 'PENDING NOC', updated_at = NOW()
+            SET status = 'PENDING NOC', lifecycle_status=COALESCE(lifecycle_status,'REGISTRY_PENDING'),
+                registry_status='NOT_READY',lifecycle_version=COALESCE(lifecycle_version,1)+1,updated_at = NOW()
           WHERE id = $8
             AND UPPER(COALESCE(status, '')) = 'BOOKED'
             AND EXISTS (SELECT 1 FROM ins)
@@ -279,6 +331,11 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
         notes ? notes.trim() : null,                                            // $15
         body.assigned_admin_id ? parseInt(body.assigned_admin_id) : null,       // $16
         userId,                                                                 // $17
+        plotContext.current_booking_id || null,                                 // $18
+        plotContext.client_member_id || null,                                   // $19
+        plotContext.rera_project_id || null,                                    // $20
+        plotContext.rera_project_phase_id || null,                              // $21
+        plotContext.agreement_id || null,                                       // $22
       ]
     );
 

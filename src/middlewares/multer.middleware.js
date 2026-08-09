@@ -1,6 +1,7 @@
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import { randomUUID } from 'crypto';
 
 const UPLOAD_DIR = 'src/uploads';
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -10,7 +11,10 @@ const storage = multer.diskStorage({
     cb(null, UPLOAD_DIR);
   },
   filename: (req, file, cb) => {
-    cb(null, Date.now() + path.extname(file.originalname));
+    // A profile photo and its documents can arrive in the same millisecond.
+    // Preserve every selected file instead of letting timestamp collisions
+    // overwrite an earlier upload before storage receives it.
+    cb(null, `${Date.now()}-${randomUUID()}${path.extname(file.originalname).toLowerCase()}`);
   }
 });
 

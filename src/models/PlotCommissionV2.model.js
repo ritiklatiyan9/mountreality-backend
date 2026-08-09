@@ -35,7 +35,7 @@ class PlotCommissionV2Model extends MasterModel {
   /**
    * Get details for a single commission entry.
    */
-  async findByIdWithDetails(id, pool) {
+  async findByIdWithDetails(id, siteId, organizationId, pool) {
     const query = `
       SELECT
         pc.*,
@@ -45,15 +45,16 @@ class PlotCommissionV2Model extends MasterModel {
         COALESCE(SUM(pcp.amount) FILTER (WHERE LOWER(COALESCE(pcp.status, 'approved')) IN ('approved', 'pending')), 0) AS total_paid_all,
         (pc.total_commission - COALESCE(SUM(pcp.amount) FILTER (WHERE LOWER(COALESCE(pcp.status, 'approved')) = 'approved'), 0)) AS balance
       FROM plot_commissions_v2 pc
-      JOIN plots p ON pc.plot_id = p.id
-      JOIN members m ON pc.agent_id = m.id
+      JOIN sites s ON s.id = pc.site_id AND s.organization_id = $3
+      JOIN plots p ON pc.plot_id = p.id AND p.site_id = pc.site_id
+      JOIN members m ON pc.agent_id = m.id AND m.site_id = pc.site_id
       LEFT JOIN plot_commission_payments pcp
         ON pc.id = pcp.plot_commission_id
         AND UPPER(COALESCE(pcp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
-      WHERE pc.id = $1
+      WHERE pc.id = $1 AND pc.site_id = $2
       GROUP BY pc.id, p.id, m.id
     `;
-    const result = await pool.query(query, [id]);
+    const result = await pool.query(query, [id, siteId, organizationId]);
     return result.rows[0];
   }
 
@@ -70,7 +71,7 @@ class PlotCommissionV2Model extends MasterModel {
    * Get one row per plot with latest agent info, all agent names, and aggregated financials.
    * Used for the list page (no OLD/NEW logic — one entry per plot).
    */
-  async findBySiteIdGroupedByPlot(siteId, pool) {
+  async findBySiteIdGroupedByPlot(siteId, organizationId, pool) {
     const query = `
       WITH commission_agg AS (
         SELECT
@@ -100,8 +101,9 @@ class PlotCommissionV2Model extends MasterModel {
           (pc.total_commission - COALESCE(SUM(pcp.amount), 0)) AS balance,
           ROW_NUMBER() OVER (PARTITION BY pc.plot_id ORDER BY pc.created_at DESC) AS rn
         FROM plot_commissions_v2 pc
-        JOIN plots p ON pc.plot_id = p.id
-        JOIN members m ON pc.agent_id = m.id
+        JOIN sites s ON s.id = pc.site_id AND s.organization_id = $2
+        JOIN plots p ON pc.plot_id = p.id AND p.site_id = pc.site_id
+        JOIN members m ON pc.agent_id = m.id AND m.site_id = pc.site_id
         LEFT JOIN plot_commission_payments pcp
           ON pc.id = pcp.plot_commission_id
           AND LOWER(COALESCE(pcp.status, 'approved')) = 'approved'
@@ -141,7 +143,7 @@ class PlotCommissionV2Model extends MasterModel {
       SELECT * FROM plot_summary
       ORDER BY plot_no ASC
     `;
-    const result = await pool.query(query, [siteId]);
+    const result = await pool.query(query, [siteId, organizationId]);
     return result.rows;
   }
 
@@ -149,7 +151,7 @@ class PlotCommissionV2Model extends MasterModel {
    * Get all commission entries for a specific plot with payment aggregates.
    * Used by the detail page to show agent history.
    */
-  async findAllCommissionsByPlotId(plotId, siteId, pool) {
+  async findAllCommissionsByPlotId(plotId, siteId, organizationId, pool) {
     const query = `
       SELECT
         pc.id, pc.site_id, pc.plot_id, pc.agent_id, pc.total_commission, pc.remarks, pc.status, pc.created_at,
@@ -161,15 +163,15 @@ class PlotCommissionV2Model extends MasterModel {
         COALESCE(SUM(pcp.amount) FILTER (WHERE LOWER(COALESCE(pcp.status, 'approved')) IN ('approved', 'pending') AND UPPER(COALESCE(pcp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')), 0) AS total_paid_all,
         (pc.total_commission - COALESCE(SUM(pcp.amount) FILTER (WHERE LOWER(COALESCE(pcp.status, 'approved')) = 'approved' AND UPPER(COALESCE(pcp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')), 0)) AS balance
       FROM plot_commissions_v2 pc
-      JOIN plots p ON pc.plot_id = p.id
-      JOIN members m ON pc.agent_id = m.id
-      JOIN sites s ON pc.site_id = s.id
+      JOIN sites s ON pc.site_id = s.id AND s.organization_id = $3
+      JOIN plots p ON pc.plot_id = p.id AND p.site_id = pc.site_id
+      JOIN members m ON pc.agent_id = m.id AND m.site_id = pc.site_id
       LEFT JOIN plot_commission_payments pcp ON pc.id = pcp.plot_commission_id
       WHERE pc.plot_id = $1 AND pc.site_id = $2
       GROUP BY pc.id, p.id, m.id, s.id
       ORDER BY pc.created_at ASC
     `;
-    const result = await pool.query(query, [plotId, siteId]);
+    const result = await pool.query(query, [plotId, siteId, organizationId]);
     return result.rows;
   }
 }
@@ -182,16 +184,19 @@ class PlotCommissionPaymentModel extends MasterModel {
   /**
    * Get all payments for a specific commission master record.
    */
-  async findByCommissionId(commissionId, pool) {
+  async findByCommissionId(commissionId, siteId, organizationId, pool) {
     const query = `
       SELECT pcp.*, u.name AS created_by_name, a.name AS approved_by_name
       FROM plot_commission_payments pcp
-      LEFT JOIN users u ON pcp.created_by = u.id
-      LEFT JOIN users a ON pcp.approved_by = a.id
+      JOIN plot_commissions_v2 pc ON pc.id = pcp.plot_commission_id AND pc.site_id = $2
+      JOIN sites s ON s.id = pc.site_id AND s.organization_id = $3
+      LEFT JOIN users u ON pcp.created_by = u.id AND u.organization_id = $3
+      LEFT JOIN users a ON pcp.approved_by = a.id AND a.organization_id = $3
       WHERE pcp.plot_commission_id = $1
+        AND (pcp.site_id = $2 OR pcp.site_id IS NULL)
       ORDER BY pcp.date DESC, pcp.created_at DESC
     `;
-    const result = await pool.query(query, [commissionId]);
+    const result = await pool.query(query, [commissionId, siteId, organizationId]);
     return result.rows;
   }
 }

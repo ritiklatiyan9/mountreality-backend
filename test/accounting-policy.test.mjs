@@ -10,7 +10,7 @@ import {
   BUCKETS as frontendBuckets,
   NON_CASH_BUCKETS,
   classifyPaymentMode as classifyFrontend,
-} from '../../mountreality-frontend/src/utils/paymentMode.js';
+} from '../../Frontend/src/utils/paymentMode.js';
 
 const CASES = [
   ['CASH', 'cash'],
@@ -194,7 +194,7 @@ test('daily DayBook shows specialized mirrors only on the authoritative source d
 
 test('DayBook presentation filters do not rewrite book running or closing balances', async () => {
   const source = await readFile(
-    new URL('../../mountreality-frontend/src/pages/DayBook.jsx', import.meta.url),
+    new URL('../../Frontend/src/pages/DayBook.jsx', import.meta.url),
     'utf8'
   );
 
@@ -210,7 +210,7 @@ test('DayBook presentation filters do not rewrite book running or closing balanc
 
 test('Balance Sheet exports distinguish whole-book accounting from filtered rows', async () => {
   const source = await readFile(
-    new URL('../../mountreality-frontend/src/pages/BalanceSheet.jsx', import.meta.url),
+    new URL('../../Frontend/src/pages/BalanceSheet.jsx', import.meta.url),
     'utf8'
   );
 
@@ -543,7 +543,7 @@ test('V2 commission payment mode edits preserve or reset cheque lifecycle atomic
   )?.[0] || '';
 
   assert.match(updateBody, /ledger_bucket\(\$\$?\{?paymentModeParamIndex\}?::text\) = 'cheque'/);
-  assert.match(updateBody, /ledger_bucket\(plot_commission_payments\.payment_mode\) = 'cheque'/);
+  assert.match(updateBody, /ledger_bucket\((?:plot_commission_payments|pcp)\.payment_mode\) = 'cheque'/);
   assert.match(updateBody, /ELSE 'PENDING'/);
   assert.match(updateBody, /fields\.push\('cheque_no = NULL'\)/);
   assert.match(source, /const isCheque = classifyPaymentMode\(mode\) === 'cheque'/);

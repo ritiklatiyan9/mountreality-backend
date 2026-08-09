@@ -15,7 +15,7 @@ export const getVendorUsers = asyncHandler(async (req, res) => {
   if (!siteId) return res.status(400).json({ message: 'site_id is required' });
 
   const result = await pool.query(
-    `SELECT id, full_name, phone, business_name, service_type
+    `SELECT id, full_name, photo, phone, business_name, service_type
      FROM members
      WHERE site_id = $1
        AND member_type = 'VENDOR'
@@ -40,7 +40,7 @@ export const createVendorUser = asyncHandler(async (req, res) => {
   const result = await pool.query(
     `INSERT INTO members (site_id, full_name, phone, business_name, service_type, member_type, status, created_by)
      VALUES ($1, $2, $3, $4, $5, 'VENDOR', 'ACTIVE', $6)
-     RETURNING id, full_name, phone, business_name, service_type`,
+     RETURNING id, full_name, photo, phone, business_name, service_type`,
     [siteId, fullName.toUpperCase(), phone, businessName, serviceType, req.user?.id || null]
   );
 
@@ -210,6 +210,7 @@ export const listVendorCommitments = asyncHandler(async (req, res) => {
       COALESCE(SUM(vp.amount), 0)::numeric(14,2) AS paid_amount,
       (vc.contract_amount - COALESCE(SUM(vp.amount), 0))::numeric(14,2) AS remaining_amount,
       m.full_name AS vendor_member_name,
+      m.photo AS vendor_member_photo,
       COUNT(vp.id)::int AS payment_count,
       COALESCE(inv.item_count, 0)::int AS inventory_item_count,
       COALESCE(inv.inv_net_amount, 0)::numeric(14,2) AS inventory_net_amount,
@@ -236,7 +237,7 @@ export const listVendorCommitments = asyncHandler(async (req, res) => {
        GROUP BY commitment_id
      ) inv ON inv.commitment_id = vc.id
      WHERE ${whereClause}
-     GROUP BY vc.id, m.full_name, cu.name, cu.email, inv.item_count, inv.inv_net_amount, inv.inv_total_paid, inv.inv_outstanding
+     GROUP BY vc.id, m.full_name, m.photo, cu.name, cu.email, inv.item_count, inv.inv_net_amount, inv.inv_total_paid, inv.inv_outstanding
      ORDER BY vc.created_at DESC, vc.id DESC
      LIMIT $${paramIdx} OFFSET $${paramIdx + 1}`,
     [...values, limit, offset]
@@ -324,14 +325,15 @@ export const getVendorCommitmentDetail = asyncHandler(async (req, res) => {
       vc.created_at,
       COALESCE(SUM(vp.amount), 0)::numeric(14,2) AS paid_amount,
       (vc.contract_amount - COALESCE(SUM(vp.amount), 0))::numeric(14,2) AS remaining_amount,
-      m.full_name AS vendor_member_name
+      m.full_name AS vendor_member_name,
+      m.photo AS vendor_member_photo
      FROM vendor_commitments vc
      LEFT JOIN vendor_payments vp ON vp.commitment_id = vc.id
        AND LOWER(COALESCE(vp.status, '')) = 'approved'
        AND UPPER(COALESCE(vp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
      LEFT JOIN members m ON m.id = vc.vendor_member_id
      WHERE vc.id = $1 AND vc.site_id = $2
-     GROUP BY vc.id, m.full_name`,
+     GROUP BY vc.id, m.full_name, m.photo`,
     [commitmentId, siteId]
   );
 
@@ -659,51 +661,59 @@ export const addVendorPayment = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Map this payment to either a client or a user, not both' });
   }
 
-  // Verify the commitment belongs to this site without taking a row-lock —
-  // there's no business invariant being enforced here (we don't reject
-  // overpayment), so the FOR UPDATE round-trip + the SUM(amount) round-trip
-  // were both wasted latency. We now do a single existence check, then INSERT.
-  const commitmentExistsResult = await pool.query(
-    `SELECT id FROM vendor_commitments WHERE id = $1 AND site_id = $2`,
-    [commitmentId, siteId]
-  );
-  if (!commitmentExistsResult.rows[0]) {
-    return res.status(404).json({ message: 'Commitment not found' });
-  }
-
   const vendorPayMode = normalizeCashType(payment_mode);
-  const paymentResult = await pool.query(
-    `INSERT INTO vendor_payments (commitment_id, site_id, payment_date, amount, payment_mode, reference_no, note, voucher_url, status, created_by, assigned_admin_id, cheque_no, cheque_status, mapped_member_id, mapped_user_id)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-     RETURNING *`,
-    [
-      commitmentId,
-      siteId,
-      payment_date,
-      paymentAmount,
-      vendorPayMode,
-      reference_no?.trim() || null,
-      note?.trim() || null,
-      voucher_url || null,
-      'pending',
-      req.user.id,
-      assigned_admin_id ? parseInt(assigned_admin_id) : null,
-      vendorPayMode === 'cheque' && req.body.cheque_no
-        ? String(req.body.cheque_no).trim()
-        : null,
-      vendorPayMode === 'cheque' ? 'PENDING' : null,
-      mapped_member_id ? parseInt(mapped_member_id) : null,
-      mapped_user_id ? parseInt(mapped_user_id) : null,
-    ]
-  );
+  // Recording a settled cash/bank/UPI transfer is an actual outflow, not a
+  // request. Keep only cheque payments pending until their settlement can be
+  // verified, so the procurement register and dashboard share one truth.
+  const isChequePayment = vendorPayMode === 'cheque';
+  const paymentStatus = isChequePayment ? 'pending' : 'approved';
+  const approvedBy = isChequePayment ? null : req.user.id;
+  const approvedAt = isChequePayment ? null : new Date();
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const commitmentResult = await client.query(
+      `SELECT vc.id, vc.contract_amount,
+         COALESCE((SELECT SUM(vp.amount) FROM vendor_payments vp
+           WHERE vp.commitment_id = vc.id
+             AND LOWER(COALESCE(vp.status, '')) NOT IN ('rejected', 'cancelled')
+             AND UPPER(COALESCE(vp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')), 0) AS committed_amount
+       FROM vendor_commitments vc WHERE vc.id = $1 AND vc.site_id = $2 FOR UPDATE`,
+      [commitmentId, siteId]
+    );
+    const commitment = commitmentResult.rows[0];
+    if (!commitment) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Commitment not found' }); }
+    const outstanding = Number(commitment.contract_amount) - Number(commitment.committed_amount);
+    if (paymentAmount > outstanding + 0.005) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: `Payment exceeds the commitment balance by ${Math.max(0, paymentAmount - outstanding).toFixed(2)}` });
+    }
 
-  // Touch updated_at (fire-and-forget — caller doesn't read it).
-  pool.query(
-    `UPDATE vendor_commitments SET updated_at = CURRENT_TIMESTAMP WHERE id = $1`,
-    [commitmentId]
-  ).catch((err) => console.error('Touch commitment failed:', err.message));
-
-  res.status(201).json({ payment: paymentResult.rows[0] });
+    const paymentResult = await client.query(
+      `INSERT INTO vendor_payments (commitment_id, site_id, payment_date, amount, payment_mode, reference_no, note, voucher_url, status, created_by, assigned_admin_id, cheque_no, cheque_status, mapped_member_id, mapped_user_id, approved_by, approved_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+       RETURNING *`,
+      [
+        commitmentId, siteId, payment_date, paymentAmount, vendorPayMode,
+        reference_no?.trim() || null, note?.trim() || null, voucher_url || null,
+        paymentStatus, req.user.id, assigned_admin_id ? parseInt(assigned_admin_id) : null,
+        vendorPayMode === 'cheque' && req.body.cheque_no ? String(req.body.cheque_no).trim() : null,
+        vendorPayMode === 'cheque' ? 'PENDING' : null,
+        mapped_member_id ? parseInt(mapped_member_id) : null,
+        mapped_user_id ? parseInt(mapped_user_id) : null,
+        approvedBy,
+        approvedAt,
+      ]
+    );
+    await client.query('UPDATE vendor_commitments SET updated_at = CURRENT_TIMESTAMP WHERE id = $1', [commitmentId]);
+    await client.query('COMMIT');
+    res.status(201).json({ payment: paymentResult.rows[0] });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 });
 
 export const updateVendorPayment = asyncHandler(async (req, res) => {
@@ -734,7 +744,7 @@ export const updateVendorPayment = asyncHandler(async (req, res) => {
   // a tx but didn't actually enforce any invariant, so all that latency was
   // wasted. We compose the WHERE on the UPDATE so it stays atomic.
   const existingResult = await pool.query(
-    `SELECT id, site_id, commitment_id, assigned_admin_id, payment_mode, cheque_no, cheque_status
+    `SELECT id, site_id, commitment_id, assigned_admin_id, payment_mode, cheque_no, cheque_status, status, approved_by, approved_at
      FROM vendor_payments WHERE id = $1`,
     [paymentId]
   );
@@ -752,12 +762,22 @@ export const updateVendorPayment = asyncHandler(async (req, res) => {
         ? (cheque_no ? String(cheque_no).trim() : null)
         : (normalizeCashType(existing.payment_mode) === 'cheque' ? existing.cheque_no || null : null))
     : null;
+  const nextStatus = nextPaymentMode === 'cheque'
+    ? existing.status
+    : (existing.status === 'pending' ? 'approved' : existing.status);
+  const nextApprovedBy = nextStatus === 'approved'
+    ? (existing.approved_by || req.user.id)
+    : existing.approved_by;
+  const nextApprovedAt = nextStatus === 'approved'
+    ? (existing.approved_at || new Date())
+    : existing.approved_at;
   const updatedPaymentResult = await pool.query(
     `UPDATE vendor_payments
         SET payment_date = $1, amount = $2, payment_mode = $3,
             reference_no = $4, note = $5, voucher_url = $6,
-            assigned_admin_id = $7, cheque_no = $8, cheque_status = $9
-      WHERE id = $10 AND site_id = $11
+            assigned_admin_id = $7, cheque_no = $8, cheque_status = $9,
+            status = $10, approved_by = $11, approved_at = $12
+      WHERE id = $13 AND site_id = $14
      RETURNING *`,
     [
       payment_date,
@@ -769,6 +789,9 @@ export const updateVendorPayment = asyncHandler(async (req, res) => {
       assigned_admin_id !== undefined ? (assigned_admin_id ? parseInt(assigned_admin_id) : null) : existing.assigned_admin_id,
       nextChequeNo,
       nextChequeStatus,
+      nextStatus,
+      nextApprovedBy,
+      nextApprovedAt,
       paymentId,
       siteId,
     ]
