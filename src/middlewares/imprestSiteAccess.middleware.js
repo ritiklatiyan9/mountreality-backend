@@ -1,5 +1,5 @@
 import pool from '../config/db.js';
-import { siteInOrg } from '../utils/orgScope.js';
+import { enforceEntitySiteAccess } from '../utils/siteAccessPolicy.js';
 
 const ADMIN_ROLES = new Set(['admin', 'super_admin']);
 
@@ -31,6 +31,7 @@ export const findEligibleImprestParticipant = async (userId, siteId, db = pool) 
   const { rows } = await db.query(
     `SELECT u.id, u.name, u.email, u.role
        FROM users u
+       JOIN sites s ON s.id = $2 AND s.organization_id = u.organization_id
       WHERE u.id = $1
         AND u.is_active = true
         AND (
@@ -98,26 +99,18 @@ const requireImprestSiteAccess = ({
         if (!rows[0]) return next();
         siteId = parsePositiveId(rows[0].site_id);
         if (!siteId) {
-          if (isAdmin(req)) return next();
           return res.status(409).json({ message: 'This record is not linked to a site' });
         }
       }
 
-      req.imprestSiteId = siteId;
-      if (isAdmin(req)) {
-        // Admins see every site of their own organization — never another tenant's.
-        if (!(await siteInOrg(siteId, req.user.organization_id))) {
-          return res.status(403).json({ message: 'Access denied to this site' });
-        }
-        return next();
-      }
-
-      const { rows } = await pool.query(
-        'SELECT 1 FROM user_sites WHERE user_id = $1 AND site_id = $2 LIMIT 1',
-        [req.user.id, siteId]
-      );
-      if (!rows[0]) return res.status(403).json({ message: 'Access denied to this site' });
-
+      const allowed = await enforceEntitySiteAccess({
+        req,
+        res,
+        siteId,
+        module: 'imprest',
+        contextProperty: 'imprestSiteId',
+      });
+      if (!allowed) return;
       return next();
     } catch (error) {
       return next(error);

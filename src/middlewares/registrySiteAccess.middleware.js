@@ -1,7 +1,5 @@
 import pool from '../config/db.js';
-import { siteInOrg } from '../utils/orgScope.js';
-
-const ADMIN_ROLES = new Set(['admin', 'super_admin']);
+import { enforceEntitySiteAccess } from '../utils/siteAccessPolicy.js';
 
 const parsePositiveId = (value) => {
   const id = Number.parseInt(value, 10);
@@ -16,6 +14,14 @@ const SITE_LOOKUPS = Object.freeze({
   payment: 'SELECT site_id FROM plot_registry_payments WHERE id = $1 LIMIT 1',
   plot: 'SELECT site_id FROM plots WHERE id = $1 LIMIT 1',
   plotPayment: 'SELECT site_id FROM plot_payments WHERE id = $1 LIMIT 1',
+  document: `SELECT COALESCE(d.site_id, p.site_id, k.site_id, b.site_id) AS site_id
+               FROM documents d
+               LEFT JOIN plots p ON p.id = d.plot_id
+               LEFT JOIN kyc_cases k ON k.id = d.kyc_case_id
+               LEFT JOIN bookings b ON b.id = k.booking_id
+              WHERE d.id = $1
+                AND d.uploaded_source = 'PLOT_REGISTRY'
+              LIMIT 1`,
 });
 
 /**
@@ -44,26 +50,18 @@ const requireRegistrySiteAccess = ({ entity, source, key }) => {
         siteId = parsePositiveId(rows[0].site_id);
       }
 
-      if (!siteId) return next();
-
-      // Admins see every site of their own organization — never another tenant's.
-      if (ADMIN_ROLES.has(req.user?.role)) {
-        if (!(await siteInOrg(siteId, req.user.organization_id))) {
-          return res.status(403).json({ message: 'Access denied to this site' });
-        }
-        req.registrySiteId = siteId;
-        return next();
+      if (!siteId) {
+        return res.status(409).json({ message: 'This record is not linked to a site' });
       }
 
-      const { rows } = await pool.query(
-        'SELECT 1 FROM user_sites WHERE user_id = $1 AND site_id = $2 LIMIT 1',
-        [req.user.id, siteId]
-      );
-      if (!rows[0]) {
-        return res.status(403).json({ message: 'Access denied to this site' });
-      }
-
-      req.registrySiteId = siteId;
+      const allowed = await enforceEntitySiteAccess({
+        req,
+        res,
+        siteId,
+        module: 'plot_registry',
+        contextProperty: 'registrySiteId',
+      });
+      if (!allowed) return;
       return next();
     } catch (error) {
       return next(error);

@@ -30,8 +30,19 @@ const BUCKET = process.env.AWS_S3_BUCKET_NAME || process.env.AWS_S3_BUCKET || ''
 // Co-locate with the booking module's local fallback dir name so dev files are predictable.
 const LOCAL_DIR = path.join(process.cwd(), 'uploads', 'kyc_documents');
 if (!fs.existsSync(LOCAL_DIR)) fs.mkdirSync(LOCAL_DIR, { recursive: true });
+// Regulatory evidence must never fall through to the public static KYC path.
+// It is streamed only after the compliance controller re-checks tenant, Site,
+// RBAC and field-policy access.
+const PRIVATE_LOCAL_DIR = path.join(process.cwd(), 'uploads', 'compliance_documents');
+if (!fs.existsSync(PRIVATE_LOCAL_DIR)) fs.mkdirSync(PRIVATE_LOCAL_DIR, { recursive: true });
 
 const usingS3 = () => Boolean(s3Client && process.env.AWS_ACCESS_KEY_ID && BUCKET);
+
+const localStoredName = (storageKey, marker) => {
+  const name = String(storageKey || '').replace(marker, '');
+  if (!name || name !== path.basename(name)) throw new Error('Invalid local document storage key');
+  return name;
+};
 
 /** Upload a document buffer. Returns a storage key: an S3 key, or `local::<name>`.
  *  `prefix` picks the S3 folder — kyc_documents by default; document-imprest proofs pass their own. */
@@ -49,16 +60,19 @@ export const uploadPlotDoc = async (fileBuffer, originalName, mimetype, prefix =
     await upload.done();
     return key;
   }
-  fs.writeFileSync(path.join(LOCAL_DIR, safeName), fileBuffer);
-  return `local::${safeName}`;
+  const privateComplianceEvidence = String(prefix || '').startsWith('compliance/')
+    || /(^|\/)rera_[a-z_]+(\/|$)/i.test(prefix);
+  fs.writeFileSync(path.join(privateComplianceEvidence ? PRIVATE_LOCAL_DIR : LOCAL_DIR, safeName), fileBuffer);
+  return `${privateComplianceEvidence ? 'local-private' : 'local'}::${safeName}`;
 };
 
 /** A browser-usable URL for a stored doc (signed for S3, static path for local). */
 export const getPlotDocUrl = async (storageKey) => {
   if (!storageKey) return null;
   if (/^https?:\/\//i.test(storageKey)) return storageKey;
+  if (storageKey.startsWith('local-private::')) return null;
   if (storageKey.startsWith('local::')) {
-    const name = storageKey.replace('local::', '');
+    const name = localStoredName(storageKey, 'local::');
     return `http://localhost:${process.env.PORT || 8000}/uploads/kyc_documents/${name}`;
   }
   if (usingS3()) {
@@ -85,8 +99,12 @@ export const getPlotDocPublicUrl = (storageKey) => {
 /** Read a stored document back into memory for OCR retry. */
 export const getPlotDocBytes = async (storageKey) => {
   if (!storageKey) throw new Error('Document storage key is missing');
+  if (storageKey.startsWith('local-private::')) {
+    const name = localStoredName(storageKey, 'local-private::');
+    return fs.readFileSync(path.join(PRIVATE_LOCAL_DIR, name));
+  }
   if (storageKey.startsWith('local::')) {
-    const name = storageKey.replace('local::', '');
+    const name = localStoredName(storageKey, 'local::');
     return fs.readFileSync(path.join(LOCAL_DIR, name));
   }
   if (/^https?:\/\//i.test(storageKey)) {
@@ -102,8 +120,11 @@ export const getPlotDocBytes = async (storageKey) => {
 /** Delete a stored doc from S3 or local disk (best-effort). */
 export const deletePlotDoc = async (storageKey) => {
   if (!storageKey) return;
-  if (storageKey.startsWith('local::')) {
-    const p = path.join(LOCAL_DIR, storageKey.replace('local::', ''));
+  if (storageKey.startsWith('local-private::')) {
+    const p = path.join(PRIVATE_LOCAL_DIR, localStoredName(storageKey, 'local-private::'));
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  } else if (storageKey.startsWith('local::')) {
+    const p = path.join(LOCAL_DIR, localStoredName(storageKey, 'local::'));
     if (fs.existsSync(p)) fs.unlinkSync(p);
   } else if (usingS3()) {
     await s3Client.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: storageKey }));

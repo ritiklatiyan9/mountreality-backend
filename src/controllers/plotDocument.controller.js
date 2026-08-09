@@ -17,16 +17,10 @@ const VALID_CATEGORIES = new Set([
 ]);
 const REGISTRY_CATEGORIES = new Set(['REGISTRY', 'NOC']);
 
-const ensureSiteAccess = async (req, res, siteId) => {
-  if (req.user.role === 'admin' || req.user.role === 'super_admin') return true;
-  const { rows } = await pool.query(
-    'SELECT 1 FROM user_sites WHERE user_id = $1 AND site_id = $2 LIMIT 1',
-    [req.user.id, siteId]
-  );
-  if (rows[0]) return true;
-  res.status(403).json({ message: 'Access denied to this site' });
-  return false;
-};
+const plotDocumentScope = (req) => ({
+  siteId: Number.parseInt(req.plotDocumentSiteId ?? req.siteContextId, 10),
+  organizationId: Number.parseInt(req.user?.organization_id, 10),
+});
 
 /** GET /plot-documents?site_id=  → plots for a site with a per-plot document count. */
 export const listPlotsWithDocs = asyncHandler(async (req, res) => {
@@ -36,7 +30,10 @@ export const listPlotsWithDocs = asyncHandler(async (req, res) => {
   if (!Number.isInteger(siteId) || siteId <= 0) {
     return res.status(400).json({ message: 'A valid site_id is required' });
   }
-  if (!await ensureSiteAccess(req, res, siteId)) return;
+  const scope = plotDocumentScope(req);
+  if (scope.siteId !== siteId) {
+    return res.status(409).json({ message: 'Selected site does not match the requested site' });
+  }
 
   // Optional comma-separated category filter for the generic plot-document view.
   // Registry deeds and NOCs are owned by the separately permissioned registry API.
@@ -61,8 +58,14 @@ export const listPlotsWithDocs = asyncHandler(async (req, res) => {
                   AND COALESCE(d.uploaded_source, 'BOOKING') NOT IN ('DMS', 'PLOT_REGISTRY')
                   AND UPPER(COALESCE(d.category, '')) NOT IN ('REGISTRY', 'NOC')
                   AND ($2::text[] IS NULL OR upper(d.category) = ANY($2::text[]))
+                  AND (d.site_id IS NULL OR d.site_id = p.site_id)
+                  AND (k.site_id IS NULL OR k.site_id = p.site_id)
+                  AND (b.site_id IS NULL OR b.site_id = p.site_id)
               )::int AS doc_count
          FROM plots p
+         JOIN sites scope_site
+           ON scope_site.id = p.site_id
+          AND scope_site.organization_id = $3
         WHERE p.site_id = $1
         ORDER BY p.site_id, p.plot_no, p.block, p.created_at DESC NULLS LAST, p.id DESC
      ) latest
@@ -70,7 +73,7 @@ export const listPlotsWithDocs = asyncHandler(async (req, res) => {
               substring(plot_no from '^[^0-9]*') ASC,
               COALESCE(NULLIF(substring(plot_no from '[0-9]+'), '')::bigint, 0) ASC,
               plot_no ASC`,
-    [siteId, cats]
+    [siteId, cats, scope.organizationId]
   );
   res.json({ plots: rows });
 });
@@ -78,16 +81,18 @@ export const listPlotsWithDocs = asyncHandler(async (req, res) => {
 /** GET /plot-documents/:plotId  → plot meta + its documents (each with a fresh signed URL). */
 export const getPlotDocuments = asyncHandler(async (req, res) => {
   const { plotId } = req.params;
+  const { siteId, organizationId } = plotDocumentScope(req);
 
   const { rows: plotRows } = await pool.query(
-    `SELECT id, plot_no, block, status, buyer_name, plot_size, plot_size_mtr,
-            booking_by, booking_date, sale_price, plot_rate, team, plot_tag, site_id
-       FROM plots WHERE id = $1`,
-    [plotId]
+    `SELECT p.id, p.plot_no, p.block, p.status, p.buyer_name, p.plot_size, p.plot_size_mtr,
+            p.booking_by, p.booking_date, p.sale_price, p.plot_rate, p.team, p.plot_tag, p.site_id
+       FROM plots p
+       JOIN sites s ON s.id = p.site_id AND s.organization_id = $3
+      WHERE p.id = $1 AND p.site_id = $2`,
+    [plotId, siteId, organizationId]
   );
   const plot = plotRows[0];
   if (!plot) return res.status(404).json({ message: 'Plot not found' });
-  if (!await ensureSiteAccess(req, res, plot.site_id)) return;
 
   const { rows: docs } = await pool.query(
     `SELECT d.id, d.type, d.category, d.title, d.original_name, d.file_path,
@@ -97,12 +102,15 @@ export const getPlotDocuments = asyncHandler(async (req, res) => {
        FROM documents d
        LEFT JOIN kyc_cases k ON k.id = d.kyc_case_id
        LEFT JOIN bookings  b ON b.id = k.booking_id
-       LEFT JOIN users     u ON u.id = d.uploaded_by
+       LEFT JOIN users     u ON u.id = d.uploaded_by AND u.organization_id = $3
       WHERE (d.plot_id = $1 OR b.plot_id = $1)
+        AND (d.site_id IS NULL OR d.site_id = $2)
+        AND (k.site_id IS NULL OR k.site_id = $2)
+        AND (b.site_id IS NULL OR b.site_id = $2)
         AND COALESCE(d.uploaded_source, 'BOOKING') NOT IN ('DMS', 'PLOT_REGISTRY')
         AND UPPER(COALESCE(d.category, '')) NOT IN ('REGISTRY', 'NOC')
       ORDER BY d.created_at DESC, d.id DESC`,
-    [plotId]
+    [plotId, siteId, organizationId]
   );
 
   for (const d of docs) {
@@ -120,12 +128,18 @@ export const getPlotDocuments = asyncHandler(async (req, res) => {
  */
 export const uploadPlotDocument = asyncHandler(async (req, res) => {
   const { plotId } = req.params;
+  const { siteId, organizationId } = plotDocumentScope(req);
   if (!req.file) return res.status(400).json({ message: 'No file uploaded (field name: file)' });
 
-  const { rows: plotRows } = await pool.query('SELECT id, site_id FROM plots WHERE id = $1', [plotId]);
+  const { rows: plotRows } = await pool.query(
+    `SELECT p.id, p.site_id
+       FROM plots p
+       JOIN sites s ON s.id = p.site_id AND s.organization_id = $3
+      WHERE p.id = $1 AND p.site_id = $2`,
+    [plotId, siteId, organizationId],
+  );
   const plot = plotRows[0];
   if (!plot) return res.status(404).json({ message: 'Plot not found' });
-  if (!await ensureSiteAccess(req, res, plot.site_id)) return;
 
   const rawCat = String(req.body.category || 'OTHER').toUpperCase();
   if (REGISTRY_CATEGORIES.has(rawCat)) {
@@ -142,16 +156,18 @@ export const uploadPlotDocument = asyncHandler(async (req, res) => {
   let clientMemberId = null;
   const { rows: bookingRows } = await pool.query(
     `SELECT id, client_member_id, site_id FROM bookings
-      WHERE plot_id = $1 AND status <> 'CANCELLED'
+      WHERE plot_id = $1 AND site_id = $2 AND status <> 'CANCELLED'
       ORDER BY id DESC LIMIT 1`,
-    [plotId]
+    [plotId, siteId]
   );
   const booking = bookingRows[0];
   if (booking) {
     clientMemberId = booking.client_member_id || null;
     const existing = await pool.query(
-      'SELECT id FROM kyc_cases WHERE booking_id = $1 ORDER BY id DESC LIMIT 1',
-      [booking.id]
+      `SELECT id FROM kyc_cases
+        WHERE booking_id = $1 AND (site_id = $2 OR site_id IS NULL)
+        ORDER BY id DESC LIMIT 1`,
+      [booking.id, siteId]
     );
     if (existing.rows[0]) {
       kycCaseId = existing.rows[0].id;
@@ -159,7 +175,7 @@ export const uploadPlotDocument = asyncHandler(async (req, res) => {
       const created = await pool.query(
         `INSERT INTO kyc_cases (booking_id, client_member_id, site_id, mode, status)
          VALUES ($1, $2, $3, 'MANUAL_OCR', 'OPEN') RETURNING id`,
-        [booking.id, booking.client_member_id || null, booking.site_id || plot.site_id]
+        [booking.id, booking.client_member_id || null, siteId]
       );
       kycCaseId = created.rows[0].id;
     }
@@ -181,7 +197,7 @@ export const uploadPlotDocument = asyncHandler(async (req, res) => {
        RETURNING id, type, category, title, original_name, file_path, mime_type, file_size,
                  uploaded_source, ocr_status, created_at, kyc_case_id`,
       [
-        kycCaseId, plotId, clientMemberId, plot.site_id, category, title,
+        kycCaseId, plotId, clientMemberId, siteId, category, title,
         req.file.originalname, storageKey, fileHash, req.file.mimetype, req.file.size,
         req.user?.id || null,
       ]
@@ -199,6 +215,7 @@ export const uploadPlotDocument = asyncHandler(async (req, res) => {
 /** DELETE /plot-documents/doc/:docId  → remove the file + DB row (cascades ocr_results). */
 export const deletePlotDocument = asyncHandler(async (req, res) => {
   const { docId } = req.params;
+  const { siteId, organizationId } = plotDocumentScope(req);
   const { rows } = await pool.query(
     `SELECT d.id, d.file_path,
             COALESCE(d.site_id, p.site_id, k.site_id, b.site_id) AS site_id
@@ -206,27 +223,44 @@ export const deletePlotDocument = asyncHandler(async (req, res) => {
        LEFT JOIN plots p ON p.id = d.plot_id
        LEFT JOIN kyc_cases k ON k.id = d.kyc_case_id
        LEFT JOIN bookings b ON b.id = k.booking_id
+       JOIN sites scope_site ON scope_site.id = $2 AND scope_site.organization_id = $3
       WHERE d.id = $1
+        AND (d.site_id IS NULL OR d.site_id = $2)
+        AND (p.site_id IS NULL OR p.site_id = $2)
+        AND (k.site_id IS NULL OR k.site_id = $2)
+        AND (b.site_id IS NULL OR b.site_id = $2)
         AND COALESCE(d.uploaded_source, 'BOOKING') NOT IN ('DMS', 'PLOT_REGISTRY')
         AND UPPER(COALESCE(d.category, '')) NOT IN ('REGISTRY', 'NOC')
         AND (d.plot_id IS NOT NULL OR b.plot_id IS NOT NULL)
       LIMIT 1`,
-    [docId]
+    [docId, siteId, organizationId]
   );
   const doc = rows[0];
   if (!doc) return res.status(404).json({ message: 'Document not found' });
   if (!doc.site_id) {
     return res.status(409).json({ message: 'The document is not linked to a site and cannot be removed here' });
   }
-  if (!await ensureSiteAccess(req, res, doc.site_id)) return;
-
   const deleted = await pool.query(
-    `DELETE FROM documents
-      WHERE id = $1
-        AND COALESCE(uploaded_source, 'BOOKING') NOT IN ('DMS', 'PLOT_REGISTRY')
-        AND UPPER(COALESCE(category, '')) NOT IN ('REGISTRY', 'NOC')
-      RETURNING id, file_path`,
-    [docId]
+    `DELETE FROM documents target
+      WHERE target.id = $1
+        AND EXISTS (
+          SELECT 1
+            FROM documents d
+            LEFT JOIN plots p ON p.id = d.plot_id
+            LEFT JOIN kyc_cases k ON k.id = d.kyc_case_id
+            LEFT JOIN bookings b ON b.id = k.booking_id
+            JOIN sites scope_site ON scope_site.id = $2 AND scope_site.organization_id = $3
+           WHERE d.id = target.id
+             AND (d.site_id IS NULL OR d.site_id = $2)
+             AND (p.site_id IS NULL OR p.site_id = $2)
+             AND (k.site_id IS NULL OR k.site_id = $2)
+             AND (b.site_id IS NULL OR b.site_id = $2)
+             AND COALESCE(d.uploaded_source, 'BOOKING') NOT IN ('DMS', 'PLOT_REGISTRY')
+             AND UPPER(COALESCE(d.category, '')) NOT IN ('REGISTRY', 'NOC')
+             AND (d.plot_id IS NOT NULL OR b.plot_id IS NOT NULL)
+        )
+      RETURNING target.id, target.file_path`,
+    [docId, siteId, organizationId]
   );
   if (!deleted.rows[0]) return res.status(404).json({ message: 'Document not found' });
   try { await deletePlotDoc(deleted.rows[0].file_path); } catch { /* best-effort file cleanup */ }

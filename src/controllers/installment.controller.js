@@ -573,12 +573,16 @@ export const createInstallments = asyncHandler(async (req, res) => {
 
     const data = {
       plot_id: parseInt(id),
+      booking_id: plot.current_booking_id || null,
       installment_name: inst.installment_name || `Installment ${nextOrder}`,
+      milestone_code: inst.milestone_code || null,
       amount: parseFloat(inst.amount) || 0,
       due_date: inst.due_date,
       status: 'pending',
       paid_amount: 0,
       sort_order: nextOrder++,
+      rera_project_id: plot.rera_project_id || null,
+      rera_project_phase_id: plot.rera_project_phase_id || null,
     };
     const row = await installmentModel.create(data, pool);
     created.push(row);

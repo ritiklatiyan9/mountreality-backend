@@ -1,7 +1,15 @@
 import asyncHandler from '../utils/asyncHandler.js';
 import permissionModel, { ALL_MODULES } from '../models/Permission.model.js';
-import userModel from '../models/User.model.js';
 import pool from '../config/db.js';
+
+const findTenantSubAdmin = async (userId, organizationId) => {
+    const { rows } = await pool.query(
+        `SELECT id,role,organization_id FROM users
+          WHERE id=$1 AND organization_id=$2 AND role='sub_admin' LIMIT 1`,
+        [userId, organizationId]
+    );
+    return rows[0] || null;
+};
 
 /**
  * GET /permissions/:userId
@@ -16,8 +24,8 @@ export const getPermissions = asyncHandler(async (req, res) => {
     }
 
     // Verify user exists and is a sub_admin
-    const user = await userModel.findById(parsedUserId, pool);
-    if (!user || user.role !== 'sub_admin') {
+    const user = await findTenantSubAdmin(parsedUserId, req.user.organization_id);
+    if (!user) {
         return res.status(404).json({ message: 'Sub-admin not found' });
     }
 
@@ -45,8 +53,8 @@ export const updatePermissions = asyncHandler(async (req, res) => {
     }
 
     // Verify user exists and is a sub_admin
-    const user = await userModel.findById(parsedUserId, pool);
-    if (!user || user.role !== 'sub_admin') {
+    const user = await findTenantSubAdmin(parsedUserId, req.user.organization_id);
+    if (!user) {
         return res.status(404).json({ message: 'Sub-admin not found' });
     }
 

@@ -3,6 +3,7 @@ import pool from '../config/db.js';
 import { hashPassword } from '../config/jwt.js';
 import userModel from '../models/User.model.js';
 import { generateUniqueSubdomain, isValidSubdomain } from '../utils/subdomain.js';
+import { sendRegistrationEmail, sendPlanPurchaseEmail, sendOwnerNotificationEmail } from '../utils/mailer.js';
 
 /**
  * GET /owner/stats — platform KPIs for the Owner Panel dashboard.
@@ -112,6 +113,16 @@ export const registerOrganization = asyncHandler(async (req, res) => {
       [org.rows[0].id, plan.id, days]
     );
     await client.query('COMMIT');
+
+    sendRegistrationEmail({ to: email, name, companyName: company_name, orgSubdomain: subdomain })
+      .catch((err) => console.error('[mailer] registration email failed:', err.message));
+    sendPlanPurchaseEmail({
+      to: email, name, companyName: company_name, planName: plan.name, amount: plan.price_inr, days, orgSubdomain: subdomain,
+    }).catch((err) => console.error('[mailer] purchase email failed:', err.message));
+    sendOwnerNotificationEmail({
+      kind: 'registration', companyName: company_name, contactName: name, contactEmail: email,
+      contactPhone: phone, planName: plan.name, amount: plan.price_inr, orgId: org.rows[0].id,
+    }).catch((err) => console.error('[mailer] owner notify failed:', err.message));
 
     res.status(201).json({
       organization: org.rows[0],
@@ -247,6 +258,36 @@ export const updateOrganization = asyncHandler(async (req, res) => {
 });
 
 /**
+ * DELETE /owner/organizations/:id — permanently removes an organization.
+ * Only allowed while it has zero users and zero sites (users.organization_id /
+ * sites.organization_id are NOT ON DELETE CASCADE, by design — an org with
+ * real tenants should be disabled, not deleted). Subscriptions/compliance/KYC
+ * rows do cascade, so an empty org's history goes with it.
+ */
+export const deleteOrganization = asyncHandler(async (req, res) => {
+  const orgId = parseInt(req.params.id, 10);
+  if (!Number.isInteger(orgId)) return res.status(400).json({ message: 'Invalid organization id' });
+
+  const { rows: org } = await pool.query('SELECT name FROM organizations WHERE id = $1', [orgId]);
+  if (!org[0]) return res.status(404).json({ message: 'Organization not found' });
+
+  const { rows: [usage] } = await pool.query(
+    `SELECT
+       (SELECT COUNT(*)::int FROM users WHERE organization_id = $1) AS user_count,
+       (SELECT COUNT(*)::int FROM sites WHERE organization_id = $1) AS site_count`,
+    [orgId]
+  );
+  if (usage.user_count > 0 || usage.site_count > 0) {
+    return res.status(409).json({
+      message: `Can't delete — ${org[0].name} still has ${usage.user_count} user${usage.user_count === 1 ? '' : 's'} and ${usage.site_count} site${usage.site_count === 1 ? '' : 's'}. Disable it instead, or remove its users and sites first.`,
+    });
+  }
+
+  await pool.query('DELETE FROM organizations WHERE id = $1', [orgId]);
+  res.json({ message: `${org[0].name} deleted` });
+});
+
+/**
  * POST /owner/organizations/:id/extend — body { days, plan_id? }.
  * Manually grant/extend a subscription (comp, offline payment, goodwill).
  */
@@ -286,4 +327,85 @@ export const extendSubscription = asyncHandler(async (req, res) => {
   );
 
   res.json({ message: `Subscription extended by ${days} days`, subscription: sub[0] });
+});
+
+const slugify = (value) => String(value).toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'plan';
+
+const uniquePlanCode = async (name) => {
+  const base = slugify(name);
+  let code = base;
+  let suffix = 2;
+  while (true) {
+    const { rows } = await pool.query('SELECT 1 FROM plans WHERE code = $1', [code]);
+    if (!rows[0]) return code;
+    code = `${base}-${suffix++}`;
+  }
+};
+
+/**
+ * GET /owner/plans — every plan, including inactive ones, for the management table.
+ */
+export const listPlansAdmin = asyncHandler(async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM plans ORDER BY price_inr ASC');
+  res.json({ plans: rows });
+});
+
+/**
+ * POST /owner/plans — body { name, price_inr, site_limit, max_users?, features? }.
+ * code is auto-derived from name; new plans are active by default.
+ */
+export const createPlan = asyncHandler(async (req, res) => {
+  const { name, price_inr, site_limit, max_users, features } = req.body;
+  if (!name || !Number.isFinite(Number(price_inr)) || !Number.isFinite(Number(site_limit))) {
+    return res.status(400).json({ message: 'name, price_inr and site_limit are required' });
+  }
+
+  const code = await uniquePlanCode(name);
+  const { rows } = await pool.query(
+    `INSERT INTO plans (code, name, price_inr, site_limit, max_users, features)
+     VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+    [
+      code,
+      String(name).trim(),
+      parseInt(price_inr, 10),
+      parseInt(site_limit, 10),
+      Number.isFinite(Number(max_users)) ? parseInt(max_users, 10) : null,
+      JSON.stringify(Array.isArray(features) ? features : []),
+    ]
+  );
+
+  res.status(201).json({ plan: rows[0], message: `${name} plan created` });
+});
+
+/**
+ * PATCH /owner/plans/:id — body any of { name, price_inr, site_limit, max_users, features, is_active }.
+ */
+export const updatePlan = asyncHandler(async (req, res) => {
+  const planId = parseInt(req.params.id, 10);
+  if (!Number.isInteger(planId)) return res.status(400).json({ message: 'Invalid plan id' });
+
+  const { name, price_inr, site_limit, max_users, features, is_active } = req.body;
+  const sets = [];
+  const values = [];
+  const set = (column, value) => { values.push(value); sets.push(`${column} = $${values.length}`); };
+
+  if (name !== undefined) set('name', String(name).trim());
+  if (price_inr !== undefined) set('price_inr', parseInt(price_inr, 10));
+  if (site_limit !== undefined) set('site_limit', parseInt(site_limit, 10));
+  if (max_users !== undefined) set('max_users', max_users === null || max_users === '' ? null : parseInt(max_users, 10));
+  if (features !== undefined) set('features', JSON.stringify(Array.isArray(features) ? features : []));
+  if (is_active !== undefined) {
+    if (typeof is_active !== 'boolean') return res.status(400).json({ message: 'is_active must be boolean' });
+    set('is_active', is_active);
+  }
+  if (!sets.length) return res.status(400).json({ message: 'Nothing to update' });
+
+  values.push(planId);
+  const { rows } = await pool.query(
+    `UPDATE plans SET ${sets.join(', ')} WHERE id = $${values.length} RETURNING *`,
+    values
+  );
+  if (!rows[0]) return res.status(404).json({ message: 'Plan not found' });
+
+  res.json({ plan: rows[0], message: 'Plan updated' });
 });

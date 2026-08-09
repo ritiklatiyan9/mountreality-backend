@@ -5,6 +5,24 @@ import pool from '../config/db.js';
 import { classifyPaymentMode } from '../utils/paymentMode.js';
 
 const normalizePaymentMode = (raw) => String(raw || 'BANK').trim().toUpperCase() || 'BANK';
+const commissionScope = (req) => ({
+  siteId: Number.parseInt(req.commissionSiteId ?? req.siteContextId, 10),
+  organizationId: Number.parseInt(req.user?.organization_id, 10),
+});
+
+const assignedUserBelongsToSite = async (userId, siteId, organizationId) => {
+  if (!userId) return true;
+  const { rows } = await pool.query(
+    `SELECT 1 FROM users u
+      WHERE u.id = $1 AND u.organization_id = $3 AND u.is_active = true
+        AND (u.role IN ('admin', 'super_admin') OR EXISTS (
+          SELECT 1 FROM user_sites us WHERE us.user_id = u.id AND us.site_id = $2
+        ))
+      LIMIT 1`,
+    [userId, siteId, organizationId],
+  );
+  return Boolean(rows[0]);
+};
 
 const resolveChequeStatus = ({ currentMode, currentStatus, nextMode, requestedStatus }) => {
   if (classifyPaymentMode(nextMode) !== 'cheque') return null;
@@ -28,11 +46,19 @@ export const createCommission = asyncHandler(async (req, res) => {
 
   if (!site_id) return res.status(400).json({ message: 'Site is required' });
   if (!particular) return res.status(400).json({ message: 'Particular (person name) is required' });
+  const { siteId, organizationId } = commissionScope(req);
+  if (siteId !== parseInt(site_id)) {
+    return res.status(409).json({ message: 'Selected site does not match the requested site' });
+  }
+  const assignedAdminId = assigned_admin_id ? parseInt(assigned_admin_id) : null;
+  if (!await assignedUserBelongsToSite(assignedAdminId, siteId, organizationId)) {
+    return res.status(400).json({ message: 'Assigned admin is not available for this Site' });
+  }
 
   const commissionPaymentMode = normalizePaymentMode(payment_mode || by_note);
   const isCheque = classifyPaymentMode(commissionPaymentMode) === 'cheque';
   const data = {
-    site_id: parseInt(site_id),
+    site_id: siteId,
     date: date || new Date().toISOString().split('T')[0],
     particular: particular.trim().toUpperCase(),
     father_name: father_name ? father_name.trim().toUpperCase() : null,
@@ -47,7 +73,7 @@ export const createCommission = asyncHandler(async (req, res) => {
     remarks: remarks ? remarks.trim() : null,
     created_by: req.user.id,
     voucher_url: voucher_url || null,
-    assigned_admin_id: assigned_admin_id ? parseInt(assigned_admin_id) : null,
+    assigned_admin_id: assignedAdminId,
     status: 'pending',
   };
 
@@ -58,7 +84,7 @@ export const createCommission = asyncHandler(async (req, res) => {
   if (commissionAmount > 0) {
     const plotInfo = plot_no ? ` (Plot: ${plot_no.trim().toUpperCase()})` : '';
     await dayBookModel.create({
-      site_id: parseInt(site_id),
+      site_id: siteId,
       date: data.date,
       particular: `${data.particular}${plotInfo} - COMMISSION`.toUpperCase(),
       entry_type: 'PLOT COMMISSION',
@@ -72,7 +98,7 @@ export const createCommission = asyncHandler(async (req, res) => {
       from_entity: null,
       to_entity: data.particular,
       created_by: req.user.id,
-      assigned_admin_id: assigned_admin_id ? parseInt(assigned_admin_id) : null,
+      assigned_admin_id: assignedAdminId,
       commission_id: commission.id,
       status: data.status,
     }, pool);
@@ -89,11 +115,11 @@ export const listCommissions = asyncHandler(async (req, res) => {
   const { site_id } = req.query;
   if (!site_id) return res.status(400).json({ message: 'site_id query param is required' });
 
-  const siteId = parseInt(site_id);
+  const { siteId, organizationId } = commissionScope(req);
   const [commissions, summary, persons] = await Promise.all([
-    plotCommissionModel.findBySiteId(siteId, pool),
-    plotCommissionModel.getSummary(siteId, pool),
-    plotCommissionModel.getPersonSummary(siteId, pool),
+    plotCommissionModel.findBySiteIdScoped(siteId, organizationId, pool),
+    plotCommissionModel.getSummaryScoped(siteId, organizationId, pool),
+    plotCommissionModel.getPersonSummaryScoped(siteId, organizationId, pool),
   ]);
 
   res.json({ commissions, summary, persons });
@@ -107,10 +133,10 @@ export const getAutocomplete = asyncHandler(async (req, res) => {
   const { site_id } = req.query;
   if (!site_id) return res.status(400).json({ message: 'site_id is required' });
 
-  const siteId = parseInt(site_id);
+  const { siteId, organizationId } = commissionScope(req);
   const [particulars, plots] = await Promise.all([
-    plotCommissionModel.getUniqueParticulars(siteId, pool),
-    plotCommissionModel.getUniquePlots(siteId, pool),
+    plotCommissionModel.getUniqueParticularsScoped(siteId, organizationId, pool),
+    plotCommissionModel.getUniquePlotsScoped(siteId, organizationId, pool),
   ]);
 
   res.json({ particulars, plots });
@@ -122,7 +148,10 @@ export const getAutocomplete = asyncHandler(async (req, res) => {
  */
 export const getCommission = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const commission = await plotCommissionModel.findById(parseInt(id), pool);
+  const { siteId, organizationId } = commissionScope(req);
+  const commission = await plotCommissionModel.findByIdScoped(
+    parseInt(id), siteId, organizationId, pool,
+  );
   if (!commission) return res.status(404).json({ message: 'Commission entry not found' });
   res.json({ commission });
 });
@@ -133,9 +162,12 @@ export const getCommission = asyncHandler(async (req, res) => {
  */
 export const updateCommission = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const { siteId, organizationId } = commissionScope(req);
   const { date, particular, father_name, plot_no, plot_size, plot_rate, amount, by_note, payment_mode, remarks, voucher_url, cheque_no, cheque_status } = req.body;
 
-  const existing = await plotCommissionModel.findById(parseInt(id), pool);
+  const existing = await plotCommissionModel.findByIdScoped(
+    parseInt(id), siteId, organizationId, pool,
+  );
   if (!existing) return res.status(404).json({ message: 'Commission entry not found' });
 
   const updateData = {};
@@ -184,13 +216,23 @@ export const updateCommission = asyncHandler(async (req, res) => {
     }
   }
 
-  const updated = await plotCommissionModel.update(parseInt(id), updateData, pool);
+  if (Object.keys(updateData).length === 0) {
+    return res.status(400).json({ message: 'Nothing to update' });
+  }
+
+  const updated = await plotCommissionModel.updateScoped(
+    parseInt(id), updateData, siteId, organizationId, pool,
+  );
 
   // ── Sync DayBook entry ──
   try {
     const dayBookResult = await pool.query(
-      `SELECT id FROM day_book WHERE commission_id = $1 LIMIT 1`,
-      [parseInt(id)]
+      `SELECT db.id
+         FROM day_book db
+         JOIN sites s ON s.id = db.site_id AND s.organization_id = $3
+        WHERE db.commission_id = $1 AND db.site_id = $2
+        LIMIT 1`,
+      [parseInt(id), siteId, organizationId]
     );
     if (dayBookResult.rows.length > 0) {
       const dbId = dayBookResult.rows[0].id;
@@ -220,16 +262,30 @@ export const updateCommission = asyncHandler(async (req, res) => {
  */
 export const deleteCommission = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const existing = await plotCommissionModel.findById(parseInt(id), pool);
+  const { siteId, organizationId } = commissionScope(req);
+  const existing = await plotCommissionModel.findByIdScoped(
+    parseInt(id), siteId, organizationId, pool,
+  );
   if (!existing) return res.status(404).json({ message: 'Commission entry not found' });
 
   // ── Delete linked DayBook entry first ──
   try {
-    await pool.query(`DELETE FROM day_book WHERE commission_id = $1`, [parseInt(id)]);
+    await pool.query(
+      `DELETE FROM day_book db
+        USING sites s
+        WHERE db.commission_id = $1
+          AND db.site_id = $2
+          AND s.id = db.site_id
+          AND s.organization_id = $3`,
+      [parseInt(id), siteId, organizationId],
+    );
   } catch (err) {
     console.error('[Commission] Failed to delete DayBook entry:', err.message);
   }
 
-  await plotCommissionModel.delete(parseInt(id), pool);
+  const deleted = await plotCommissionModel.deleteScoped(
+    parseInt(id), siteId, organizationId, pool,
+  );
+  if (!deleted) return res.status(404).json({ message: 'Commission entry not found' });
   res.json({ message: 'Commission entry deleted' });
 });

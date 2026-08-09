@@ -17,14 +17,14 @@ if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
 
 const s3Client = new S3Client(s3Config);
 
-export const uploadToS3 = async (filePath, fileName, contentType) => {
+export const uploadToS3 = async (filePath, fileName, contentType, folderOverride = null) => {
   const fileStream = fs.createReadStream(filePath);
   const bucket = process.env.AWS_S3_BUCKET_NAME || process.env.AWS_S3_BUCKET;
   const region = process.env.AWS_REGION || 'ap-south-1';
   const ext = fileName.split('.').pop().toLowerCase();
-  let folder = 'uploads';
-  if (['jpg','jpeg','png','webp'].includes(ext)) folder = 'vouchers';
-  else if (['pdf'].includes(ext)) folder = 'vouchers';
+  let folder = folderOverride || 'uploads';
+  if (!folderOverride && ['jpg','jpeg','png','webp'].includes(ext)) folder = 'vouchers';
+  else if (!folderOverride && ['pdf'].includes(ext)) folder = 'vouchers';
   const uniqueKey = `${folder}/${Date.now()}-${fileName}`;
 
   // Use multipart upload to avoid MaxMessageLengthExceeded

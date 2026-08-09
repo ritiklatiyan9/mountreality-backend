@@ -4,6 +4,9 @@ import pool from '../config/db.js';
 import { buildVerifyUrl, ReceiptType } from '../utils/receiptToken.js';
 import { notifyPlotPaymentRecorded } from '../utils/notify.js';
 import { normalizeCashType } from '../utils/paymentMode.js';
+import { resolveCollectionGuard } from '../services/collectionGuard.service.js';
+import { money, positiveId } from '../services/propertyLifecycle.service.js';
+import { writeComplianceAudit } from '../utils/complianceAccess.js';
 
 const normalizePlotPaymentType = (paymentType) => {
   // payment_type is the accounting settlement field. payment_from describes
@@ -620,54 +623,135 @@ export const createPayment = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Map this payment to either a client or a user, not both' });
   }
 
-  const plotIdInt = parseInt(plot_id);
+  const plotIdInt = positiveId(plot_id, 'plot_id');
+  const normalizedAmount = money(amount, 'Amount', { required: true, allowZero: false });
   const normalizedPaymentType = normalizePlotPaymentType(payment_type);
   const isBankish = ['BANK', 'CHEQUE'].includes(normalizedPaymentType);
+  const requestedBookingId = positiveId(req.body.booking_id, 'booking_id', { optional: true });
+  const requestedInstallmentId = positiveId(req.body.installment_id ?? req.body.payment_schedule_id, 'installment_id', { optional: true });
+  const requestedFirmId = positiveId(req.body.firm_id, 'firm_id', { optional: true });
+  const idempotencyKey = String(req.get('Idempotency-Key') || req.body.idempotency_key || '').trim().slice(0, 120) || null;
 
-  // Single CTE: lookup plot.site_id + INSERT in ONE round-trip.
-  // Was: SELECT plot + INSERT = 2 RTTs.
-  const result = await pool.query(
-    `WITH plot AS (SELECT id, site_id FROM plots WHERE id = $1)
-     INSERT INTO plot_payments (
-       plot_id, site_id, date, payment_from, payment_type, bank_details, bank_name,
-       branch, narration, amount, created_by, voucher_url, assigned_admin_id, status,
-       cheque_no, cheque_status, buyer_name, booked_by, mapped_member_id, mapped_user_id
-     )
-     SELECT $1, plot.site_id, $2::date, $3, $4, $5, $6, $7, $8, $9::numeric,
-            $10, $11, $12, 'pending', $13, $14, $15, $16, $17, $18
-       FROM plot
-     RETURNING *`,
-    [
-      plotIdInt,                                                          // $1
-      date || todayInIndia(),                                             // $2
-      payment_from ? payment_from.trim().toUpperCase() : null,            // $3
-      normalizedPaymentType,                                              // $4
-      bank_details ? bank_details.trim().toUpperCase() : null,            // $5
-      isBankish ? (bank_name ? bank_name.trim().toUpperCase() : null) : null, // $6
-      isBankish ? (branch ? branch.trim().toUpperCase() : null) : null,   // $7
-      narration ? narration.trim().toUpperCase() : null,                  // $8
-      parseFloat(amount) || 0,                                            // $9
-      req.user.id,                                                        // $10
-      voucher_url || null,                                                // $11
-      assigned_admin_id ? parseInt(assigned_admin_id) : null,             // $12
-      normalizedPaymentType === 'CHEQUE' && req.body.cheque_no
-        ? String(req.body.cheque_no).trim()
-        : null,                                                          // $13
-      normalizedPaymentType === 'CHEQUE' ? 'PENDING' : null,              // $14
-      buyer_name ? buyer_name.trim().toUpperCase() : null,                // $15
-      booked_by ? booked_by.trim().toUpperCase() : null,                  // $16
-      mapped_member_id ? parseInt(mapped_member_id) : null,               // $17
-      mapped_user_id ? parseInt(mapped_user_id) : null,                   // $18
-    ]
-  );
-  const payment = result.rows[0];
-  if (!payment) return res.status(404).json({ message: 'Plot not found' });
-  res.status(201).json({ payment });
+  const client = await pool.connect();
+  let payment;
+  let decision;
+  let replayed = false;
+  try {
+    await client.query('BEGIN');
+    await client.query(`SELECT pg_advisory_xact_lock(96096,$1)`, [plotIdInt]);
+    const { rows: plotRows } = await client.query(
+      `SELECT p.*,s.organization_id,b.id AS booking_id,b.client_member_id,b.buyer_name AS booking_buyer_name,
+              b.agreement_status AS booking_agreement_status,b.lifecycle_status AS booking_lifecycle_status,
+              b.rera_project_id AS booking_project_id,b.rera_project_phase_id AS booking_phase_id
+         FROM plots p JOIN sites s ON s.id=p.site_id
+         LEFT JOIN bookings b ON b.id=p.current_booking_id AND b.site_id=p.site_id
+        WHERE p.id=$1 AND s.organization_id=$2 FOR UPDATE OF p`,
+      [plotIdInt, req.user.organization_id],
+    );
+    const plot = plotRows[0];
+    if (!plot) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Plot not found' });
+    }
+    const bookingId = requestedBookingId || (plot.booking_id ? Number(plot.booking_id) : null);
+    if (requestedBookingId && Number(plot.booking_id || 0) !== requestedBookingId) {
+      throw Object.assign(new Error('Booking is not the current booking for this property'), { statusCode: 409, code: 'BOOKING_PROPERTY_MISMATCH' });
+    }
+    if (bookingId && ['CANCELLATION_REQUESTED', 'CANCELLATION_APPROVED', 'REFUND_PENDING', 'CANCELLED', 'CLOSED'].includes(plot.booking_lifecycle_status)) {
+      throw Object.assign(new Error('Payment cannot be recorded while cancellation or closure is in progress'), { statusCode: 409, code: 'BOOKING_PAYMENT_BLOCKED' });
+    }
+    if (idempotencyKey) {
+      const { rows: existing } = await client.query(`SELECT * FROM plot_payments WHERE site_id=$1 AND idempotency_key=$2 LIMIT 1`, [plot.site_id, idempotencyKey]);
+      if (existing[0]) {
+        payment = existing[0];
+        decision = payment.ruleset_decision || {};
+        replayed = true;
+        await client.query('COMMIT');
+      }
+    }
+    if (!payment) {
+      if (requestedFirmId) {
+        const { rows: firms } = await client.query(`SELECT 1 FROM firms WHERE id=$1 AND site_id=$2`, [requestedFirmId, plot.site_id]);
+        if (!firms[0]) throw Object.assign(new Error('Selected bank account is outside this Site'), { statusCode: 409, code: 'FIRM_SCOPE_MISMATCH' });
+      }
+      if (requestedInstallmentId) {
+        const { rows: installments } = await client.query(`SELECT pi.id,pi.booking_id,pi.amount,COALESCE(SUM(ppa.allocated_amount) FILTER (WHERE LOWER(COALESCE(pp.status,'approved'))='approved' AND UPPER(COALESCE(pp.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')),0) AS allocated FROM plot_installments pi LEFT JOIN plot_payment_allocations ppa ON ppa.installment_id=pi.id LEFT JOIN plot_payments pp ON pp.id=ppa.plot_payment_id WHERE pi.id=$1 AND pi.plot_id=$2 AND ($3::int IS NULL OR pi.booking_id=$3) GROUP BY pi.id`, [requestedInstallmentId, plotIdInt, bookingId]);
+        if (!installments[0]) throw Object.assign(new Error('Payment schedule item is outside this booking/property'), { statusCode: 409, code: 'SCHEDULE_SCOPE_MISMATCH' });
+        if (Math.round((Number(installments[0].allocated) + Number(normalizedAmount)) * 100) > Math.round(Number(installments[0].amount) * 100)) {
+          throw Object.assign(new Error('Payment allocation exceeds the selected schedule item'), { statusCode: 409, code: 'PAYMENT_ALLOCATION_EXCEEDS_DUE' });
+        }
+      }
+      decision = await resolveCollectionGuard({ organizationId: req.user.organization_id, siteId: plot.site_id, bookingId, proposedAmount: normalizedAmount, db: client });
+      if (decision.decision === 'BLOCKED') {
+        throw Object.assign(new Error(decision.message || 'Payment is blocked by the active collection control'), { statusCode: 409, code: decision.code || 'COLLECTION_BLOCKED', details: decision });
+      }
+      const effectiveMemberId = bookingId ? plot.client_member_id : (mapped_member_id ? positiveId(mapped_member_id, 'mapped_member_id') : null);
+      if (effectiveMemberId) {
+        const { rows: members } = await client.query(`SELECT 1 FROM members WHERE id=$1 AND site_id=$2`, [effectiveMemberId, plot.site_id]);
+        if (!members[0]) throw Object.assign(new Error('Mapped customer is outside this Site'), { statusCode: 409, code: 'CUSTOMER_SCOPE_MISMATCH' });
+      }
+      const effectiveUserId = bookingId ? null : (mapped_user_id ? positiveId(mapped_user_id, 'mapped_user_id') : null);
+      if (effectiveUserId) {
+        const { rows: users } = await client.query(
+          `SELECT 1 FROM users WHERE id=$1 AND organization_id=$2 AND COALESCE(is_active,TRUE)=TRUE`,
+          [effectiveUserId, req.user.organization_id],
+        );
+        if (!users[0]) throw Object.assign(new Error('Mapped user is outside this organization'), { statusCode: 409, code: 'USER_SCOPE_MISMATCH' });
+      }
+      let agreementId = null;
+      if (bookingId) {
+        const { rows: agreements } = await client.query(
+          `SELECT id FROM booking_agreements
+            WHERE booking_id=$1 AND site_id=$2 AND status NOT IN ('SUPERSEDED','CANCELLED')
+            ORDER BY version_number DESC,id DESC LIMIT 1`,
+          [bookingId, plot.site_id],
+        );
+        agreementId = agreements[0]?.id || null;
+      }
+      const { rows: inserted } = await client.query(
+        `INSERT INTO plot_payments (
+           plot_id,site_id,date,payment_from,payment_type,bank_details,bank_name,branch,narration,amount,
+           created_by,voucher_url,assigned_admin_id,status,cheque_no,cheque_status,buyer_name,booked_by,
+           mapped_member_id,mapped_user_id,booking_id,allottee_member_id,rera_project_id,rera_project_phase_id,
+           agreement_id,firm_id,idempotency_key,ruleset_decision,reconciliation_status
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending',$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,'UNMATCHED')
+         RETURNING *`,
+        [plotIdInt, plot.site_id, date || todayInIndia(), payment_from ? payment_from.trim().toUpperCase() : null,
+          normalizedPaymentType, bank_details ? bank_details.trim().toUpperCase() : null,
+          isBankish ? (bank_name ? bank_name.trim().toUpperCase() : null) : null,
+          isBankish ? (branch ? branch.trim().toUpperCase() : null) : null,
+          narration ? narration.trim().toUpperCase() : null, normalizedAmount, req.user.id, voucher_url || null,
+          assigned_admin_id ? parseInt(assigned_admin_id) : null,
+          normalizedPaymentType === 'CHEQUE' && req.body.cheque_no ? String(req.body.cheque_no).trim() : null,
+          normalizedPaymentType === 'CHEQUE' ? 'PENDING' : null,
+          (plot.booking_buyer_name || buyer_name) ? String(plot.booking_buyer_name || buyer_name).trim().toUpperCase() : null,
+          booked_by ? booked_by.trim().toUpperCase() : null, effectiveMemberId,
+          effectiveUserId, bookingId,
+          effectiveMemberId, plot.booking_project_id || plot.rera_project_id || null,
+          plot.booking_phase_id || plot.rera_project_phase_id || null, agreementId, requestedFirmId, idempotencyKey, decision],
+      );
+      payment = inserted[0];
+      const receiptNo = `RCPT-${new Date().getFullYear()}-${String(payment.id).padStart(6, '0')}`;
+      const { rows: numbered } = await client.query(`UPDATE plot_payments SET receipt_no=$1 WHERE id=$2 RETURNING *`, [receiptNo, payment.id]);
+      payment = numbered[0];
+      if (requestedInstallmentId && bookingId) {
+        await client.query(`INSERT INTO plot_payment_allocations (plot_payment_id,booking_id,installment_id,allocated_amount,created_by) VALUES ($1,$2,$3,$4,$5)`, [payment.id, bookingId, requestedInstallmentId, normalizedAmount, req.user.id]);
+      }
+      await writeComplianceAudit(client, req, { action: 'PLOT_PAYMENT_RECORDED', entityType: 'PROPERTY_BOOKING', entityId: bookingId || plotIdInt, siteId: plot.site_id, newValue: { booking_id: bookingId, plot_payment_id: payment.id, amount: normalizedAmount, installment_id: requestedInstallmentId, project_id: payment.rera_project_id, phase_id: payment.rera_project_phase_id, ruleset_decision: decision } });
+      await client.query('COMMIT');
+    }
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch { /* transaction already ended */ }
+    throw error;
+  } finally {
+    client.release();
+  }
+  res.status(replayed ? 200 : 201).json({ payment, collection_decision: decision, idempotent_replay: replayed });
 
   // Fire-and-forget: WhatsApp the plot owner with the payment details.
   // Deliberately not awaited — a notification failure must never affect the
   // recorded payment or the API response.
-  notifyPlotPaymentRecorded(payment).catch((e) => console.error('[notify] error', e?.message || e));
+  if (!replayed) notifyPlotPaymentRecorded(payment).catch((e) => console.error('[notify] error', e?.message || e));
 });
 
 /** GET /plots/payments/list?plot_id=X — List payments for a plot */
@@ -727,9 +811,21 @@ export const listPayments = asyncHandler(async (req, res) => {
 
   const [paymentsRes, plotRes, fromBreakdown, receivedByBreakdown] = await Promise.all([
     pool.query(
-      `SELECT pp.*, 'payment' AS source, u.name AS created_by_name
+      `SELECT pp.*, 'payment' AS source, u.name AS created_by_name,
+              b.booking_no,m.full_name AS allottee_name,rp.name AS project_name,rpp.name AS phase_name,
+              COALESCE(alloc.items,'[]'::jsonb) AS schedule_allocations
          FROM plot_payments pp
          LEFT JOIN users u ON u.id = pp.created_by
+         LEFT JOIN bookings b ON b.id=pp.booking_id
+         LEFT JOIN members m ON m.id=pp.allottee_member_id
+         LEFT JOIN rera_projects rp ON rp.id=pp.rera_project_id
+         LEFT JOIN rera_project_phases rpp ON rpp.id=pp.rera_project_phase_id
+         LEFT JOIN LATERAL (
+           SELECT jsonb_agg(jsonb_build_object('id',ppa.id,'installment_id',ppa.installment_id,
+             'amount',ppa.allocated_amount,'name',pi.installment_name,'due_date',pi.due_date)) AS items
+             FROM plot_payment_allocations ppa JOIN plot_installments pi ON pi.id=ppa.installment_id
+            WHERE ppa.plot_payment_id=pp.id
+         ) alloc ON TRUE
         WHERE pp.plot_id = $1
         ORDER BY pp.date ASC, pp.created_at ASC`,
       [plotIdInt]

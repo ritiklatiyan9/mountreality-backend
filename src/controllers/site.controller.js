@@ -142,6 +142,34 @@ export const deleteSite = asyncHandler(async (req, res) => {
     return res.status(404).json({ message: 'Site not found' });
   }
 
+  // Regulatory history must remain traceable. Once the Phase 1 foundation is
+  // installed, a Site with an operating-profile revision or RERA Project must
+  // be archived through its status instead of cascade-deleted.
+  const { rows: relationRows } = await pool.query(
+    `SELECT to_regclass('public.site_operating_profile_revisions') IS NOT NULL AS profiles_ready,
+            to_regclass('public.rera_projects') IS NOT NULL AS projects_ready`
+  );
+  if (relationRows[0]?.profiles_ready && relationRows[0]?.projects_ready) {
+    const { rows: protectedRows } = await pool.query(
+      `SELECT
+         EXISTS (
+           SELECT 1 FROM site_operating_profile_revisions
+            WHERE organization_id=$1 AND site_id=$2 AND deleted_at IS NULL
+         ) AS has_profile_history,
+         EXISTS (
+           SELECT 1 FROM rera_projects
+            WHERE organization_id=$1 AND site_id=$2 AND deleted_at IS NULL
+         ) AS has_rera_projects`,
+      [req.user.organization_id, site.id]
+    );
+    if (protectedRows[0]?.has_profile_history || protectedRows[0]?.has_rera_projects) {
+      return res.status(409).json({
+        code: 'SITE_REGULATORY_HISTORY_EXISTS',
+        message: 'This Site has regulatory history. Mark the Site inactive instead of deleting it.',
+      });
+    }
+  }
+
   await siteModel.delete(parseInt(id), pool);
   res.json({ message: 'Site deleted' });
 });

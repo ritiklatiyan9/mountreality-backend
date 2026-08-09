@@ -7,7 +7,7 @@ import requirePermission from '../middlewares/permission.middleware.js';
 import createRateLimiter from '../middlewares/rateLimit.middleware.js';
 import {
   deleteComplianceDocument, getComplianceDocument, listComplianceDocuments,
-  listExpiringComplianceDocuments, uploadComplianceDocument,
+  listExpiringComplianceDocuments, streamComplianceDocument, uploadComplianceDocument,
 } from '../controllers/complianceDocument.controller.js';
 
 const router = express.Router();
@@ -39,6 +39,7 @@ const uploadLimiter = createRateLimiter({ windowMs: 60_000, max: 20, keyPrefix: 
 
 router.use(authMiddleware, requireRole('admin', 'sub_admin'));
 router.get('/expiring', requirePermission('compliance', 'read'), listExpiringComplianceDocuments);
+router.get('/file/:documentId/content', streamComplianceDocument);
 router.get('/file/:documentId', getComplianceDocument);
 router.delete('/file/:documentId', deleteComplianceDocument);
 router.get('/:entityType/:entityId', listComplianceDocuments);

@@ -2,7 +2,8 @@ import express from 'express';
 import authMiddleware from '../middlewares/auth.middleware.js';
 import {
   getStats, getAnalytics, listOrganizations, getOrganizationDetail,
-  registerOrganization, updateOrganization, extendSubscription,
+  registerOrganization, updateOrganization, extendSubscription, deleteOrganization,
+  listPlansAdmin, createPlan, updatePlan,
 } from '../controllers/owner.controller.js';
 
 const router = express.Router();
@@ -24,6 +25,10 @@ router.get('/organizations', listOrganizations);
 router.post('/organizations', registerOrganization);
 router.get('/organizations/:id', getOrganizationDetail);
 router.patch('/organizations/:id', updateOrganization);
+router.delete('/organizations/:id', deleteOrganization);
 router.post('/organizations/:id/extend', extendSubscription);
+router.get('/plans', listPlansAdmin);
+router.post('/plans', createPlan);
+router.patch('/plans/:id', updatePlan);
 
 export default router;

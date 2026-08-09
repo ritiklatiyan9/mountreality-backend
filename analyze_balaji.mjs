@@ -10,9 +10,10 @@ const EXCEL_PATH = 'A:\\MY_CLIENTS\\RiverGreen\\Account\\RGAccount\\Frontend\\th
 const SITE_ID = 6; // BALAJI ASSOCIATES
 const SITE_NAME = 'BALAJI ASSOCIATES';
 
+if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
+
 const pool = new Pool({
-  connectionString:
-    'postgresql://neondb_owner:npg_r5zpVtZnxRu1@ep-dark-boat-aijjdnhi-pooler.c-4.us-east-1.aws.neon.tech/rgaccount?sslmode=require',
+  connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 

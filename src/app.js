@@ -24,6 +24,9 @@ import path from 'path';
 app.use('/uploads/excel', express.static(path.join(process.cwd(), 'uploads', 'excel')));
 // Serve fallback local plot/KYC documents if AWS S3 isn't configured (dev only)
 app.use('/uploads/kyc_documents', express.static(path.join(process.cwd(), 'uploads', 'kyc_documents')));
+// Member profile images use this local fallback whenever Cloudinary credentials
+// are not supplied (for example, local product development).
+app.use('/uploads/members', express.static(path.join(process.cwd(), 'src', 'uploads')));
 
 // ── GraphQL endpoint (dashboard BFF) ──
 app.all(
