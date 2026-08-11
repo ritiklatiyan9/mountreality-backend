@@ -5,6 +5,7 @@ import { imprestLedgerModel } from '../models/Imprest.model.js';
 import pool from '../config/db.js';
 import { buildVerifyUrl, ReceiptType } from '../utils/receiptToken.js';
 import { classifyPaymentMode } from '../utils/paymentMode.js';
+import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
 
 const resolveChequeStatus = ({ currentMode, currentStatus, nextMode, requestedStatus }) => {
   if (classifyPaymentMode(nextMode) !== 'cheque') return null;
@@ -25,60 +26,83 @@ const resolveChequeStatus = ({ currentMode, currentStatus, nextMode, requestedSt
  * entry is APPROVED. Looks up the creator's role and only deducts if
  * the creator is a sub_admin and the debit amount is > 0.
  */
-async function deductImprestOnApproval(createdByUserId, debitAmount, referenceId, remarks, approvedByUserId) {
+async function deductImprestOnApproval(createdByUserId, debitAmount, referenceId, remarks, approvedByUserId, {
+  db = pool, siteId = null, sourceModule = 'expenses',
+} = {}) {
   if (!debitAmount || debitAmount <= 0) return;
-
-  try {
-    // Check if the creator is a sub_admin
-    const userResult = await pool.query('SELECT role FROM users WHERE id = $1', [createdByUserId]);
-    const user = userResult.rows[0];
-    if (!user || user.role !== 'sub_admin') return;
-
-    await imprestLedgerModel.createEntry({
-      user_id: createdByUserId,
-      type: 'EXPENSE',
-      reference_id: referenceId,
-      amount: -debitAmount,
-      remarks: remarks.toUpperCase(),
-      created_by: approvedByUserId,
-    }, pool);
-  } catch (err) {
-    console.error('[Imprest] Failed to deduct on approval for ref', referenceId, err.message);
-  }
+  const userResult = await db.query('SELECT role FROM users WHERE id = $1', [createdByUserId]);
+  const user = userResult.rows[0];
+  if (!user || user.role !== 'sub_admin') return;
+  await imprestLedgerModel.createEntry({
+    user_id: createdByUserId, site_id: siteId, type: 'EXPENSE', source_module: sourceModule,
+    reference_id: referenceId, amount: -debitAmount,
+    remarks: remarks.toUpperCase(), created_by: approvedByUserId,
+  }, db);
 }
 
 /**
  * Helper: Reverse the imprest deduction when a previously-approved expense
  * is REJECTED/DECLINED. Adds back the deducted amount to restore balance.
  */
-async function reverseImprestOnRejection(createdByUserId, debitAmount, referenceId, remarks, rejectedByUserId) {
+async function reverseImprestOnRejection(createdByUserId, debitAmount, referenceId, remarks, rejectedByUserId, {
+  db = pool, siteId = null, sourceModule = 'expenses',
+} = {}) {
   if (!debitAmount || debitAmount <= 0) return;
 
-  try {
-    // Only reverse for sub_admin users
-    const userResult = await pool.query('SELECT role FROM users WHERE id = $1', [createdByUserId]);
-    const user = userResult.rows[0];
-    if (!user || user.role !== 'sub_admin') return;
-
-    // Check that an EXPENSE deduction actually exists for this reference
-    const existing = await pool.query(
-      `SELECT id FROM imprest_ledger WHERE user_id = $1 AND reference_id = $2 AND type = 'EXPENSE' AND amount < 0 LIMIT 1`,
-      [createdByUserId, referenceId]
-    );
-    if (existing.rows.length === 0) return; // No deduction was made, nothing to reverse
-
-    await imprestLedgerModel.createEntry({
-      user_id: createdByUserId,
-      type: 'ADJUSTMENT',
-      reference_id: referenceId,
-      amount: debitAmount, // positive = restore balance
-      remarks: `REVERSED (REJECTED): ${remarks}`.toUpperCase(),
-      created_by: rejectedByUserId,
-    }, pool);
-  } catch (err) {
-    console.error('[Imprest] Failed to reverse on rejection for ref', referenceId, err.message);
-  }
+  const userResult = await db.query('SELECT role FROM users WHERE id = $1', [createdByUserId]);
+  const user = userResult.rows[0];
+  if (!user || user.role !== 'sub_admin') return;
+  const existing = await db.query(
+    `SELECT id FROM imprest_ledger
+      WHERE user_id=$1 AND reference_id=$2 AND type='EXPENSE' AND amount<0
+        AND source_module=$3 AND COALESCE(site_id,0)=COALESCE($4::int,0) LIMIT 1`,
+    [createdByUserId, referenceId, sourceModule, siteId]
+  );
+  if (existing.rows.length === 0) return;
+  await imprestLedgerModel.createEntry({
+    user_id: createdByUserId, site_id: siteId, type: 'ADJUSTMENT', source_module: sourceModule,
+    reference_id: referenceId, amount: debitAmount,
+    remarks: `REVERSED (REJECTED): ${remarks}`.toUpperCase(), created_by: rejectedByUserId,
+  }, db);
 }
+
+const transitionExpenseStatus = async ({ table, id, status, amountField, sourceModule, label, actorId }) => {
+  if (!Number.isInteger(id) || id <= 0) {
+    const error = new Error('Invalid entry ID'); error.status = 400; throw error;
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const locked = await client.query(`SELECT * FROM ${table} WHERE id=$1 FOR UPDATE`, [id]);
+    const existing = locked.rows[0];
+    if (!existing) {
+      const error = new Error('Entry not found'); error.status = 404; throw error;
+    }
+    if (existing.status === status) {
+      const error = new Error(`Entry is already ${status}`); error.status = 409; throw error;
+    }
+    const { rows } = await client.query(
+      `UPDATE ${table} SET status=$1,approved_by=$2,approved_at=NOW(),updated_at=NOW()
+        WHERE id=$3 RETURNING *`,
+      [status, actorId, id]
+    );
+    const entry = rows[0];
+    const amount = Number(entry[amountField]) || 0;
+    const options = { db: client, siteId: entry.site_id, sourceModule };
+    if (status === 'approved') {
+      await deductImprestOnApproval(entry.created_by, amount, entry.id, label(entry), actorId, options);
+    } else if (existing.status === 'approved') {
+      await reverseImprestOnRejection(entry.created_by, amount, entry.id, label(entry), actorId, options);
+    }
+    await client.query('COMMIT');
+    return entry;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+};
 
 /**
  * POST /expenses
@@ -89,7 +113,7 @@ export const createExpense = asyncHandler(async (req, res) => {
     site_id, date, from_entity, to_entity, payment_mode,
     debit, credit, remark, account_no, branch, category,
     assigned_user_id, assigned_admin_id, voucher_url, bill_url,
-    mapped_member_id, mapped_user_id,
+    mapped_member_id, mapped_user_id, bank_account_id,
   } = req.body;
 
   if (!site_id) return res.status(400).json({ message: 'Site is required' });
@@ -97,12 +121,19 @@ export const createExpense = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Map this entry to either a client or a user, not both' });
   }
 
+  const normalizedPaymentMode = payment_mode ? payment_mode.trim().toUpperCase() : 'BANK';
+  const selectedBankAccountId = await resolveBankAccountSelection({
+    siteId: site_id,
+    paymentMode: normalizedPaymentMode,
+    bankAccountId: bank_account_id,
+  });
   const data = {
     site_id: parseInt(site_id),
     date: date || new Date().toISOString().split('T')[0],
     from_entity: from_entity ? from_entity.trim().toUpperCase() : null,
     to_entity: to_entity ? to_entity.trim().toUpperCase() : null,
-    payment_mode: payment_mode ? payment_mode.trim().toUpperCase() : 'BANK',
+    payment_mode: normalizedPaymentMode,
+    bank_account_id: selectedBankAccountId,
     debit: parseFloat(debit) || 0,
     credit: parseFloat(credit) || 0,
     remark: remark ? remark.trim().toUpperCase() : null,
@@ -218,7 +249,7 @@ export const updateExpense = asyncHandler(async (req, res) => {
     date, from_entity, to_entity, payment_mode,
     debit, credit, remark, account_no, branch, category,
     assigned_user_id, assigned_admin_id, voucher_url, bill_url,
-    customer_signature_url, authority_signature_url, cheque_no, cheque_status,
+    customer_signature_url, authority_signature_url, cheque_no, cheque_status, bank_account_id,
   } = req.body;
 
   const existing = await expenseModel.findById(expenseId, pool);
@@ -231,6 +262,13 @@ export const updateExpense = asyncHandler(async (req, res) => {
   const nextMode = payment_mode !== undefined
     ? (payment_mode ? payment_mode.trim().toUpperCase() : 'BANK')
     : existing.payment_mode;
+  if (bank_account_id !== undefined || payment_mode !== undefined) {
+    data.bank_account_id = await resolveBankAccountSelection({
+      siteId: existing.site_id,
+      paymentMode: nextMode,
+      bankAccountId: bank_account_id !== undefined ? bank_account_id : existing.bank_account_id,
+    });
+  }
   if (payment_mode !== undefined) {
     data.payment_mode = nextMode;
     data.cheque_status = resolveChequeStatus({
@@ -316,6 +354,10 @@ export const bulkDeleteExpenses = asyncHandler(async (req, res) => {
  */
 export const listPendingExpenses = asyncHandler(async (req, res) => {
   const { site_id, date_from, date_to, status = 'pending' } = req.query;
+  const siteId = Number.parseInt(site_id, 10);
+  if (!Number.isInteger(siteId) || siteId <= 0) {
+    return res.status(400).json({ message: 'A valid site_id is required' });
+  }
 
   let expensesList = [];
   let daybookList = [];
@@ -325,14 +367,14 @@ export const listPendingExpenses = asyncHandler(async (req, res) => {
   [expensesList, daybookList] = await Promise.all([
     expenseModel.findByStatus(
       status,
-      site_id ? parseInt(site_id) : null,
+      siteId,
       date_from || null,
       date_to || null,
       pool
     ),
     dayBookModel.findByStatus(
       status,
-      site_id ? parseInt(site_id) : null,
+      siteId,
       date_from || null,
       date_to || null,
       pool
@@ -365,11 +407,11 @@ export const listPendingExpenses = asyncHandler(async (req, res) => {
          JOIN sites s ON s.id = vp.site_id
          LEFT JOIN users u ON u.id = vp.created_by
          WHERE ($1::text = 'all' OR vp.status = $1)
-           AND ($2::int IS NULL OR vp.site_id = $2)
+           AND vp.site_id = $2
            AND ($3::date IS NULL OR vp.payment_date >= $3)
            AND ($4::date IS NULL OR vp.payment_date <= $4)
          ORDER BY vp.payment_date DESC, vp.id DESC`,
-        [status, site_id ? parseInt(site_id) : null, date_from || null, date_to || null]
+        [status, siteId, date_from || null, date_to || null]
       )
       .then((r) => r.rows),
   ]);
@@ -430,17 +472,21 @@ export const listPendingExpenses = asyncHandler(async (req, res) => {
  */
 export const getStatusCounts = asyncHandler(async (req, res) => {
   const { site_id } = req.query;
+  const siteId = Number.parseInt(site_id, 10);
+  if (!Number.isInteger(siteId) || siteId <= 0) {
+    return res.status(400).json({ message: 'A valid site_id is required' });
+  }
 
   const [expenseCounts, daybookCounts, vendorCounts] = await Promise.all([
-    expenseModel.getStatusCounts(site_id ? parseInt(site_id) : null, pool),
-    dayBookModel.getStatusCounts(site_id ? parseInt(site_id) : null, pool),
+    expenseModel.getStatusCounts(siteId, pool),
+    dayBookModel.getStatusCounts(siteId, pool),
     pool
       .query(
         `SELECT status, COUNT(*)::int AS count
          FROM vendor_payments
-         WHERE ($1::int IS NULL OR site_id = $1)
+         WHERE site_id = $1
          GROUP BY status`,
-        [site_id ? parseInt(site_id) : null]
+        [siteId]
       )
       .then((r) => r.rows),
   ]);
@@ -473,81 +519,29 @@ export const approveExpense = asyncHandler(async (req, res) => {
 
   // ── Vendor payment branch ──
   if (source === 'vendor_payment') {
-    // Atomic: only flip status when not already 'approved'. Saves the
-    // SELECT round-trip and rejects the dup in a single query.
-    const result = await pool.query(
-      `UPDATE vendor_payments
-          SET status = 'approved', approved_by = $2, approved_at = NOW()
-        WHERE id = $1 AND status != 'approved'
-        RETURNING *`,
-      [parseInt(id), req.user.id]
-    );
-    if (!result.rows[0]) {
-      // Either not found or already approved — distinguish via a tiny lookup.
-      const check = await pool.query('SELECT status FROM vendor_payments WHERE id = $1', [parseInt(id)]);
-      if (check.rows.length === 0) return res.status(404).json({ message: 'Vendor payment not found' });
-      return res.status(400).json({ message: 'Vendor payment is already approved' });
-    }
-    const approvedPayment = result.rows[0];
-
-    // Imprest deduction in BACKGROUND — caller doesn't need to wait.
-    deductImprestOnApproval(
-      approvedPayment.created_by,
-      parseFloat(approvedPayment.amount) || 0,
-      approvedPayment.id,
-      `VENDOR PAYMENT #${approvedPayment.id}`,
-      req.user.id
-    ).catch(() => {});
-
+    const approvedPayment = await transitionExpenseStatus({
+      table: 'vendor_payments', id: Number.parseInt(id, 10), status: 'approved',
+      amountField: 'amount', sourceModule: 'vendor_payments',
+      label: (entry) => `VENDOR PAYMENT #${entry.id}`, actorId: req.user.id,
+    });
     return res.json({ expense: approvedPayment, message: 'Vendor payment approved successfully' });
   }
 
   // ── DayBook branch ──
   if (source === 'daybook') {
-    const existing = await dayBookModel.findById(parseInt(id), pool);
-    if (!existing) {
-      return res.status(404).json({ message: 'Day Book entry not found' });
-    }
-    if (existing.status === 'approved') {
-      return res.status(400).json({ message: 'Entry is already approved' });
-    }
-    const entry = await dayBookModel.approveEntry(parseInt(id), req.user.id, pool);
-
-    // Imprest deduction in BACKGROUND.
-    deductImprestOnApproval(
-      entry.created_by,
-      parseFloat(entry.debit) || 0,
-      entry.id,
-      `DAYBOOK #${entry.id}: ${entry.entry_type || 'EXPENSE'}`,
-      req.user.id
-    ).catch(() => {});
-
+    const entry = await transitionExpenseStatus({
+      table: 'day_book', id: Number.parseInt(id, 10), status: 'approved',
+      amountField: 'debit', sourceModule: 'day_book',
+      label: (row) => `DAYBOOK #${row.id}: ${row.entry_type || 'EXPENSE'}`, actorId: req.user.id,
+    });
     return res.json({ expense: entry, message: 'Day Book expense approved successfully' });
   }
 
-  // ── Default: expenses table — atomic flip ──
-  const result = await pool.query(
-    `UPDATE expenses
-        SET status = 'approved', approved_by = $2, approved_at = NOW(), updated_at = NOW()
-      WHERE id = $1 AND status != 'approved'
-      RETURNING *`,
-    [parseInt(id), req.user.id]
-  );
-  if (!result.rows[0]) {
-    const check = await pool.query('SELECT status FROM expenses WHERE id = $1', [parseInt(id)]);
-    if (check.rows.length === 0) return res.status(404).json({ message: 'Expense not found' });
-    return res.status(400).json({ message: 'Expense is already approved' });
-  }
-  const expense = result.rows[0];
-
-  // Imprest deduction in BACKGROUND — response can return immediately.
-  deductImprestOnApproval(
-    expense.created_by,
-    parseFloat(expense.debit) || 0,
-    expense.id,
-    `EXPENSE #${expense.id}: ${expense.remark || 'EXPENSE'}`,
-    req.user.id
-  ).catch(() => {});
+  const expense = await transitionExpenseStatus({
+    table: 'expenses', id: Number.parseInt(id, 10), status: 'approved',
+    amountField: 'debit', sourceModule: 'expenses',
+    label: (row) => `EXPENSE #${row.id}: ${row.remark || 'EXPENSE'}`, actorId: req.user.id,
+  });
 
   res.json({ expense, message: 'Expense approved successfully' });
 });
@@ -562,87 +556,29 @@ export const rejectExpense = asyncHandler(async (req, res) => {
 
   // ── Vendor payment branch ── single SELECT + atomic UPDATE
   if (source === 'vendor_payment') {
-    const result = await pool.query(
-      `UPDATE vendor_payments
-          SET status = 'rejected', approved_by = $2, approved_at = NOW()
-        WHERE id = $1 AND status != 'rejected'
-        RETURNING *, (
-          SELECT status FROM vendor_payments WHERE id = $1
-        ) AS prev_status`,
-      [parseInt(id), req.user.id]
-    );
-    if (!result.rows[0]) {
-      const check = await pool.query('SELECT status FROM vendor_payments WHERE id = $1', [parseInt(id)]);
-      if (check.rows.length === 0) return res.status(404).json({ message: 'Vendor payment not found' });
-      return res.status(400).json({ message: 'Vendor payment is already rejected' });
-    }
-    const rejectedPayment = result.rows[0];
-
-    // Reverse imprest deduction in BACKGROUND if previously approved.
-    // (`reverseImprestOnRejection` already filters via a row check, so it's
-    // safe to fire even when there was no prior deduction.)
-    reverseImprestOnRejection(
-      rejectedPayment.created_by,
-      parseFloat(rejectedPayment.amount) || 0,
-      rejectedPayment.id,
-      `VENDOR PAYMENT #${rejectedPayment.id}`,
-      req.user.id
-    ).catch(() => {});
-
+    const rejectedPayment = await transitionExpenseStatus({
+      table: 'vendor_payments', id: Number.parseInt(id, 10), status: 'rejected',
+      amountField: 'amount', sourceModule: 'vendor_payments',
+      label: (entry) => `VENDOR PAYMENT #${entry.id}`, actorId: req.user.id,
+    });
     return res.json({ expense: rejectedPayment, message: 'Vendor payment rejected' });
   }
 
   // ── DayBook branch ──
   if (source === 'daybook') {
-    const existing = await dayBookModel.findById(parseInt(id), pool);
-    if (!existing) {
-      return res.status(404).json({ message: 'Day Book entry not found' });
-    }
-    if (existing.status === 'rejected') {
-      return res.status(400).json({ message: 'Entry is already rejected' });
-    }
-    const entry = await dayBookModel.rejectEntry(parseInt(id), req.user.id, pool);
-
-    if (existing.status === 'approved') {
-      reverseImprestOnRejection(
-        existing.created_by,
-        parseFloat(existing.debit) || 0,
-        existing.id,
-        `DAYBOOK #${existing.id}: ${existing.entry_type || 'EXPENSE'}`,
-        req.user.id
-      ).catch(() => {});
-    }
-
+    const entry = await transitionExpenseStatus({
+      table: 'day_book', id: Number.parseInt(id, 10), status: 'rejected',
+      amountField: 'debit', sourceModule: 'day_book',
+      label: (row) => `DAYBOOK #${row.id}: ${row.entry_type || 'EXPENSE'}`, actorId: req.user.id,
+    });
     return res.json({ expense: entry, message: 'Day Book expense rejected' });
   }
 
-  // ── Default: expenses table — atomic flip with prev_status detection ──
-  const result = await pool.query(
-    `WITH prev AS (
-       SELECT status AS prev_status FROM expenses WHERE id = $1
-     )
-     UPDATE expenses
-        SET status = 'rejected', approved_by = $2, approved_at = NOW(), updated_at = NOW()
-      WHERE id = $1 AND status != 'rejected'
-      RETURNING *, (SELECT prev_status FROM prev) AS prev_status`,
-    [parseInt(id), req.user.id]
-  );
-  if (!result.rows[0]) {
-    const check = await pool.query('SELECT status FROM expenses WHERE id = $1', [parseInt(id)]);
-    if (check.rows.length === 0) return res.status(404).json({ message: 'Expense not found' });
-    return res.status(400).json({ message: 'Expense is already rejected' });
-  }
-  const expense = result.rows[0];
-
-  if (expense.prev_status === 'approved') {
-    reverseImprestOnRejection(
-      expense.created_by,
-      parseFloat(expense.debit) || 0,
-      expense.id,
-      `EXPENSE #${expense.id}: ${expense.remark || 'EXPENSE'}`,
-      req.user.id
-    ).catch(() => {});
-  }
+  const expense = await transitionExpenseStatus({
+    table: 'expenses', id: Number.parseInt(id, 10), status: 'rejected',
+    amountField: 'debit', sourceModule: 'expenses',
+    label: (row) => `EXPENSE #${row.id}: ${row.remark || 'EXPENSE'}`, actorId: req.user.id,
+  });
 
   res.json({ expense, message: 'Expense rejected' });
 });
@@ -658,40 +594,18 @@ export const bulkApproveExpenses = asyncHandler(async (req, res) => {
   //     unique creators in ONE query (was N queries via the per-item
   //     deductImprestOnApproval helper) and inserts all deductions in a
   //     single multi-row INSERT. Runs fire-and-forget after the response.
-  const bulkImprestDeduct = async (allItems) => {
+  const bulkImprestDeduct = async (allItems, db) => {
     if (!allItems || allItems.length === 0) return;
-    try {
-      const creatorIds = [...new Set(allItems.map((i) => i.creator).filter(Boolean))];
-      if (creatorIds.length === 0) return;
-      const userRes = await pool.query(
-        `SELECT id, role FROM users WHERE id = ANY($1::int[])`,
-        [creatorIds]
-      );
-      const subAdminIds = new Set(
-        userRes.rows.filter((u) => u.role === 'sub_admin').map((u) => u.id)
-      );
-      const ledgerRows = allItems.filter(
-        (i) => subAdminIds.has(i.creator) && i.amount > 0
-      );
-      if (ledgerRows.length === 0) return;
-
-      const COLS = 6;
-      const placeholders = [];
-      const values = [];
-      ledgerRows.forEach((r, i) => {
-        const b = i * COLS;
-        placeholders.push(
-          `($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, $${b + 5}, $${b + 6})`
-        );
-        values.push(r.creator, r.type, r.referenceId, -r.amount, r.remarks.toUpperCase(), req.user.id);
-      });
-      await pool.query(
-        `INSERT INTO imprest_ledger (user_id, type, reference_id, amount, remarks, created_by)
-         VALUES ${placeholders.join(',')}`,
-        values
-      );
-    } catch (err) {
-      console.error('[Imprest] Bulk deduct failed:', err.message);
+    const creatorIds = [...new Set(allItems.map((i) => i.creator).filter(Boolean))];
+    if (creatorIds.length === 0) return;
+    const userRes = await db.query('SELECT id,role FROM users WHERE id=ANY($1::int[])', [creatorIds]);
+    const subAdminIds = new Set(userRes.rows.filter((u) => u.role === 'sub_admin').map((u) => u.id));
+    for (const row of allItems.filter((item) => subAdminIds.has(item.creator) && item.amount > 0)) {
+      await imprestLedgerModel.createEntry({
+        user_id: row.creator, site_id: row.siteId, type: 'EXPENSE', source_module: row.sourceModule,
+        reference_id: row.referenceId, amount: -row.amount,
+        remarks: row.remarks.toUpperCase(), created_by: req.user.id,
+      }, db);
     }
   };
 
@@ -701,21 +615,22 @@ export const bulkApproveExpenses = asyncHandler(async (req, res) => {
     if (!Array.isArray(expense_ids) || expense_ids.length === 0) {
       return res.status(400).json({ message: 'expense_ids array is required' });
     }
-    const expenses = await expenseModel.bulkApprove(
-      expense_ids.map((id) => parseInt(id)),
-      req.user.id,
-      pool
-    );
-
-    // Build the imprest payload but DON'T await — caller gets the response
-    // immediately, and the ledger writes happen after.
-    bulkImprestDeduct(expenses.map((exp) => ({
-      creator: exp.created_by,
-      type: 'EXPENSE',
-      referenceId: exp.id,
-      amount: parseFloat(exp.debit) || 0,
-      remarks: `EXPENSE #${exp.id}: ${exp.remark || 'EXPENSE'}`,
-    })));
+    const client = await pool.connect();
+    let expenses;
+    try {
+      await client.query('BEGIN');
+      expenses = await expenseModel.bulkApprove(expense_ids.map((id) => parseInt(id)), req.user.id, client);
+      await bulkImprestDeduct(expenses.map((exp) => ({
+        creator: exp.created_by, siteId: exp.site_id, sourceModule: 'expenses', referenceId: exp.id,
+        amount: parseFloat(exp.debit) || 0, remarks: `EXPENSE #${exp.id}: ${exp.remark || 'EXPENSE'}`,
+      })), client);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
 
     return res.json({
       expenses,
@@ -737,48 +652,58 @@ export const bulkApproveExpenses = asyncHandler(async (req, res) => {
     .filter((i) => !daybookSources.includes(i.source) && i.source !== 'vendor_payment')
     .map((i) => parseInt(i.id));
 
-  const results = await Promise.all([
-    pureExpenseIds.length > 0 ? expenseModel.bulkApprove(pureExpenseIds, req.user.id, pool) : [],
-    daybookIds.length > 0 ? dayBookModel.bulkApprove(daybookIds, req.user.id, pool) : [],
-    vendorPaymentIds.length > 0
-      ? pool
-          .query(
-            `UPDATE vendor_payments
-             SET status = 'approved', approved_by = $2, approved_at = NOW()
-             WHERE id = ANY($1::int[])
-             RETURNING *`,
+  const client = await pool.connect();
+  let results;
+  try {
+    await client.query('BEGIN');
+    results = [
+      pureExpenseIds.length > 0 ? await expenseModel.bulkApprove(pureExpenseIds, req.user.id, client) : [],
+      daybookIds.length > 0 ? await dayBookModel.bulkApprove(daybookIds, req.user.id, client) : [],
+      vendorPaymentIds.length > 0
+        ? (await client.query(
+            `UPDATE vendor_payments SET status='approved',approved_by=$2,approved_at=NOW(),updated_at=NOW()
+              WHERE id=ANY($1::int[]) AND status<>'approved' RETURNING *`,
             [vendorPaymentIds, req.user.id]
-          )
-          .then((r) => r.rows)
-      : [],
-  ]);
+          )).rows
+        : [],
+    ];
 
   // Build a single batched imprest payload (was 3 nested for loops × N
   // serial round-trips). Run in BACKGROUND.
   const ledgerPayload = [
     ...results[0].map((exp) => ({
       creator: exp.created_by,
-      type: 'EXPENSE',
+      siteId: exp.site_id,
+      sourceModule: 'expenses',
       referenceId: exp.id,
       amount: parseFloat(exp.debit) || 0,
       remarks: `EXPENSE #${exp.id}: ${exp.remark || 'EXPENSE'}`,
     })),
     ...results[1].map((entry) => ({
       creator: entry.created_by,
-      type: 'EXPENSE',
+      siteId: entry.site_id,
+      sourceModule: 'day_book',
       referenceId: entry.id,
       amount: parseFloat(entry.debit) || 0,
       remarks: `DAYBOOK #${entry.id}: ${entry.entry_type || 'EXPENSE'}`,
     })),
     ...results[2].map((vp) => ({
       creator: vp.created_by,
-      type: 'EXPENSE',
+      siteId: vp.site_id,
+      sourceModule: 'vendor_payments',
       referenceId: vp.id,
       amount: parseFloat(vp.amount) || 0,
       remarks: `VENDOR PAYMENT #${vp.id}`,
     })),
   ];
-  bulkImprestDeduct(ledgerPayload);
+    await bulkImprestDeduct(ledgerPayload, client);
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 
   const totalApproved = results[0].length + results[1].length + results[2].length;
 

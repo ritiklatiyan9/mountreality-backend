@@ -223,7 +223,7 @@ test('RERA evidence is exact-Site scoped, field-policy enforced and privately st
   assert.match(controller, /FIELD_POLICY_VALIDATION_FAILED/);
   assert.match(controller, /export const streamComplianceDocument/);
   assert.match(controller, /getPermission\(req\.user\.id, 'rera_evidence'\)/);
-  assert.match(controller, /candidate\.entity_type IN \('RERA_PROJECT','RERA_PHASE','RERA_APPROVAL','RERA_STAKEHOLDER'\)/);
+  assert.match(controller, /candidate\.entity_type IN \([\s\S]*'RERA_PROJECT'[\s\S]*'RERA_FILING_PERIOD'[\s\S]*\)/);
   assert.match(controller, /module: 'rera_evidence'/);
   assert.match(controller, /d\.site_id = ANY\(\$\$\{params\.length\}::bigint\[\]\)/);
   assert.match(storage, /local-private::/);

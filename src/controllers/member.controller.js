@@ -3,6 +3,7 @@ import { memberModel } from '../models/Member.model.js';
 import { uploadSingle } from '../utils/upload.js';
 import pool from '../config/db.js';
 import { extractMemberKyc } from '../services/memberKycOcr.service.js';
+import { getPlotDocUrl } from '../utils/plotDocStorage.js';
 
 const money = (value) => {
   const parsed = Number(value);
@@ -87,7 +88,7 @@ const uploadDocuments = async (files, options) => {
   for (const fieldName of DOC_FIELDS) {
     const fileArr = files[fieldName];
     if (fileArr && fileArr.length > 0) {
-      tasks.push(uploadSingle(fileArr[0], 's3', { ...options, folder: 'member-files' }).then((url) => ({ fieldName, url })));
+      tasks.push(uploadSingle(fileArr[0], 's3', { ...options, folder: 'member-files', returnKey: true }).then((url) => ({ fieldName, url })));
     }
   }
   try {
@@ -98,6 +99,24 @@ const uploadDocuments = async (files, options) => {
     throw new Error('Profile image or document upload failed. Please retry.');
   }
   return urls;
+};
+
+const presentMember = async (member, { list = false } = {}) => {
+  if (!member) return member;
+  const presented = { ...member };
+  await Promise.all(DOC_FIELDS.map(async (field) => {
+    if (!presented[field]) return;
+    if (list && field !== 'photo') {
+      presented[field] = '__private_document__';
+      return;
+    }
+    try {
+      presented[field] = await getPlotDocUrl(presented[field]);
+    } catch {
+      presented[field] = null;
+    }
+  }));
+  return presented;
 };
 
 /** POST /members — Create a new member */
@@ -131,7 +150,7 @@ export const createMember = asyncHandler(async (req, res) => {
   Object.assign(data, docUrls);
 
   const member = await memberModel.create(data, pool);
-  res.status(201).json({ member });
+  res.status(201).json({ member: await presentMember(member) });
 });
 
 /** POST /members/kyc/extract — OCR a document and return reviewable member fields. */
@@ -191,12 +210,15 @@ export const registerMemberInSites = asyncHandler(async (req, res) => {
       }
     }
     const accessResult = isAdmin
-      ? await client.query('SELECT id, name FROM sites WHERE id = ANY($1::int[])', [requestedSiteIds])
+      ? await client.query(
+          'SELECT id, name FROM sites WHERE id = ANY($1::int[]) AND organization_id=$2',
+          [requestedSiteIds, req.user.organization_id]
+        )
       : await client.query(
           `SELECT s.id, s.name FROM sites s
              JOIN user_sites us ON us.site_id = s.id
-            WHERE us.user_id = $1 AND s.id = ANY($2::int[])`,
-          [req.user.id, requestedSiteIds]
+            WHERE us.user_id = $1 AND s.id = ANY($2::int[]) AND s.organization_id=$3`,
+          [req.user.id, requestedSiteIds, req.user.organization_id]
         );
     if (accessResult.rows.length !== requestedSiteIds.length) {
       await client.query('ROLLBACK');
@@ -288,7 +310,7 @@ export const listMembers = asyncHandler(async (req, res) => {
     memberModel.findBySiteIdList(parseInt(site_id), pool, type || null),
     memberModel.getSummary(parseInt(site_id), pool),
   ]);
-  res.json({ members, summary });
+  res.json({ members: await Promise.all(members.map((member) => presentMember(member, { list: true }))), summary });
 });
 
 /** GET /members/search?site_id=X&q=... */
@@ -296,7 +318,7 @@ export const searchMembers = asyncHandler(async (req, res) => {
   const { site_id, q } = req.query;
   if (!site_id) return res.status(400).json({ message: 'site_id is required' });
   const members = await memberModel.search(parseInt(site_id), q || '', pool);
-  res.json({ members });
+  res.json({ members: await Promise.all(members.map((member) => presentMember(member, { list: true }))) });
 });
 
 /** GET /members/autocomplete?site_id=X */
@@ -311,7 +333,7 @@ export const getMemberAutocomplete = asyncHandler(async (req, res) => {
 export const getMember = asyncHandler(async (req, res) => {
   const member = await memberModel.findById(parseInt(req.params.id), pool);
   if (!member) return res.status(404).json({ message: 'Member not found' });
-  res.json({ member });
+  res.json({ member: await presentMember(member) });
 });
 
 /** PUT /members/:id */
@@ -363,7 +385,7 @@ export const updateMember = asyncHandler(async (req, res) => {
   if (Object.keys(data).length === 0) return res.status(400).json({ message: 'Nothing to update' });
 
   const updated = await memberModel.update(memberId, data, pool);
-  res.json({ member: updated });
+  res.json({ member: await presentMember(updated) });
 });
 
 /** DELETE /members/:id */

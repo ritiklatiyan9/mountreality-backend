@@ -27,15 +27,16 @@ class ExcelModel extends MasterModel {
   /**
    * Find recent files for a user (for sidebar quick-access)
    */
-  async findRecent(userId, limit = 5, pool) {
+  async findRecent(userId, organizationId, limit = 5, pool) {
     const query = `
-      SELECT id, name, updated_at
-      FROM excel_files
-      WHERE created_by = $1
-      ORDER BY updated_at DESC
-      LIMIT $2
+      SELECT ef.id, ef.name, ef.updated_at
+      FROM excel_files ef
+      JOIN sites s ON s.id = ef.site_id
+      WHERE ef.created_by = $1 AND s.organization_id = $2
+      ORDER BY ef.updated_at DESC
+      LIMIT $3
     `;
-    const result = await pool.query(query, [userId, limit]);
+    const result = await pool.query(query, [userId, organizationId, limit]);
     return result.rows;
   }
 

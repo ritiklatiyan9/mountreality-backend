@@ -5,21 +5,64 @@
 import pool from '../../config/db.js';
 
 /**
- * Fetch all plots for a site with payment aggregates in a SINGLE query
- * using LEFT JOIN + GROUP BY instead of 6 correlated subqueries per row.
+ * Fetch all plots for a site with payment aggregates in a single set-based
+ * query. Grouping each receipt table once avoids two index scans for every
+ * plot on the Plot Payments landing page.
  */
 export async function getPlotsWithTotals(siteId) {
-  // Per-plot RECEIVED = plot_payments + plot_installment_payments (both across
-  // every payment mode). Two LATERAL joins keep the query readable; the final
-  // `total_received`, `received_bank` and `received_cash` are the sum of each
-  // leg. Bounced / returned cheques are excluded on both sources.
   const query = `
-    SELECT
-      p.*,
-      -- booking_date is a DATE column → pg hands it back as a JS Date, which the
-      -- GraphQLString field then serializes as epoch-millis (unparseable on the
-      -- client). Emit a stable 'YYYY-MM-DD' string instead. The duplicate column
-      -- name intentionally overrides the one from p.* (last column wins in pg).
+    WITH direct_rollup AS (
+      SELECT
+        pp.plot_id,
+        SUM(pp.amount) FILTER (
+          WHERE LOWER(COALESCE(pp.status, 'approved')) = 'approved'
+            AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+        ) AS total_received,
+        SUM(pp.amount) FILTER (
+          WHERE ledger_bucket(pp.payment_type) <> 'cash'
+            AND LOWER(COALESCE(pp.status, 'approved')) = 'approved'
+            AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+        ) AS received_bank,
+        SUM(pp.amount) FILTER (
+          WHERE ledger_bucket(pp.payment_type) = 'cash'
+            AND LOWER(COALESCE(pp.status, 'approved')) = 'approved'
+            AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+        ) AS received_cash,
+        COUNT(*) FILTER (
+          WHERE LOWER(COALESCE(pp.status, 'approved')) = 'approved'
+            AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+        )::int AS payment_count,
+        STRING_AGG(DISTINCT pp.buyer_name, ', ') FILTER (
+          WHERE pp.buyer_name IS NOT NULL AND pp.buyer_name != ''
+        ) AS payment_buyer_names,
+        STRING_AGG(DISTINCT pp.booked_by, ', ') FILTER (
+          WHERE pp.booked_by IS NOT NULL AND pp.booked_by != ''
+        ) AS payment_booked_bys
+      FROM plot_payments pp
+      WHERE pp.site_id = $1
+      GROUP BY pp.plot_id
+    ), installment_rollup AS (
+      SELECT
+        pip.plot_id,
+        SUM(pip.amount) FILTER (
+          WHERE UPPER(COALESCE(pip.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+        ) AS total_received,
+        SUM(pip.amount) FILTER (
+          WHERE ledger_bucket(pip.payment_mode) <> 'cash'
+            AND UPPER(COALESCE(pip.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+        ) AS received_bank,
+        SUM(pip.amount) FILTER (
+          WHERE ledger_bucket(pip.payment_mode) = 'cash'
+            AND UPPER(COALESCE(pip.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+        ) AS received_cash,
+        COUNT(*) FILTER (
+          WHERE UPPER(COALESCE(pip.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+        )::int AS payment_count
+      FROM plot_installment_payments pip
+      JOIN plots scoped_plot ON scoped_plot.id = pip.plot_id AND scoped_plot.site_id = $1
+      GROUP BY pip.plot_id
+    )
+    SELECT p.*,
       to_char(p.booking_date, 'YYYY-MM-DD') AS booking_date,
       COALESCE(pp_agg.total_received, 0) + COALESCE(ip_agg.total_received, 0)
         AS total_received,
@@ -32,36 +75,9 @@ export async function getPlotsWithTotals(siteId) {
       COALESCE(pp_agg.payment_buyer_names, '')  AS payment_buyer_names,
       COALESCE(pp_agg.payment_booked_bys, '')   AS payment_booked_bys
     FROM plots p
-    LEFT JOIN LATERAL (
-      SELECT
-        SUM(pp.amount) FILTER (WHERE LOWER(COALESCE(pp.status, 'approved')) = 'approved' AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED'))
-          AS total_received,
-        SUM(pp.amount) FILTER (WHERE ledger_bucket(pp.payment_type) <> 'cash' AND LOWER(COALESCE(pp.status, 'approved')) = 'approved' AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED'))
-          AS received_bank,
-        SUM(pp.amount) FILTER (WHERE ledger_bucket(pp.payment_type) = 'cash' AND LOWER(COALESCE(pp.status, 'approved')) = 'approved' AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED'))
-          AS received_cash,
-        COUNT(*) FILTER (WHERE LOWER(COALESCE(pp.status, 'approved')) = 'approved' AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED'))::int AS payment_count,
-        string_agg(DISTINCT pp.buyer_name, ', ') FILTER (WHERE pp.buyer_name IS NOT NULL AND pp.buyer_name != '')
-          AS payment_buyer_names,
-        string_agg(DISTINCT pp.booked_by, ', ') FILTER (WHERE pp.booked_by IS NOT NULL AND pp.booked_by != '')
-          AS payment_booked_bys
-      FROM plot_payments pp
-      WHERE pp.plot_id = p.id
-    ) pp_agg ON true
-    LEFT JOIN LATERAL (
-      SELECT
-        SUM(pip.amount) FILTER (WHERE UPPER(COALESCE(pip.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED'))
-          AS total_received,
-        SUM(pip.amount) FILTER (WHERE ledger_bucket(pip.payment_mode) <> 'cash' AND UPPER(COALESCE(pip.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED'))
-          AS received_bank,
-        SUM(pip.amount) FILTER (WHERE ledger_bucket(pip.payment_mode) = 'cash' AND UPPER(COALESCE(pip.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED'))
-          AS received_cash,
-        COUNT(*) FILTER (WHERE UPPER(COALESCE(pip.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED'))::int AS payment_count
-      FROM plot_installment_payments pip
-      WHERE pip.plot_id = p.id
-    ) ip_agg ON true
+    LEFT JOIN direct_rollup pp_agg ON pp_agg.plot_id = p.id
+    LEFT JOIN installment_rollup ip_agg ON ip_agg.plot_id = p.id
     WHERE p.site_id = $1
-    ORDER BY p.plot_no ASC
   `;
   const { rows } = await pool.query(query, [siteId]);
   return rows;
@@ -148,27 +164,10 @@ export async function getPlotAutocomplete(siteId) {
   return autocomplete;
 }
 
-/**
- * Fetch plot payments page data in a single call (plots + autocomplete).
- * This replaces the two parallel REST calls in the frontend.
- */
+/** Fetch the initial Plot Payments view. Form metadata is deliberately lazy. */
 export async function getPlotPageData(siteId) {
-  // Run free-to-sale check in parallel with data fetching
-  const checkFreeToSaleQuery = `
-    SELECT p.id, p.status, p.grace_period_days, p.free_to_sale_days
-    FROM plots p
-    WHERE p.site_id = $1
-      AND p.installments_enabled = true
-      AND p.free_to_sale_days > 0
-      AND p.status NOT IN ('UNDER CANCELLATION', 'CANCELLED', 'RESALE', 'TRANSFERRED', 'COMPANY')
-  `;
-
-  const [plots, autocomplete] = await Promise.all([
-    getPlotsWithTotals(siteId),
-    getPlotAutocomplete(siteId),
-  ]);
-
-  return { plots, autocomplete };
+  const plots = await getPlotsWithTotals(siteId);
+  return { plots };
 }
 
 /**

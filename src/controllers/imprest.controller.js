@@ -9,6 +9,7 @@ import { dayBookModel } from '../models/DayBook.model.js';
 import { expenseModel } from '../models/Expense.model.js';
 import { findEligibleImprestParticipant } from '../middlewares/imprestSiteAccess.middleware.js';
 import pool from '../config/db.js';
+import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
 
 // ══════════════════════════════════════════════════
 //  IMPREST ALLOCATION (Admin)
@@ -411,7 +412,7 @@ export const getAllBalances = asyncHandler(async (req, res) => {
 export const createExpenseFromImprest = asyncHandler(async (req, res) => {
   const {
     site_id, date, from_entity, to_entity, payment_mode,
-    debit, credit, remark, account_no, branch, category, assigned_admin_id,
+    debit, credit, remark, account_no, branch, category, assigned_admin_id, bank_account_id,
   } = req.body;
 
   if (!site_id) return res.status(400).json({ message: 'Site is required' });
@@ -425,6 +426,13 @@ export const createExpenseFromImprest = asyncHandler(async (req, res) => {
 
     // 1. Check imprest balance
     const parsedSiteId = req.imprestSiteId || parseInt(site_id);
+    const normalizedPaymentMode = payment_mode ? payment_mode.trim().toUpperCase() : null;
+    const selectedBankAccountId = await resolveBankAccountSelection({
+      siteId: parsedSiteId,
+      paymentMode: normalizedPaymentMode,
+      bankAccountId: bank_account_id,
+      db: client,
+    });
     const currentBalance = await imprestLedgerModel.getBalance(req.user.id, parsedSiteId, client);
 
     if (currentBalance <= 0) {
@@ -453,7 +461,8 @@ export const createExpenseFromImprest = asyncHandler(async (req, res) => {
       date: expenseDate,
       from_entity: from_entity ? from_entity.trim().toUpperCase() : null,
       to_entity: to_entity ? to_entity.trim().toUpperCase() : null,
-      payment_mode: payment_mode ? payment_mode.trim().toUpperCase() : null,
+      payment_mode: normalizedPaymentMode,
+      bank_account_id: selectedBankAccountId,
       debit: expenseAmount,
       credit: parseFloat(credit) || 0,
       remark: remark ? remark.trim().toUpperCase() : null,
@@ -487,7 +496,7 @@ export const createExpenseFromImprest = asyncHandler(async (req, res) => {
       debit: expenseAmount,
       credit: parseFloat(credit) || 0,
       remarks: remark ? remark.trim().toUpperCase() : null,
-      payment_mode: payment_mode ? payment_mode.trim().toUpperCase() : null,
+      payment_mode: normalizedPaymentMode,
       category: category ? category.trim().toUpperCase() : null,
       assigned_admin_id: assigned_admin_id ? parseInt(assigned_admin_id) : null,
       from_entity: from_entity ? from_entity.trim().toUpperCase() : null,
@@ -530,6 +539,7 @@ export const createExpenseRequest = asyncHandler(async (req, res) => {
     site_id, amount, reason,
     date, from_entity, to_entity, payment_mode,
     debit, credit, remark, account_no, branch, category, assigned_admin_id,
+    bank_account_id,
     request_type: explicitType,
   } = req.body;
 
@@ -543,13 +553,22 @@ export const createExpenseRequest = asyncHandler(async (req, res) => {
   const requestType = explicitType === 'IMPREST' || explicitType === 'EXPENSE'
     ? explicitType
     : hasExpenseFields ? 'EXPENSE' : 'IMPREST';
+  const normalizedPaymentMode = payment_mode ? payment_mode.trim().toUpperCase() : null;
+  const selectedBankAccountId = requestType === 'EXPENSE'
+    ? await resolveBankAccountSelection({
+        siteId: parsedSiteId,
+        paymentMode: normalizedPaymentMode,
+        bankAccountId: bank_account_id,
+      })
+    : null;
 
   const expenseData = {
     site_id: parsedSiteId,
     date: date || new Date().toISOString().split('T')[0],
     from_entity: from_entity ? from_entity.trim().toUpperCase() : null,
     to_entity: to_entity ? to_entity.trim().toUpperCase() : null,
-    payment_mode: payment_mode ? payment_mode.trim().toUpperCase() : null,
+    payment_mode: normalizedPaymentMode,
+    bank_account_id: selectedBankAccountId,
     debit: requestAmount,
     credit: parseFloat(credit) || 0,
     remark: remark ? remark.trim().toUpperCase() : null,
@@ -684,6 +703,12 @@ export const approveExpenseRequest = asyncHandler(async (req, res) => {
     // The request row owns the authoritative site. Never trust a stale or
     // legacy JSON payload to direct the approved expense into another site.
     const expenseData = { ...storedExpenseData, site_id: request.site_id };
+    expenseData.bank_account_id = await resolveBankAccountSelection({
+      siteId: request.site_id,
+      paymentMode: expenseData.payment_mode,
+      bankAccountId: expenseData.bank_account_id,
+      db: client,
+    });
     const expenseAmount = parseFloat(expenseData.debit) || requestAmount;
 
     // 2b. Create the expense
@@ -834,7 +859,7 @@ export const adjustBalance = asyncHandler(async (req, res) => {
  * Sub-admin initiates returning money back to admin
  */
 export const createReturn = asyncHandler(async (req, res) => {
-  const { amount, reason, payment_mode, site_id, assigned_admin_id } = req.body;
+  const { amount, reason, payment_mode, site_id, assigned_admin_id, bank_account_id } = req.body;
 
   const returnAmount = parseFloat(amount);
   if (!returnAmount || returnAmount <= 0) {
@@ -843,6 +868,12 @@ export const createReturn = asyncHandler(async (req, res) => {
 
   // Validate balance — can't return more than available
   const parsedSiteId = req.imprestSiteId || parseInt(site_id);
+  const normalizedPaymentMode = payment_mode ? payment_mode.trim().toUpperCase() : 'CASH';
+  const selectedBankAccountId = await resolveBankAccountSelection({
+    siteId: parsedSiteId,
+    paymentMode: normalizedPaymentMode,
+    bankAccountId: bank_account_id,
+  });
   const currentBalance = await imprestLedgerModel.getBalance(req.user.id, parsedSiteId, pool);
   if (currentBalance < returnAmount) {
     return res.status(400).json({
@@ -855,7 +886,8 @@ export const createReturn = asyncHandler(async (req, res) => {
     sub_admin_id: req.user.id,
     amount: returnAmount,
     reason: reason ? reason.trim() : null,
-    payment_mode: payment_mode ? payment_mode.trim().toUpperCase() : 'CASH',
+    payment_mode: normalizedPaymentMode,
+    bank_account_id: selectedBankAccountId,
     site_id: parsedSiteId,
     assigned_admin_id: assigned_admin_id ? parseInt(assigned_admin_id) : null,
     status: 'PENDING',
@@ -956,6 +988,7 @@ export const acceptReturn = asyncHandler(async (req, res) => {
       credit: 0,
       remarks: `IMPREST RETURN: ${returnRecord.reason || 'UNUSED FUNDS RETURNED'}`.toUpperCase(),
       payment_mode: returnRecord.payment_mode || 'CASH',
+      bank_account_id: returnRecord.bank_account_id || null,
       category: 'IMPREST',
       from_entity: subAdminName.toUpperCase(),
       to_entity: 'ADMIN',

@@ -1,6 +1,7 @@
 import asyncHandler from '../utils/asyncHandler.js';
 import pool from '../config/db.js';
 import { uploadPlotDoc, getPlotDocUrl, deletePlotDoc } from '../utils/plotDocStorage.js';
+import { enforceEntitySiteAccess } from '../utils/siteAccessPolicy.js';
 
 /**
  * Document Imprest — register of physical documents handed over on site.
@@ -14,19 +15,8 @@ import { uploadPlotDoc, getPlotDocUrl, deletePlotDoc } from '../utils/plotDocSto
 
 const S3_PREFIX = 'document_imprest';
 
-const isAdminRole = (role) => role === 'admin' || role === 'super_admin';
-
 const ensureSiteAccess = async (req, res, siteId) => {
-  if (isAdminRole(req.user.role)) return true;
-
-  const { rows } = await pool.query(
-    'SELECT 1 FROM user_sites WHERE user_id = $1 AND site_id = $2 LIMIT 1',
-    [req.user.id, siteId]
-  );
-  if (rows[0]) return true;
-
-  res.status(403).json({ message: 'Access denied to this site' });
-  return false;
+  return enforceEntitySiteAccess({ req, res, siteId, module: 'document_imprest' });
 };
 
 /** Resolve the record's authoritative site before exposing proof keys or mutating it. */
@@ -41,11 +31,12 @@ const getAccessibleRecord = async (req, res, id) => {
   return record;
 };
 
-const getSiteReceiver = async (receiverUserId, siteId) => {
+const getSiteReceiver = async (receiverUserId, siteId, organizationId) => {
   const { rows } = await pool.query(
     `SELECT u.id
        FROM users u
       WHERE u.id = $1
+        AND u.organization_id = $3
         AND u.is_active = true
         AND (
           u.role IN ('admin', 'super_admin')
@@ -55,7 +46,7 @@ const getSiteReceiver = async (receiverUserId, siteId) => {
           )
         )
       LIMIT 1`,
-    [receiverUserId, siteId]
+    [receiverUserId, siteId, organizationId]
   );
   return rows[0] || null;
 };
@@ -153,7 +144,7 @@ export const createDocumentImprest = asyncHandler(async (req, res) => {
   if (receiver_user_id) {
     receiverUserId = parseInt(receiver_user_id, 10);
     if (Number.isNaN(receiverUserId)) return res.status(400).json({ message: 'Invalid receiver_user_id' });
-    if (!await getSiteReceiver(receiverUserId, siteId)) {
+    if (!await getSiteReceiver(receiverUserId, siteId, req.user.organization_id)) {
       return res.status(400).json({ message: 'Receiver is not available for this site' });
     }
   }
@@ -213,7 +204,7 @@ export const updateDocumentImprest = asyncHandler(async (req, res) => {
   if (receiver_user_id) {
     receiverUserId = parseInt(receiver_user_id, 10);
     if (Number.isNaN(receiverUserId)) return res.status(400).json({ message: 'Invalid receiver_user_id' });
-    if (!await getSiteReceiver(receiverUserId, existing.site_id)) {
+    if (!await getSiteReceiver(receiverUserId, existing.site_id, req.user.organization_id)) {
       return res.status(400).json({ message: 'Receiver is not available for this site' });
     }
   }
@@ -232,8 +223,8 @@ export const updateDocumentImprest = asyncHandler(async (req, res) => {
     `UPDATE document_imprest
         SET document_name = $2, description = $3, receiver_user_id = $4,
             receiver_name = $5, expected_return_at = $6, remarks = $7
-      WHERE id = $1`,
-    [id, String(document_name).trim(), description || null, receiverUserId, receiverName, expectedReturnAt, remarks || null]
+      WHERE id = $1 AND site_id = $8`,
+    [id, String(document_name).trim(), description || null, receiverUserId, receiverName, expectedReturnAt, remarks || null, existing.site_id]
   );
 
   const { rows } = await pool.query(`${RECORD_SELECT} WHERE di.id = $1`, [id]);
@@ -253,7 +244,7 @@ export const deleteDocumentImprest = asyncHandler(async (req, res) => {
   const record = await getAccessibleRecord(req, res, id);
   if (!record) return;
 
-  await pool.query('DELETE FROM document_imprest WHERE id = $1', [id]);
+  await pool.query('DELETE FROM document_imprest WHERE id = $1 AND site_id = $2', [id, record.site_id]);
   try { await deletePlotDoc(record.photo_key); } catch { /* best-effort */ }
   try { await deletePlotDoc(record.return_photo_key); } catch { /* best-effort */ }
 
@@ -285,9 +276,10 @@ export const returnDocumentImprest = asyncHandler(async (req, res) => {
           SET status = 'RETURNED', returned_at = now(),
               return_photo_key = $2, return_received_by = $3, return_remarks = $4
         WHERE id = $1
+          AND site_id = $5
           AND status = 'ISSUED'
         RETURNING id`,
-      [id, returnPhotoKey, req.user.id, req.body.return_remarks || null]
+      [id, returnPhotoKey, req.user.id, req.body.return_remarks || null, existing.site_id]
     );
 
     // Another authorized request may have returned the document after our

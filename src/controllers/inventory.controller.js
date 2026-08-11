@@ -23,6 +23,8 @@ export const listMaterials = asyncHandler(async (req, res) => {
   const materials = await inventoryModel.listMaterials(siteId, {
     search: req.query.search?.trim() || undefined,
     lowStock: req.query.low_stock === 'true',
+    limit: Math.min(Math.max(parseInt(req.query.limit, 10) || 100, 1), 200),
+    offset: Math.max(parseInt(req.query.offset, 10) || 0, 0),
   });
   res.json({ materials });
 });
@@ -108,6 +110,7 @@ export const listMovements = asyncHandler(async (req, res) => {
   const movements = await inventoryModel.listMovements(siteId, {
     materialId: req.query.material_id ? parseInt(req.query.material_id, 10) : undefined,
     limit: Math.min(parseInt(req.query.limit, 10) || 200, 1000),
+    offset: Math.max(parseInt(req.query.offset, 10) || 0, 0),
   });
   res.json({ movements });
 });
@@ -122,8 +125,18 @@ export const createMovement = asyncHandler(async (req, res) => {
   if (!Number.isFinite(q) || q === 0) return res.status(400).json({ message: 'qty must be a non-zero number' });
   // Only ADJUSTMENT may be negative; everything else is a positive magnitude.
   if (type !== 'ADJUSTMENT' && q < 0) return res.status(400).json({ message: 'qty must be positive for this movement type' });
+  if (type === 'ADJUSTMENT' && !['admin', 'super_admin'].includes(req.user.role)) {
+    return res.status(403).json({ message: 'Stock adjustments require an administrator' });
+  }
+  if (type === 'ADJUSTMENT' && String(note || '').trim().length < 8) {
+    return res.status(400).json({ message: 'A clear adjustment reason of at least 8 characters is required' });
+  }
   if (type === 'RECEIPT' && String(ref_type || '').toUpperCase() === 'VENDOR_ORDER') {
     return res.status(400).json({ message: 'Vendor-order receipts must use the procurement receive workflow' });
+  }
+  const idempotencyKey = String(req.get('X-Idempotency-Key') || '').trim();
+  if (!/^[A-Za-z0-9._:-]{8,128}$/.test(idempotencyKey)) {
+    return res.status(400).json({ message: 'A valid X-Idempotency-Key header is required' });
   }
 
   const client = await pool.connect();
@@ -138,10 +151,37 @@ export const createMovement = asyncHandler(async (req, res) => {
     );
     if (!mat.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Material not found for this site' }); }
 
-    if (REDUCING.has(type) || type === 'RESERVE') {
-      const { on_hand, available } = await inventoryModel.stockFor(material_id, client);
-      const cap = type === 'RESERVE' ? available : on_hand;
-      if (q > cap) { await client.query('ROLLBACK'); return res.status(400).json({ message: `Only ${cap} in stock — cannot ${type.toLowerCase()} ${q}` }); }
+    const prior = await client.query(
+      'SELECT * FROM inventory_movements WHERE site_id=$1 AND idempotency_key=$2 LIMIT 1',
+      [siteId, idempotencyKey]
+    );
+    if (prior.rows[0]) {
+      await client.query('COMMIT');
+      return res.status(200).json({ movement: { ...prior.rows[0], idempotent: true } });
+    }
+
+    if (REDUCING.has(type) || type === 'RESERVE' || type === 'UNRESERVE' || (type === 'ADJUSTMENT' && q < 0)) {
+      const stock = await inventoryModel.stockFor(material_id, client);
+      const { on_hand, available } = stock;
+      const cap = type === 'UNRESERVE' ? stock.reserved : (type === 'RESERVE' || REDUCING.has(type) ? available : on_hand);
+      const requested = type === 'ADJUSTMENT' ? Math.abs(q) : q;
+      if (requested > cap) { await client.query('ROLLBACK'); return res.status(400).json({ message: `Only ${cap} available — cannot ${type.toLowerCase()} ${q}` }); }
+    }
+
+    if (project_id || task_id) {
+      const refs = await client.query(
+        `SELECT
+          ($2::int IS NULL OR EXISTS (SELECT 1 FROM construction_projects p WHERE p.id=$2 AND p.site_id=$1)) AS project_ok,
+          ($3::int IS NULL OR EXISTS (
+            SELECT 1 FROM construction_tasks t JOIN construction_projects p ON p.id=t.project_id
+             WHERE t.id=$3 AND p.site_id=$1 AND ($2::int IS NULL OR p.id=$2)
+          )) AS task_ok`,
+        [siteId, project_id || null, task_id || null]
+      );
+      if (!refs.rows[0].project_ok || !refs.rows[0].task_ok) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'Project or task does not belong to the selected site' });
+      }
     }
 
     const movementRate = rate === undefined || rate === '' ? parseFloat(mat.rows[0].rate) || 0 : Number(rate);
@@ -149,6 +189,7 @@ export const createMovement = asyncHandler(async (req, res) => {
     const movement = await inventoryModel.insertMovement({
       site_id: siteId, material_id, movement_type: type, qty: q,
       rate: movementRate, project_id, task_id, ref_type, ref_id, note, created_by: req.user.id,
+      idempotency_key: idempotencyKey,
     }, client);
     await client.query('COMMIT');
     res.status(201).json({ movement });
@@ -173,6 +214,10 @@ export const receiveVendorOrder = asyncHandler(async (req, res) => {
   if (!Number.isInteger(orderId)) return res.status(400).json({ message: 'Invalid order id' });
   const qty = Number(req.body.qty);
   if (!Number.isFinite(qty) || qty <= 0) return res.status(400).json({ message: 'qty must be greater than 0' });
+  const idempotencyKey = String(req.get('X-Idempotency-Key') || '').trim();
+  if (!/^[A-Za-z0-9._:-]{8,128}$/.test(idempotencyKey)) {
+    return res.status(400).json({ message: 'A valid X-Idempotency-Key header is required' });
+  }
 
   const client = await pool.connect();
   try {
@@ -185,6 +230,14 @@ export const receiveVendorOrder = asyncHandler(async (req, res) => {
     );
     if (!order) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Vendor order not found for this site' }); }
     if (order.status === 'cancelled') { await client.query('ROLLBACK'); return res.status(400).json({ message: 'Order is cancelled' }); }
+    const prior = await client.query(
+      'SELECT * FROM inventory_movements WHERE site_id=$1 AND idempotency_key=$2 LIMIT 1',
+      [siteId, idempotencyKey]
+    );
+    if (prior.rows[0]) {
+      await client.query('COMMIT');
+      return res.status(200).json({ movement: { ...prior.rows[0], idempotent: true }, material_id: prior.rows[0].material_id });
+    }
 
     const { rows: [rec] } = await client.query(
       `SELECT COALESCE(SUM(qty), 0) AS received FROM inventory_movements
@@ -218,6 +271,7 @@ export const receiveVendorOrder = asyncHandler(async (req, res) => {
       ref_type: 'VENDOR_ORDER', ref_id: orderId,
       note: (req.body.note || '').trim() || `Vendor order #${orderId} — ${order.vendor_name}`,
       created_by: req.user.id,
+      idempotency_key: idempotencyKey,
     }, client);
 
     await client.query('COMMIT');

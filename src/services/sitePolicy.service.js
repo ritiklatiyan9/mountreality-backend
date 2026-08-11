@@ -92,6 +92,9 @@ export const SITE_POLICY_CAPABILITY_KEYS = Object.freeze([
   'commercial_inventory',
   'mixed_use_inventory',
   'landowner_linked',
+  'construction_certification',
+  'filing_preparation',
+  'project_change_control',
 ]);
 
 const KNOWN_CAPABILITIES = new Set(SITE_POLICY_CAPABILITY_KEYS);
@@ -172,6 +175,9 @@ const baseCapabilities = () => ({
   commercial_inventory: false,
   mixed_use_inventory: false,
   landowner_linked: false,
+  construction_certification: false,
+  filing_preparation: false,
+  project_change_control: false,
 });
 
 const configuredValue = (profile, key) => {
@@ -599,8 +605,6 @@ const profileDefaults = (profile) => {
   modules[RERA_MODULE_KEYS.OPERATING_PROFILE] = true;
   if (projectWorkspace) {
     modules[RERA_MODULE_KEYS.PROJECTS] = true;
-    modules[RERA_MODULE_KEYS.APPROVALS] = true;
-    modules[RERA_MODULE_KEYS.EVIDENCE] = true;
   }
   if (reraWorkspace) {
     modules[RERA_MODULE_KEYS.PROJECTS] = true;
@@ -620,6 +624,9 @@ const profileDefaults = (profile) => {
   capabilities.evidence_vault = modules[RERA_MODULE_KEYS.EVIDENCE] === true;
   capabilities.ruleset_information = modules[RERA_MODULE_KEYS.RULESETS] === true;
   capabilities.landowner_linked = landownerLinked;
+  capabilities.construction_certification = reraWorkspace;
+  capabilities.filing_preparation = reraWorkspace;
+  capabilities.project_change_control = reraWorkspace;
 
   if (['PLOTTED_DEVELOPMENT', 'MIXED_USE'].includes(projectShape)) {
     capabilities.plotted_inventory = true;

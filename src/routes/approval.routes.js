@@ -27,10 +27,10 @@ router.use(requireRole('admin', 'sub_admin'), requirePermission('expense_approva
 router.get('/pending', approvalReadCache, listAllPending);           // ?site_id=X&date_from=&date_to=&module=
 router.get('/counts', approvalReadCache, getPendingCounts);           // ?site_id=X
 router.get('/cheques', approvalReadCache, listChequeEntries);         // ?site_id=X&status=PENDING|CLEARED|BOUNCED|RETURNED|all
-router.put('/:id/approve', bustApprovalCache, approveEntry);          // ?source=farmer_payment|plot_commission|...
-router.put('/:id/reject', bustApprovalCache, rejectEntry);            // ?source=...
-router.post('/bulk-approve', bustApprovalCache, bulkApprove);         // { items: [{ id, source }] }
-router.post('/bulk-reject', bustApprovalCache, bulkReject);           // { items: [{ id, source }] }
-router.patch('/cheque-status', bustApprovalCache, updateChequeStatus); // { id, source, cheque_status }
+router.put('/:id/approve', requirePermission('expense_approval', 'write'), bustApprovalCache, approveEntry);          // ?source=farmer_payment|plot_commission|...
+router.put('/:id/reject', requirePermission('expense_approval', 'write'), bustApprovalCache, rejectEntry);            // ?source=...
+router.post('/bulk-approve', requirePermission('expense_approval', 'write'), bustApprovalCache, bulkApprove);         // { items: [{ id, source }] }
+router.post('/bulk-reject', requirePermission('expense_approval', 'write'), bustApprovalCache, bulkReject);           // { items: [{ id, source }] }
+router.patch('/cheque-status', requirePermission('expense_approval', 'write'), bustApprovalCache, updateChequeStatus); // { id, source, cheque_status }
 
 export default router;

@@ -61,8 +61,8 @@ export const listFiles = asyncHandler(async (req, res) => {
  * Recent files for sidebar
  */
 export const getRecentFiles = asyncHandler(async (req, res) => {
-    const limit = parseInt(req.query.limit) || 5;
-    const files = await excelModel.findRecent(req.user.id, limit, pool);
+    const limit = Math.min(25, Math.max(1, parseInt(req.query.limit, 10) || 5));
+    const files = await excelModel.findRecent(req.user.id, req.user.organization_id, limit, pool);
     res.json({ files });
 });
 

@@ -4,6 +4,7 @@ import { buildVerifyUrl, ReceiptType } from '../utils/receiptToken.js';
 import pool from '../config/db.js';
 import applicationSettingModel, { FEATURE_KEYS } from '../models/ApplicationSetting.model.js';
 import { classifyPaymentMode } from '../utils/paymentMode.js';
+import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
 
 // ══════════════════════════════════════════════════
 //  REGISTRY ENDPOINTS
@@ -211,7 +212,7 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
     // registry's NOC payment gate.
     const { rows } = await db.query(
       `SELECT pp.id, pp.site_id, pp.date, pp.amount, pp.payment_from, pp.payment_type,
-              pp.bank_details, pp.narration, pp.cheque_no, pp.cheque_status
+              pp.bank_details, pp.narration, pp.cheque_no, pp.cheque_status, pp.bank_account_id
          FROM plot_payments pp
         WHERE pp.id = ANY($1::int[])
           AND pp.site_id = $2
@@ -264,7 +265,7 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
     if (linkedIds.length) {
       const { rows: currentLinkable } = await client.query(
         `SELECT pp.id,pp.site_id,pp.date,pp.amount,pp.payment_from,pp.payment_type,
-                pp.bank_details,pp.narration,pp.cheque_no,pp.cheque_status
+                pp.bank_details,pp.narration,pp.cheque_no,pp.cheque_status,pp.bank_account_id
            FROM plot_payments pp
           WHERE pp.id=ANY($1::int[]) AND pp.site_id=$2 AND pp.plot_id=$3
             AND LOWER(COALESCE(pp.status,'approved'))='approved'
@@ -351,14 +352,14 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
       await client.query(
         `INSERT INTO plot_registry_payments (
            registry_id, site_id, payment_date, amount, payment_mode, tally_date, tally_amount,
-           notes, source_plot_payment_id, cheque_no, cheque_status, created_by
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+           notes, source_plot_payment_id, cheque_no, cheque_status, created_by, bank_account_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
         [
           registryId, siteIdInt, pp.date || today, parseFloat(pp.amount) || 0,
           (pp.payment_type || '').trim().toUpperCase() || null,
           pp.date || null, parseFloat(pp.amount) || 0,
           (pp.narration || pp.bank_details || 'LINKED FROM PLOT PAYMENT').trim().toUpperCase(),
-          pp.id, pp.cheque_no || null, pp.cheque_status || null, userId,
+          pp.id, pp.cheque_no || null, pp.cheque_status || null, userId, pp.bank_account_id || null,
         ]
       );
     }
@@ -367,11 +368,17 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
     for (const m of manualRows) {
       const mode = m.payment_mode ? String(m.payment_mode).trim().toUpperCase() : null;
       const isCheque = classifyPaymentMode(mode) === 'cheque';
+      const selectedBankAccountId = await resolveBankAccountSelection({
+        siteId: siteIdInt,
+        paymentMode: mode,
+        bankAccountId: m.bank_account_id,
+        db: client,
+      });
       await client.query(
         `INSERT INTO plot_registry_payments (
            registry_id, site_id, payment_date, amount, payment_mode, tally_date, tally_amount,
-           notes, cheque_no, cheque_status, created_by
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+           notes, cheque_no, cheque_status, created_by, bank_account_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
         [
           registryId, siteIdInt, m.payment_date || today, parseFloat(m.amount) || 0, mode,
           m.tally_date || null,
@@ -380,6 +387,7 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
           isCheque && m.cheque_no ? String(m.cheque_no).trim() : null,
           isCheque ? 'PENDING' : null,
           userId,
+          selectedBankAccountId,
         ]
       );
     }
@@ -628,7 +636,7 @@ export const createRegistryPayment = asyncHandler(async (req, res) => {
       pool.query(
         `SELECT pp.id, pp.site_id, pp.plot_id, p.plot_no, pp.date, pp.amount,
                 pp.payment_from, pp.payment_type, pp.bank_details, pp.narration,
-                pp.cheque_no, pp.cheque_status
+                pp.cheque_no, pp.cheque_status, pp.bank_account_id
            FROM plot_payments pp
            LEFT JOIN plots p ON p.id = pp.plot_id
           WHERE pp.id = $1
@@ -673,6 +681,7 @@ export const createRegistryPayment = asyncHandler(async (req, res) => {
       source_plot_payment_id: sourceId,
       cheque_no: sourcePayment.cheque_no || null,
       cheque_status: sourcePayment.cheque_status || null,
+      bank_account_id: sourcePayment.bank_account_id || null,
       created_by: req.user.id,
       assigned_admin_id: req.body.assigned_admin_id ? parseInt(req.body.assigned_admin_id) : null,
     };
@@ -690,6 +699,11 @@ export const createRegistryPayment = asyncHandler(async (req, res) => {
 
   const normalizedMode = payment_mode ? payment_mode.trim().toUpperCase() : null;
   const isCheque = classifyPaymentMode(normalizedMode) === 'cheque';
+  const selectedBankAccountId = await resolveBankAccountSelection({
+    siteId: registry.site_id,
+    paymentMode: normalizedMode,
+    bankAccountId: req.body.bank_account_id,
+  });
   const data = {
     registry_id: registryIdInt,
     site_id: registry.site_id,
@@ -703,6 +717,7 @@ export const createRegistryPayment = asyncHandler(async (req, res) => {
     created_by: req.user.id,
     cheque_no: isCheque && req.body.cheque_no ? String(req.body.cheque_no).trim() : null,
     cheque_status: isCheque ? 'PENDING' : null,
+    bank_account_id: selectedBankAccountId,
   };
   if (hasSourcePlotPaymentCol) data.source_plot_payment_id = null;
 
@@ -734,7 +749,7 @@ export const getRegistryPayment = asyncHandler(async (req, res) => {
 /** PUT /registries/payments/:id */
 export const updateRegistryPayment = asyncHandler(async (req, res) => {
   const paymentId = parseInt(req.params.id);
-  const { payment_date, amount, payment_mode, tally_date, tally_amount, notes, cheque_no } = req.body;
+  const { payment_date, amount, payment_mode, tally_date, tally_amount, notes, cheque_no, bank_account_id } = req.body;
 
   const existing = await plotRegistryPaymentModel.findById(paymentId, pool);
   if (!existing) return res.status(404).json({ message: 'Payment not found' });
@@ -753,6 +768,13 @@ export const updateRegistryPayment = asyncHandler(async (req, res) => {
     : currentMode;
   const currentIsCheque = classifyPaymentMode(currentMode) === 'cheque';
   const nextIsCheque = classifyPaymentMode(nextMode) === 'cheque';
+  if (payment_mode !== undefined || bank_account_id !== undefined) {
+    updateData.bank_account_id = await resolveBankAccountSelection({
+      siteId: existing.site_id,
+      paymentMode: nextMode,
+      bankAccountId: bank_account_id !== undefined ? bank_account_id : existing.bank_account_id,
+    });
+  }
   if (payment_mode !== undefined) {
     updateData.payment_mode = nextMode;
     updateData.cheque_status = nextIsCheque
@@ -1028,7 +1050,7 @@ export const getRegistryNoc = asyncHandler(async (req, res) => {
 /** PUT /registries/:id/noc — batch-save NOC meta + payment selections.
  *  Body: { noc_no, noc_date, noc_place, noc_notes,
  *          included_plot_payment_ids: [plotPaymentId, ...],
- *          inline_payments: [{ id?, payment_date, amount, payment_mode, notes, cheque_no, include_in_noc }] }
+ *          inline_payments: [{ id?, payment_date, amount, payment_mode, bank_account_id, notes, cheque_no, include_in_noc }] }
  *  Toggling a plot payment ON links it to the registry (reusing the
  *  payment-assign infra); toggling OFF keeps the link but flags it out of
  *  the NOC, so registry accounting is never silently deleted. */
@@ -1098,15 +1120,15 @@ export const saveRegistryNoc = asyncHandler(async (req, res) => {
       );
       // Link payments that aren't assigned to any registry yet.
       await client.query(
-        `INSERT INTO plot_registry_payments (
+         `INSERT INTO plot_registry_payments (
            registry_id, site_id, payment_date, amount, payment_mode, tally_date, tally_amount,
-           notes, source_plot_payment_id, include_in_noc, cheque_no, cheque_status, created_by
+           notes, source_plot_payment_id, include_in_noc, cheque_no, cheque_status, created_by, bank_account_id
          )
          SELECT $1, pp.site_id, COALESCE(pp.date, CURRENT_DATE), pp.amount,
                 UPPER(COALESCE(NULLIF(TRIM(pp.payment_type), ''), 'BANK')),
                 pp.date, pp.amount,
                 COALESCE(NULLIF(UPPER(TRIM(pp.narration)), ''), NULLIF(UPPER(TRIM(pp.bank_details)), ''), 'LINKED FROM PLOT PAYMENT'),
-                pp.id, TRUE, pp.cheque_no, pp.cheque_status, $3
+                pp.id, TRUE, pp.cheque_no, pp.cheque_status, $3, pp.bank_account_id
            FROM plot_payments pp
           WHERE pp.id = ANY($2::int[])
             AND pp.site_id = $4
@@ -1143,10 +1165,17 @@ export const saveRegistryNoc = asyncHandler(async (req, res) => {
         const include = row.include_in_noc === undefined ? true : !!row.include_in_noc;
         const mode = row.payment_mode ? String(row.payment_mode).trim().toUpperCase() : null;
         const isCheque = classifyPaymentMode(mode) === 'cheque';
+        const selectedBankAccountId = await resolveBankAccountSelection({
+          siteId: registry.site_id,
+          paymentMode: mode,
+          bankAccountId: row.bank_account_id,
+          db: client,
+        });
         if (row.id) {
           await client.query(
             `UPDATE plot_registry_payments
                 SET payment_date = $2, amount = $3, payment_mode = $4, notes = $5,
+                    bank_account_id = $9,
                     cheque_no = CASE
                       WHEN ledger_bucket($4::text) = 'cheque' THEN $8
                       ELSE NULL
@@ -1170,20 +1199,22 @@ export const saveRegistryNoc = asyncHandler(async (req, res) => {
               parseInt(row.id), row.payment_date || today, amount, mode,
               row.notes ? String(row.notes).trim().toUpperCase() : null, include, registryId,
               isCheque && row.cheque_no ? String(row.cheque_no).trim() : null,
+              selectedBankAccountId,
             ]
           );
         } else if (amount > 0) {
           await client.query(
             `INSERT INTO plot_registry_payments (
                registry_id, site_id, payment_date, amount, payment_mode, notes,
-               include_in_noc, cheque_no, cheque_status, created_by
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+               include_in_noc, cheque_no, cheque_status, created_by, bank_account_id
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
             [
               registryId, registry.site_id, row.payment_date || today, amount, mode,
               row.notes ? String(row.notes).trim().toUpperCase() : null, include,
               isCheque && row.cheque_no ? String(row.cheque_no).trim() : null,
               isCheque ? 'PENDING' : null,
               req.user.id,
+              selectedBankAccountId,
             ]
           );
         }

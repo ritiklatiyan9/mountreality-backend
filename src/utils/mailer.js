@@ -131,6 +131,30 @@ export async function sendComplianceReminderEmail({
   });
 }
 
+/** Invite-only portal identity delivery. The raw invitation token exists only
+ * in this message/creator response; the database stores its SHA-256 hash. */
+export async function sendPortalInvitationEmail({ to, name, portalType, organizationName, invitationUrl, expiresAt }) {
+  if (!transporter) throw new Error('SMTP is not configured');
+  const label = `${String(portalType || 'portal').toLowerCase()} portal`;
+  await transporter.sendMail({
+    from: process.env.SMTP_FROM || `"Mount Reality" <${USER}>`,
+    to,
+    subject: `${organizationName} invited you to its ${label}`,
+    text: `Hello ${name || ''}\n\n${organizationName} invited you to the Mount Reality ${label}. Accept this invitation before ${expiresAt}:\n${invitationUrl}\n\nIf you were not expecting this invitation, ignore this email.`,
+    html: emailShell({
+      title: `Your ${label} invitation`,
+      bodyHtml: `
+        <p style="color:#0f172a;font-size:15px;line-height:1.7;margin:0 0 12px">Hello ${escapeHtml(name || 'there')},</p>
+        <p style="color:#334155;font-size:15px;line-height:1.7;margin:0 0 12px">
+          <b>${escapeHtml(organizationName)}</b> has invited you to its controlled ${escapeHtml(label)} workspace.
+        </p>
+        <p style="color:#64748b;font-size:13px;line-height:1.6;margin:0">This invite expires ${escapeHtml(expiresAt)}. Access is limited to the records assigned to you.</p>`,
+      ctaLabel: 'Accept invitation',
+      ctaUrl: invitationUrl,
+    }),
+  });
+}
+
 /** Sent to a new company's contact right after registration (self-serve
  * signup, or the Owner Panel's manual "Register a company" flow). Throws on
  * delivery failure — callers fire this without awaiting and log the error. */

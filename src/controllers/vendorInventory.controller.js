@@ -1,5 +1,6 @@
 import asyncHandler from '../utils/asyncHandler.js';
 import pool from '../config/db.js';
+import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
 
 // Vendor inventory module — transactions-only (no deliveries / stock-in/out).
 // An "order" is: item + qty_ordered * rate - discount = net value.
@@ -409,15 +410,21 @@ export const addInventoryPayment = asyncHandler(async (req, res) => {
     const outstanding = Number(order.order_value) - Number(order.paid_amount);
     if (amount > outstanding + 0.005) { await client.query('ROLLBACK'); return res.status(409).json({ message: `Payment exceeds the outstanding amount by ${Math.max(0, amount - outstanding).toFixed(2)}` }); }
 
-    const { payment_date, payment_mode, reference_no, note, voucher_url } = req.body;
+    const { payment_date, payment_mode, reference_no, note, voucher_url, bank_account_id } = req.body;
     const allowedModes = new Set(['cash', 'bank', 'upi', 'cheque', 'neft', 'rtgs', 'imps', 'other']);
     const mode = String(payment_mode || 'cash').toLowerCase();
     if (!allowedModes.has(mode)) { await client.query('ROLLBACK'); return res.status(400).json({ message: 'Invalid payment mode' }); }
+    const selectedBankAccountId = await resolveBankAccountSelection({
+      siteId,
+      paymentMode: mode,
+      bankAccountId: bank_account_id,
+      db: client,
+    });
 
     const result = await client.query(
     `INSERT INTO vendor_inventory_payments
-       (order_id, site_id, payment_date, amount, payment_mode, reference_no, cheque_no, note, voucher_url, created_by)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       (order_id, site_id, payment_date, amount, payment_mode, reference_no, cheque_no, note, voucher_url, created_by, bank_account_id)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
      RETURNING *`,
     [
       orderId,
@@ -430,6 +437,7 @@ export const addInventoryPayment = asyncHandler(async (req, res) => {
       (note || '').trim() || null,
       (voucher_url || '').trim() || null,
       req.user.id,
+      selectedBankAccountId,
     ]
     );
     await client.query('COMMIT');

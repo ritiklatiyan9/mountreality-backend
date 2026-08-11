@@ -91,7 +91,10 @@ const getAccessibleSiteId = async (req, res, rawSiteId) => {
     return null;
   }
 
-  const { rows } = await pool.query('SELECT id FROM sites WHERE id = $1 LIMIT 1', [siteId]);
+  const { rows } = await pool.query(
+    'SELECT id FROM sites WHERE id = $1 AND organization_id = $2 LIMIT 1',
+    [siteId, req.user?.organization_id],
+  );
   if (!rows[0]) {
     res.status(404).json({ message: 'Site not found.' });
     return null;
@@ -137,16 +140,19 @@ export const listUnassignedDmsDocuments = asyncHandler(async (req, res) => {
          FROM documents d
          LEFT JOIN users u ON u.id = d.uploaded_by
         WHERE d.uploaded_source = 'DMS'
+          AND d.organization_id = $1
           AND d.site_id IS NULL
         ORDER BY d.created_at ASC, d.id ASC
-        LIMIT $1 OFFSET $2`,
-      [limit, offset]
+        LIMIT $2 OFFSET $3`,
+      [req.user.organization_id, limit, offset]
     ),
     pool.query(
       `SELECT COUNT(*)::int AS total
          FROM documents
         WHERE uploaded_source = 'DMS'
-          AND site_id IS NULL`
+          AND organization_id = $1
+          AND site_id IS NULL`,
+      [req.user.organization_id]
     ),
   ]);
 
@@ -176,6 +182,7 @@ export const assignUnassignedDmsDocument = asyncHandler(async (req, res) => {
        UPDATE documents
           SET site_id = $1, updated_at = now()
         WHERE id = $2
+          AND organization_id = $3
           AND uploaded_source = 'DMS'
           AND site_id IS NULL
        RETURNING *
@@ -183,16 +190,16 @@ export const assignUnassignedDmsDocument = asyncHandler(async (req, res) => {
      SELECT ${LIST_COLS}
        FROM assigned d
        LEFT JOIN users u ON u.id = d.uploaded_by`,
-    [siteId, id]
+    [siteId, id, req.user.organization_id]
   );
 
   if (!rows[0]) {
     const existing = await pool.query(
       `SELECT site_id
          FROM documents
-        WHERE id = $1 AND uploaded_source = 'DMS'
+        WHERE id = $1 AND organization_id = $2 AND uploaded_source = 'DMS'
         LIMIT 1`,
-      [id]
+      [id, req.user.organization_id]
     );
     if (!existing.rows[0]) return res.status(404).json({ message: 'Legacy document not found.' });
     return res.status(409).json({ message: 'This document has already been assigned to a site.' });
@@ -219,28 +226,28 @@ export const buildTsQuery = (query) =>
 
 // OCR runs after the upload response. Failures are persisted and can be retried
 // from the UI without making an otherwise successful file upload fail.
-const processDmsOcr = async (documentId, buffer, mimeType) => {
+const processDmsOcr = async (documentId, buffer, mimeType, organizationId) => {
   try {
     await pool.query(
       `UPDATE documents
           SET ocr_status='PROCESSING', ocr_started_at=now(), updated_at=now()
-        WHERE id=$1 AND uploaded_source='DMS'`,
-      [documentId]
+        WHERE id=$1 AND organization_id=$2 AND uploaded_source='DMS'`,
+      [documentId, organizationId]
     );
     const { text, engine } = await runDmsOcr(buffer, mimeType);
     await pool.query(
       `UPDATE documents
           SET ocr_text=$1, ocr_status='DONE', ocr_engine=$2,
               ocr_completed_at=now(), ocr_error=NULL, updated_at=now()
-        WHERE id=$3 AND uploaded_source='DMS'`,
-      [text, engine, documentId]
+        WHERE id=$3 AND organization_id=$4 AND uploaded_source='DMS'`,
+      [text, engine, documentId, organizationId]
     );
   } catch (error) {
     await pool.query(
       `UPDATE documents
           SET ocr_status='FAILED', ocr_error=$1, ocr_completed_at=now(), updated_at=now()
-        WHERE id=$2 AND uploaded_source='DMS'`,
-      [String(error?.message || error).slice(0, 2000), documentId]
+        WHERE id=$2 AND organization_id=$3 AND uploaded_source='DMS'`,
+      [String(error?.message || error).slice(0, 2000), documentId, organizationId]
     ).catch(() => {});
     console.error(`[dms ocr] document ${documentId} failed:`, error.message);
   }
@@ -280,9 +287,9 @@ export const uploadDmsDocument = asyncHandler(async (req, res) => {
       `INSERT INTO documents
          (site_id, type, category, title, original_name, file_path, file_hash, mime_type, file_size,
           metadata, doc_date, expiry_date, ocr_status, ocr_engine, ocr_completed_at,
-          uploaded_source, uploaded_by)
+          uploaded_source, uploaded_by, organization_id)
        VALUES ($1, 'OTHER', $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::date, $11::date,
-               $12, $13, $14, 'DMS', $15)
+               $12, $13, $14, 'DMS', $15, $16)
        RETURNING id, category, title, original_name, file_path, mime_type, file_size,
                  metadata, doc_date, expiry_date, ocr_status, ocr_engine, created_at`,
       [
@@ -301,12 +308,13 @@ export const uploadDmsDocument = asyncHandler(async (req, res) => {
         willOcr ? null : 'none',
         willOcr ? null : new Date(),
         req.user?.id || null,
+        req.user.organization_id,
       ]
     );
 
     const document = rows[0];
     res.status(201).json(await toPublicDocument(document));
-    if (willOcr) void processDmsOcr(document.id, req.file.buffer, mimeType);
+    if (willOcr) void processDmsOcr(document.id, req.file.buffer, mimeType, req.user.organization_id);
   } catch (error) {
     // S3/local storage succeeded but the DB insert did not: remove the orphan.
     if (storageKey) await deletePlotDoc(storageKey).catch(() => {});
@@ -343,9 +351,10 @@ export const searchDmsDocuments = asyncHandler(async (req, res) => {
             updated_at = now()
       WHERE uploaded_source = 'DMS'
         AND site_id = $1
+        AND organization_id = $2
         AND ocr_status IN ('PENDING', 'PROCESSING')
-        AND COALESCE(ocr_started_at, created_at) < now() - $2::interval`,
-    [siteId, OCR_STALE_INTERVAL]
+        AND COALESCE(ocr_started_at, created_at) < now() - $3::interval`,
+    [siteId, req.user.organization_id, OCR_STALE_INTERVAL]
   );
 
   const params = [];
@@ -353,6 +362,7 @@ export const searchDmsDocuments = asyncHandler(async (req, res) => {
   const filters = [
     `d.uploaded_source = 'DMS'`,
     `d.site_id = ${add(siteId)}`,
+    `d.organization_id = ${add(req.user.organization_id)}`,
   ];
 
   if (category && category !== 'ALL') filters.push(`d.category = ${add(String(category).toUpperCase())}`);
@@ -449,8 +459,8 @@ export const getDmsDocument = asyncHandler(async (req, res) => {
             d.ocr_text, d.created_at, COALESCE(u.name, u.email) AS uploaded_by_name
        FROM documents d
        LEFT JOIN users u ON u.id = d.uploaded_by
-      WHERE d.id = $1 AND d.site_id = $2 AND d.uploaded_source = 'DMS'`,
-    [id, siteId]
+      WHERE d.id = $1 AND d.site_id = $2 AND d.organization_id = $3 AND d.uploaded_source = 'DMS'`,
+    [id, siteId, req.user.organization_id]
   );
   if (!rows[0]) return res.status(404).json({ message: 'Document not found.' });
   res.json(await toPublicDocument(rows[0]));
@@ -480,8 +490,8 @@ export const updateDmsDocument = asyncHandler(async (req, res) => {
     const { rows: dateRows } = await pool.query(
       `SELECT doc_date, expiry_date
          FROM documents
-        WHERE id = $1 AND site_id = $2 AND uploaded_source = 'DMS'`,
-      [id, siteId]
+        WHERE id = $1 AND site_id = $2 AND organization_id = $3 AND uploaded_source = 'DMS'`,
+      [id, siteId, req.user.organization_id]
     );
     if (!dateRows[0]) return res.status(404).json({ message: 'Document not found.' });
     const storedDocDate = storedDateText(dateRows[0].doc_date);
@@ -512,7 +522,8 @@ export const updateDmsDocument = asyncHandler(async (req, res) => {
 
   const { rows } = await pool.query(
     `UPDATE documents SET ${sets.join(', ')}
-      WHERE id = ${add(id)} AND site_id = ${add(siteId)} AND uploaded_source = 'DMS'
+      WHERE id = ${add(id)} AND site_id = ${add(siteId)}
+        AND organization_id = ${add(req.user.organization_id)} AND uploaded_source = 'DMS'
       RETURNING id, category, title, doc_date, expiry_date, metadata`,
     params
   );
@@ -530,8 +541,8 @@ export const retryOcr = asyncHandler(async (req, res) => {
   const { rows } = await pool.query(
     `SELECT id, file_path, mime_type, ocr_status, ocr_started_at, created_at
        FROM documents
-      WHERE id = $1 AND site_id = $2 AND uploaded_source = 'DMS'`,
-    [id, siteId]
+      WHERE id = $1 AND site_id = $2 AND organization_id = $3 AND uploaded_source = 'DMS'`,
+    [id, siteId, req.user.organization_id]
   );
   const document = rows[0];
   if (!document) return res.status(404).json({ message: 'Document not found.' });
@@ -542,13 +553,13 @@ export const retryOcr = asyncHandler(async (req, res) => {
     `UPDATE documents
         SET ocr_status = 'PENDING', ocr_error = NULL,
             ocr_started_at = now(), ocr_completed_at = NULL, updated_at = now()
-      WHERE id = $1 AND site_id = $2 AND uploaded_source = 'DMS'
+      WHERE id = $1 AND site_id = $2 AND organization_id = $3 AND uploaded_source = 'DMS'
         AND (
           ocr_status NOT IN ('PENDING', 'PROCESSING')
-          OR COALESCE(ocr_started_at, created_at) < now() - $3::interval
+          OR COALESCE(ocr_started_at, created_at) < now() - $4::interval
         )
       RETURNING id`,
-    [id, siteId, OCR_STALE_INTERVAL]
+    [id, siteId, req.user.organization_id, OCR_STALE_INTERVAL]
   );
   if (!claimedRows[0]) {
     return res.status(409).json({ message: 'Text extraction is already running.' });
@@ -562,13 +573,13 @@ export const retryOcr = asyncHandler(async (req, res) => {
       `UPDATE documents
           SET ocr_status='FAILED', ocr_error='The stored file could not be read.',
               ocr_completed_at=now(), updated_at=now()
-        WHERE id=$1 AND site_id=$2 AND uploaded_source='DMS'`,
-      [id, siteId]
+        WHERE id=$1 AND site_id=$2 AND organization_id=$3 AND uploaded_source='DMS'`,
+      [id, siteId, req.user.organization_id]
     ).catch(() => {});
     return res.status(502).json({ message: 'The stored file could not be read for text extraction.' });
   }
   res.json({ message: 'Text extraction restarted.', id });
-  void processDmsOcr(id, buffer, document.mime_type);
+  void processDmsOcr(id, buffer, document.mime_type, req.user.organization_id);
 });
 
 /** DELETE /documents/:id. */
@@ -582,9 +593,9 @@ export const deleteDmsDocument = asyncHandler(async (req, res) => {
   // record in search. Storage cleanup remains best-effort.
   const { rows } = await pool.query(
     `DELETE FROM documents
-      WHERE id = $1 AND site_id = $2 AND uploaded_source = 'DMS'
+      WHERE id = $1 AND site_id = $2 AND organization_id = $3 AND uploaded_source = 'DMS'
       RETURNING id, file_path`,
-    [id, siteId]
+    [id, siteId, req.user.organization_id]
   );
   const document = rows[0];
   if (!document) return res.status(404).json({ message: 'Document not found.' });

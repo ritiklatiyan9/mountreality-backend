@@ -18,8 +18,9 @@ export const listAccounts = asyncHandler(async (req, res) => {
      FROM upi_accounts a
      LEFT JOIN users u ON a.created_by = u.id
      WHERE a.site_id = $1
+      AND ($2::boolean = FALSE OR (a.vpa IS NOT NULL AND a.vpa <> ''))
      ORDER BY a.is_active DESC, a.id ASC`,
-    [parseInt(site_id)]
+    [parseInt(site_id), req.query.purpose === 'upi']
   );
   res.json({ accounts: result.rows });
 });
@@ -115,10 +116,14 @@ export const createQr = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'site_id, upi_account_id and a positive amount are required' });
   }
   const acc = (await pool.query(
-    `SELECT * FROM upi_accounts WHERE id = $1 AND site_id = $2 AND is_active = true`,
+    `SELECT * FROM upi_accounts
+      WHERE id = $1 AND site_id = $2 AND is_active = true
+        AND vpa IS NOT NULL AND vpa <> ''`,
     [parseInt(upi_account_id), parseInt(site_id)]
   )).rows[0];
-  if (!acc) return res.status(404).json({ message: 'Active UPI account not found for this site' });
+  if (!acc) return res.status(404).json({ message: 'Active UPI-enabled account not found for this Site' });
+
+  const qrPayeeName = acc.payee_name?.trim() || acc.label?.trim() || acc.bank_name?.trim() || 'Merchant';
 
   const txnRef = `DGQ${Date.now().toString(36).toUpperCase()}${Math.floor(Math.random() * 1296).toString(36).toUpperCase()}`;
   const result = await pool.query(
@@ -126,7 +131,7 @@ export const createQr = asyncHandler(async (req, res) => {
      VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
     [parseInt(site_id), acc.id, amt.toFixed(2), note?.trim() || null, txnRef, req.user.id]
   );
-  res.status(201).json({ qr: { ...result.rows[0], vpa: acc.vpa, payee_name: acc.payee_name, account_label: acc.label } });
+  res.status(201).json({ qr: { ...result.rows[0], vpa: acc.vpa, payee_name: qrPayeeName, account_label: acc.label } });
 });
 
 /**
@@ -150,7 +155,9 @@ export const listQrs = asyncHandler(async (req, res) => {
 
   params.push(safeLimit, (safePage - 1) * safeLimit);
   const result = await pool.query(
-    `SELECT q.*, a.label as account_label, a.vpa, a.payee_name, u.name as created_by_name
+    `SELECT q.*, a.label as account_label, a.vpa,
+            COALESCE(NULLIF(a.payee_name, ''), NULLIF(a.label, ''), NULLIF(a.bank_name, ''), 'Merchant') AS payee_name,
+            u.name as created_by_name
      FROM payment_qrs q
      JOIN upi_accounts a ON q.upi_account_id = a.id
      LEFT JOIN users u ON q.created_by = u.id
@@ -203,8 +210,9 @@ export const updateQr = asyncHandler(async (req, res) => {
     `UPDATE payment_qrs SET ${sets.join(', ')} WHERE id = $${i} RETURNING *`,
     params
   );
-  const acc = (await pool.query(`SELECT label, vpa, payee_name FROM upi_accounts WHERE id = $1`, [result.rows[0].upi_account_id])).rows[0];
-  res.json({ qr: { ...result.rows[0], account_label: acc.label, vpa: acc.vpa, payee_name: acc.payee_name } });
+  const acc = (await pool.query(`SELECT label, bank_name, vpa, payee_name FROM upi_accounts WHERE id = $1`, [result.rows[0].upi_account_id])).rows[0];
+  const qrPayeeName = acc.payee_name?.trim() || acc.label?.trim() || acc.bank_name?.trim() || 'Merchant';
+  res.json({ qr: { ...result.rows[0], account_label: acc.label, vpa: acc.vpa, payee_name: qrPayeeName } });
 });
 
 /**
@@ -243,7 +251,8 @@ export const getDisplayQr = asyncHandler(async (req, res) => {
   const { site_id } = req.query;
   if (!site_id) return res.status(400).json({ message: 'site_id is required' });
   const result = await pool.query(
-    `SELECT q.*, a.label as account_label, a.vpa, a.payee_name
+    `SELECT q.*, a.label as account_label, a.vpa,
+            COALESCE(NULLIF(a.payee_name, ''), NULLIF(a.label, ''), NULLIF(a.bank_name, ''), 'Merchant') AS payee_name
      FROM payment_qrs q
      JOIN upi_accounts a ON q.upi_account_id = a.id
      WHERE q.site_id = $1 AND q.status = 'pending'

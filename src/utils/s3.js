@@ -12,15 +12,14 @@ const validateAwsConfig = () => {
 
 let s3Client = null;
 try {
-    if (process.env.AWS_ACCESS_KEY_ID) {
-        s3Client = new S3Client({
-            region: process.env.AWS_REGION || 'us-east-1',
-            credentials: {
-                accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
-                secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
-            }
-        });
+    const s3Config = { region: process.env.AWS_REGION || 'us-east-1' };
+    if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
+        s3Config.credentials = {
+            accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+            secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+        };
     }
+    s3Client = new S3Client(s3Config);
 } catch (e) {
     console.warn("⚠️ S3 Client initialization skipped: missing credentials. Falling back to local disk storage.");
 }
@@ -44,7 +43,7 @@ export const uploadToS3 = async (fileBuffer, fileName, mimetype) => {
     
     const s3_key = `${folder}/${uniqueFileName}`;
 
-    if (s3Client && process.env.AWS_ACCESS_KEY_ID) {
+    if (s3Client && BUCKET_NAME) {
         // ACTUAL S3 UPLOAD (multipart to avoid MaxMessageLengthExceeded)
         const upload = new Upload({
             client: s3Client,
@@ -60,6 +59,7 @@ export const uploadToS3 = async (fileBuffer, fileName, mimetype) => {
         await upload.done();
         return s3_key;
     } else {
+        if (process.env.NODE_ENV === 'production') throw new Error('Private object storage is not configured');
         // LOCAL FALLBACK UPLOAD
         const localPath = path.join(LOCAL_UPLOAD_DIR, uniqueFileName);
         fs.writeFileSync(localPath, fileBuffer);
@@ -75,7 +75,7 @@ export const deleteFromS3 = async (s3_key) => {
         const fileName = s3_key.replace('local::', '');
         const localPath = path.join(LOCAL_UPLOAD_DIR, fileName);
         if (fs.existsSync(localPath)) fs.unlinkSync(localPath);
-    } else if (s3Client && process.env.AWS_ACCESS_KEY_ID) {
+    } else if (s3Client && BUCKET_NAME) {
         // ACTUAL S3 DELETE
         const command = new DeleteObjectCommand({
             Bucket: BUCKET_NAME,
@@ -92,7 +92,7 @@ export const generateSignedGetUrl = async (s3_key) => {
         // LOCAL GET URL
         const fileName = s3_key.replace('local::', '');
         return `http://localhost:${process.env.PORT || 5000}/uploads/excel/${fileName}`;
-    } else if (s3Client && process.env.AWS_ACCESS_KEY_ID) {
+    } else if (s3Client && BUCKET_NAME) {
         // ACTUAL S3 GET URL
         const command = new GetObjectCommand({
             Bucket: BUCKET_NAME,

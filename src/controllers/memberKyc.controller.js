@@ -4,7 +4,7 @@ import pool from '../config/db.js';
 import { clearCacheByPrefixes } from '../config/cache.js';
 import { extractMemberKyc } from '../services/memberKycOcr.service.js';
 import {
-  deletePlotDoc, getPlotDocBytes, getPlotDocPublicUrl, getPlotDocUrl, uploadPlotDoc,
+  deletePlotDoc, getPlotDocBytes, getPlotDocUrl, uploadPlotDoc,
 } from '../utils/plotDocStorage.js';
 
 const DOCUMENT_FIELDS_BY_TYPE = {
@@ -46,10 +46,13 @@ const normalisePhone = (value) => {
 };
 
 const canAccessSite = async (user, siteId) => {
-  if (['admin', 'super_admin'].includes(user?.role)) return true;
   const { rows } = await pool.query(
-    'SELECT 1 FROM user_sites WHERE user_id = $1 AND site_id = $2 LIMIT 1',
-    [user?.id, siteId]
+    `SELECT 1 FROM sites s
+      WHERE s.id=$1 AND s.organization_id=$2
+        AND ($3::boolean=FALSE OR EXISTS (
+          SELECT 1 FROM user_sites us WHERE us.user_id=$4 AND us.site_id=s.id
+        )) LIMIT 1`,
+    [siteId, user?.organization_id, user?.role === 'sub_admin', user?.id]
   );
   return Boolean(rows[0]);
 };
@@ -753,8 +756,9 @@ export const verifyCase = asyncHandler(async (req, res) => {
     const documentUpdates = {};
     for (const document of activeDocuments) {
       if (!MEMBER_DOCUMENT_FIELDS.has(document.member_document_field)) continue;
-      const publicUrl = getPlotDocPublicUrl(document.file_path);
-      if (publicUrl) documentUpdates[document.member_document_field] = publicUrl;
+      // Persist the private storage key. API presenters issue short-lived signed
+      // URLs only after authentication; durable public KYC URLs are forbidden.
+      documentUpdates[document.member_document_field] = document.file_path;
     }
     const verifiedUpdate = { ...data, ...documentUpdates };
     if (Object.keys(verifiedUpdate).length) {

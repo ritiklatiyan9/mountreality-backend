@@ -2,6 +2,7 @@ import pool from '../config/db.js';
 import asyncHandler from '../utils/asyncHandler.js';
 import { writeComplianceAudit } from '../utils/complianceAccess.js';
 import { resolveCollectionGuard } from '../services/collectionGuard.service.js';
+import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
 import {
   AGREEMENT_TRANSITIONS,
   POSSESSION_TRANSITIONS,
@@ -596,7 +597,12 @@ export const createRefund = asyncHandler(async (req, res) => {
     const mode = String(req.body.payment_mode || '').toUpperCase();
     if (!['CASH', 'BANK', 'CHEQUE'].includes(mode)) throw businessError('A valid refund payment mode is required', 'INVALID_PAYMENT_MODE', 400);
     const firmId = positiveId(req.body.firm_id, 'firm_id', { optional: true });
-    if (mode !== 'CASH' && !firmId) throw businessError('Select an existing bank account for a bank/cheque refund', 'FIRM_ACCOUNT_REQUIRED', 400);
+    const bankAccountId = await resolveBankAccountSelection({
+      siteId,
+      paymentMode: mode,
+      bankAccountId: req.body.bank_account_id,
+      db,
+    });
     const originalPaymentId = positiveId(req.body.original_plot_payment_id, 'original_plot_payment_id', { optional: true });
     if (originalPaymentId) {
       const { rows: payment } = await db.query(`SELECT 1 FROM plot_payments WHERE id=$1 AND booking_id=$2 AND site_id=$3`, [originalPaymentId, cancellation.booking_id, siteId]);
@@ -607,7 +613,7 @@ export const createRefund = asyncHandler(async (req, res) => {
       const { rows: existing } = await db.query(`SELECT * FROM booking_refunds WHERE booking_id=$1 AND idempotency_key=$2`, [cancellation.booking_id, idempotencyKey]);
       if (existing[0]) return existing[0];
     }
-    const { rows: created } = await db.query(`INSERT INTO booking_refunds (cancellation_id,booking_id,original_plot_payment_id,amount,payment_mode,firm_id,reference,status,created_by,idempotency_key) VALUES ($1,$2,$3,$4,$5,$6,$7,'PENDING',$8,$9) RETURNING *`, [cancellationId, cancellation.booking_id, originalPaymentId, amount, mode, firmId, cleanText(req.body.reference, 'Reference', 255), req.user.id, idempotencyKey]);
+    const { rows: created } = await db.query(`INSERT INTO booking_refunds (cancellation_id,booking_id,original_plot_payment_id,amount,payment_mode,firm_id,bank_account_id,reference,status,created_by,idempotency_key) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'PENDING',$9,$10) RETURNING *`, [cancellationId, cancellation.booking_id, originalPaymentId, amount, mode, firmId, bankAccountId, cleanText(req.body.reference, 'Reference', 255), req.user.id, idempotencyKey]);
     await writeComplianceAudit(db, req, { action: 'REFUND_PREPARED', entityType: 'BOOKING_REFUND', entityId: created[0].id, siteId, newValue: { ...created[0], booking_id: cancellation.booking_id } });
     return created[0];
   });
@@ -630,27 +636,19 @@ export const postRefund = asyncHandler(async (req, res) => {
     if (refund.status !== 'PENDING') throw businessError('Only a pending refund can be posted', 'REFUND_NOT_PENDING');
     let dayBookId = null;
     let firmTransactionId = null;
-    if (refund.payment_mode === 'CASH') {
-      const { rows: dayRows } = await db.query(
-        `INSERT INTO day_book (site_id,date,particular,entry_type,debit,credit,remarks,payment_mode,category,from_entity,to_entity,created_by,status,approved_by,approved_at,booking_id,rera_project_id,rera_project_phase_id)
-         SELECT b.site_id,CURRENT_DATE,$1,'PAYMENT',$2,0,$3,'CASH','CUSTOMER REFUND',$4,$5,$6,'approved',$6,NOW(),b.id,b.rera_project_id,b.rera_project_phase_id
-           FROM bookings b WHERE b.id=$7 RETURNING id`,
-        [`Refund · Plot ${refund.plot_no}`, refund.amount, refund.reference || `Cancellation ${refund.cancellation_id}`, 'MountReality', refund.full_name || 'Customer', req.user.id, refund.booking_id],
-      );
-      dayBookId = dayRows[0]?.id || null;
-    } else {
-      const { rows: firms } = await db.query(`SELECT id FROM firms WHERE id=$1 AND site_id=$2`, [refund.firm_id, siteId]);
-      if (!firms[0]) throw businessError('Refund bank account is outside the selected Site', 'FIRM_SCOPE_MISMATCH');
-      const { rows: transactionRows } = await db.query(
-        `INSERT INTO firm_transactions (firm_id,site_id,date,description,debit,credit,name,purpose,remark,created_by,status,approved_by,approved_at,payment_mode,rera_project_id,rera_project_phase_id,reconciliation_context)
-         SELECT $1,b.site_id,CURRENT_DATE,$2,$3,0,$4,'CUSTOMER REFUND',$5,$6,'approved',$6,NOW(),$7,b.rera_project_id,b.rera_project_phase_id,$8
-           FROM bookings b WHERE b.id=$9 RETURNING id`,
-        [refund.firm_id, `Refund · Plot ${refund.plot_no}`, refund.amount, refund.full_name || 'Customer', String(refund.reference || '').slice(0, 100) || null, req.user.id, refund.payment_mode.toLowerCase(), { booking_id: refund.booking_id, refund_id: refund.id, cancellation_id: refund.cancellation_id }, refund.booking_id],
-      );
-      firmTransactionId = transactionRows[0]?.id || null;
-      const { rows: dayRows } = await db.query(`SELECT id FROM day_book WHERE firm_transaction_id=$1 ORDER BY id DESC LIMIT 1`, [firmTransactionId]);
-      dayBookId = dayRows[0]?.id || null;
-    }
+    const selectedBankAccountId = await resolveBankAccountSelection({
+      siteId,
+      paymentMode: refund.payment_mode,
+      bankAccountId: refund.bank_account_id,
+      db,
+    });
+    const { rows: dayRows } = await db.query(
+      `INSERT INTO day_book (site_id,date,particular,entry_type,debit,credit,remarks,payment_mode,bank_account_id,category,from_entity,to_entity,created_by,status,approved_by,approved_at,booking_id,rera_project_id,rera_project_phase_id)
+       SELECT b.site_id,CURRENT_DATE,$1,'PAYMENT',$2,0,$3,$4,$5,'CUSTOMER REFUND',$6,$7,$8,'approved',$8,NOW(),b.id,b.rera_project_id,b.rera_project_phase_id
+         FROM bookings b WHERE b.id=$9 RETURNING id`,
+      [`Refund · Plot ${refund.plot_no}`, refund.amount, refund.reference || `Cancellation ${refund.cancellation_id}`, refund.payment_mode, selectedBankAccountId, 'MountReality', refund.full_name || 'Customer', req.user.id, refund.booking_id],
+    );
+    dayBookId = dayRows[0]?.id || null;
     const { rows: postedRows } = await db.query(`UPDATE booking_refunds SET status='POSTED',day_book_id=$1,firm_transaction_id=$2,approved_by=$3,approved_at=NOW(),posted_at=NOW() WHERE id=$4 RETURNING *`, [dayBookId, firmTransactionId, req.user.id, refundId]);
     const { rows: totals } = await db.query(`SELECT COALESCE(SUM(amount),0) AS posted FROM booking_refunds WHERE cancellation_id=$1 AND status='POSTED'`, [refund.cancellation_id]);
     let released = false;

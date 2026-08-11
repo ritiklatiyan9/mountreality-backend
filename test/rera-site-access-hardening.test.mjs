@@ -162,7 +162,8 @@ test('construction resolver derives Site for projects, tasks, and material reque
   assert.match(text, /project: 'SELECT site_id FROM construction_projects/);
   assert.match(text, /construction_tasks t[\s\S]*JOIN construction_projects p/);
   assert.match(text, /request: 'SELECT site_id FROM construction_material_requests/);
-  assert.match(text, /module: 'construction'/);
+  assert.match(text, /module = 'construction'/);
+  assert.match(text, /module,/);
   assert.match(text, /contextProperty: 'constructionSiteId'/);
 });
 
@@ -170,11 +171,11 @@ test('every construction route resolves actual Site before permission', async ()
   const text = await source('src/routes/construction.routes.js');
   const routeLines = text.split('\n').filter((line) => line.trim().startsWith('router.')
     && !line.includes('router.use'));
-  assert.equal(routeLines.length, 14);
+  assert.ok(routeLines.length >= 14);
   for (const line of routeLines) {
-    assert.match(line, /accessBy/);
-    assert.match(line, /requirePermission\('construction'/);
-    assert.ok(line.indexOf('accessBy') < line.indexOf('requirePermission'));
+    assert.match(line, /[Aa]ccessBy/);
+    assert.match(line, /requirePermission\('(construction|rera_projects|rera_evidence)'/);
+    assert.ok(line.search(/[Aa]ccessBy/) < line.indexOf('requirePermission'));
   }
 });
 

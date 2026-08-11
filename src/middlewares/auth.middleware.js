@@ -3,14 +3,29 @@ import pool from '../config/db.js';
 
 // Paths reachable while an organization has no active subscription (login + payment).
 const SUBSCRIPTION_EXEMPT = /^\/(auth|billing)(\/|$)/;
+const PORTAL_USER_ALLOWED = /^\/(auth|phase4\/portal)(\/|$)/;
 
 const authMiddleware = async (req, res, next) => {
   const token = req.header('Authorization')?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ message: 'No token provided' });
 
+  let decoded;
   try {
-    const decoded = verifyToken(token);
-    const sessionIdHeader = req.header('X-Session-ID');
+    decoded = verifyToken(token);
+  } catch {
+    return res.status(401).json({ message: 'Invalid or expired token' });
+  }
+
+  const sessionId = Number(decoded.sid);
+  const sessionIdHeader = req.header('X-Session-ID');
+  if (!Number.isInteger(sessionId) || sessionId <= 0) {
+    return res.status(401).json({ message: 'Session expired. Please login again.' });
+  }
+  if (sessionIdHeader && Number(sessionIdHeader) !== sessionId) {
+    return res.status(401).json({ message: 'Invalid session context' });
+  }
+
+  try {
 
     const userResult = await pool.query(
       `SELECT u.id, u.role, u.token_version, u.is_active, u.organization_id,
@@ -20,11 +35,15 @@ const authMiddleware = async (req, res, next) => {
                 WHERE s.organization_id = u.organization_id
                   AND s.status = 'active'
                   AND s.current_period_end > NOW()
-              ) AS subscription_active
+              ) AS subscription_active,
+              EXISTS (
+                SELECT 1 FROM user_sessions us
+                 WHERE us.id=$2 AND us.user_id=u.id AND us.logout_time IS NULL
+              ) AS session_active
        FROM users u
        LEFT JOIN organizations o ON o.id = u.organization_id
        WHERE u.id = $1 LIMIT 1`,
-      [decoded.id]
+      [decoded.id, sessionId]
     );
 
     const dbUser = userResult.rows[0];
@@ -33,6 +52,10 @@ const authMiddleware = async (req, res, next) => {
     }
 
     if (decoded.version !== dbUser.token_version) {
+      return res.status(401).json({ message: 'Session expired. Please login again.' });
+    }
+
+    if (!dbUser.session_active) {
       return res.status(401).json({ message: 'Session expired. Please login again.' });
     }
 
@@ -49,26 +72,13 @@ const authMiddleware = async (req, res, next) => {
       });
     }
 
-    if (sessionIdHeader && dbUser.role !== 'super_admin' && dbUser.role !== 'owner') {
-      const sessionId = parseInt(sessionIdHeader, 10);
-      if (!Number.isInteger(sessionId) || sessionId <= 0) {
-        return res.status(401).json({ message: 'Invalid session context' });
-      }
-
-      const sessionResult = await pool.query(
-        `SELECT id, logout_time
-         FROM user_sessions
-         WHERE id = $1 AND user_id = $2
-         LIMIT 1`,
-        [sessionId, decoded.id]
-      );
-
-      if (!sessionResult.rows[0] || sessionResult.rows[0].logout_time) {
-        return res.status(401).json({ message: 'Session expired. Please login again.' });
-      }
-
-      req.sessionId = sessionId;
+    // A portal-only base identity never inherits broad authenticated routes.
+    // Staff users may also hold portal memberships and retain normal RBAC.
+    if (dbUser.role === 'portal_user' && !PORTAL_USER_ALLOWED.test(req.originalUrl)) {
+      return res.status(403).json({ code: 'PORTAL_ONLY_IDENTITY', message: 'This identity can access only its assigned portal resources' });
     }
+
+    req.sessionId = sessionId;
 
     // Tenant boundary: the selected Site is carried explicitly so RBAC can be
     // intersected with its published operating policy. Reject mismatched site
@@ -111,7 +121,7 @@ const authMiddleware = async (req, res, next) => {
     req.subscriptionActive = dbUser.subscription_active;
     next();
   } catch (err) {
-    res.status(401).json({ message: 'Invalid or expired token' });
+    next(err);
   }
 };
 

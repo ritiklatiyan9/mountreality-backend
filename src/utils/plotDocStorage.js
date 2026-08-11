@@ -15,16 +15,14 @@ import path from 'path';
  * is configured in this project's .env files).
  */
 
-let s3Client = null;
-if (process.env.AWS_ACCESS_KEY_ID) {
-  s3Client = new S3Client({
-    region: process.env.AWS_REGION || 'ap-south-1',
-    credentials: {
-      accessKeyId: process.env.AWS_ACCESS_KEY_ID,
-      secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-    },
-  });
+const s3Config = { region: process.env.AWS_REGION || 'ap-south-1' };
+if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
+  s3Config.credentials = {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  };
 }
+const s3Client = new S3Client(s3Config);
 
 const BUCKET = process.env.AWS_S3_BUCKET_NAME || process.env.AWS_S3_BUCKET || '';
 // Co-locate with the booking module's local fallback dir name so dev files are predictable.
@@ -36,7 +34,7 @@ if (!fs.existsSync(LOCAL_DIR)) fs.mkdirSync(LOCAL_DIR, { recursive: true });
 const PRIVATE_LOCAL_DIR = path.join(process.cwd(), 'uploads', 'compliance_documents');
 if (!fs.existsSync(PRIVATE_LOCAL_DIR)) fs.mkdirSync(PRIVATE_LOCAL_DIR, { recursive: true });
 
-const usingS3 = () => Boolean(s3Client && process.env.AWS_ACCESS_KEY_ID && BUCKET);
+const usingS3 = () => Boolean(s3Client && BUCKET);
 
 const localStoredName = (storageKey, marker) => {
   const name = String(storageKey || '').replace(marker, '');
@@ -60,6 +58,9 @@ export const uploadPlotDoc = async (fileBuffer, originalName, mimetype, prefix =
     await upload.done();
     return key;
   }
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('Private object storage is not configured');
+  }
   const privateComplianceEvidence = String(prefix || '').startsWith('compliance/')
     || /(^|\/)rera_[a-z_]+(\/|$)/i.test(prefix);
   fs.writeFileSync(path.join(privateComplianceEvidence ? PRIVATE_LOCAL_DIR : LOCAL_DIR, safeName), fileBuffer);
@@ -67,9 +68,30 @@ export const uploadPlotDoc = async (fileBuffer, originalName, mimetype, prefix =
 };
 
 /** A browser-usable URL for a stored doc (signed for S3, static path for local). */
+const legacyS3Key = (storageKey) => {
+  try {
+    const url = new URL(storageKey);
+    const hosts = new Set([
+      `${BUCKET}.s3.amazonaws.com`,
+      `${BUCKET}.s3.${process.env.AWS_REGION || 'ap-south-1'}.amazonaws.com`,
+    ]);
+    if (url.protocol !== 'https:' || !hosts.has(url.hostname)) return null;
+    return decodeURIComponent(url.pathname.replace(/^\//, ''));
+  } catch {
+    return null;
+  }
+};
+
 export const getPlotDocUrl = async (storageKey) => {
   if (!storageKey) return null;
-  if (/^https?:\/\//i.test(storageKey)) return storageKey;
+  if (/^https?:\/\//i.test(storageKey)) {
+    const key = legacyS3Key(storageKey);
+    if (!key || !usingS3()) {
+      if (process.env.NODE_ENV === 'production') return null;
+      return storageKey;
+    }
+    return getSignedUrl(s3Client, new GetObjectCommand({ Bucket: BUCKET, Key: key }), { expiresIn: 900 });
+  }
   if (storageKey.startsWith('local-private::')) return null;
   if (storageKey.startsWith('local::')) {
     const name = localStoredName(storageKey, 'local::');
@@ -77,7 +99,7 @@ export const getPlotDocUrl = async (storageKey) => {
   }
   if (usingS3()) {
     const cmd = new GetObjectCommand({ Bucket: BUCKET, Key: storageKey });
-    return await getSignedUrl(s3Client, cmd, { expiresIn: 3600 });
+    return await getSignedUrl(s3Client, cmd, { expiresIn: 900 });
   }
   return null;
 };
@@ -86,6 +108,7 @@ export const getPlotDocUrl = async (storageKey) => {
  * public KYC URL strategy; case viewers continue to use short-lived signed URLs. */
 export const getPlotDocPublicUrl = (storageKey) => {
   if (!storageKey) return null;
+  if (process.env.NODE_ENV === 'production') return null;
   if (/^https?:\/\//i.test(storageKey)) return storageKey;
   if (storageKey.startsWith('local::')) {
     const name = storageKey.replace('local::', '');
@@ -108,6 +131,12 @@ export const getPlotDocBytes = async (storageKey) => {
     return fs.readFileSync(path.join(LOCAL_DIR, name));
   }
   if (/^https?:\/\//i.test(storageKey)) {
+    const key = legacyS3Key(storageKey);
+    if (key && usingS3()) {
+      const response = await s3Client.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+      return Buffer.from(await response.Body.transformToByteArray());
+    }
+    if (process.env.NODE_ENV === 'production') throw new Error('External document URLs are not allowed');
     const response = await fetch(storageKey);
     if (!response.ok) throw new Error(`Stored document download failed (${response.status})`);
     return Buffer.from(await response.arrayBuffer());

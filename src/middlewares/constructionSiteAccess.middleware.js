@@ -9,9 +9,16 @@ const LOOKUPS = Object.freeze({
           WHERE t.id = $1
           LIMIT 1`,
   request: 'SELECT site_id FROM construction_material_requests WHERE id = $1 LIMIT 1',
+  workPackage: 'SELECT site_id FROM construction_work_packages WHERE id=$1 AND deleted_at IS NULL LIMIT 1',
+  dailyUpdate: 'SELECT site_id FROM construction_daily_updates WHERE id=$1 LIMIT 1',
+  certification: 'SELECT site_id FROM construction_certifications WHERE id=$1 LIMIT 1',
+  filing: 'SELECT site_id FROM rera_filing_periods WHERE id=$1 LIMIT 1',
+  change: 'SELECT site_id FROM rera_project_change_requests WHERE id=$1 LIMIT 1',
+  extension: 'SELECT site_id FROM rera_project_extensions WHERE id=$1 LIMIT 1',
+  risk: 'SELECT site_id FROM construction_risks WHERE id=$1 LIMIT 1',
 });
 
-const requireConstructionSiteAccess = ({ entity = 'site', source = 'query', key = 'site_id' } = {}) => {
+const requireConstructionSiteAccess = ({ entity = 'site', source = 'query', key = 'site_id', module = 'construction' } = {}) => {
   if (entity !== 'site' && !Object.prototype.hasOwnProperty.call(LOOKUPS, entity)) {
     throw new Error(`Unsupported construction access entity: ${entity}`);
   }
@@ -34,7 +41,7 @@ const requireConstructionSiteAccess = ({ entity = 'site', source = 'query', key 
         req,
         res,
         siteId,
-        module: 'construction',
+        module,
         contextProperty: 'constructionSiteId',
       });
       if (!allowed) return;
@@ -46,4 +53,3 @@ const requireConstructionSiteAccess = ({ entity = 'site', source = 'query', key 
 };
 
 export default requireConstructionSiteAccess;
-

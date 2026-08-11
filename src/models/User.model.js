@@ -6,7 +6,7 @@ class UserModel extends MasterModel {
   }
 
   async findByEmail(email, pool) {
-    const query = `SELECT * FROM ${this.tableName} WHERE email = $1`;
+    const query = `SELECT * FROM ${this.tableName} WHERE LOWER(email) = LOWER($1) LIMIT 1`;
     const result = await pool.query(query, [email]);
     return result.rows[0];
   }
@@ -51,7 +51,7 @@ class UserModel extends MasterModel {
   /** Safe user object (no password / tokens) */
   sanitize(user) {
     if (!user) return null;
-    const { password, refresh_token, token_version, ...safe } = user;
+    const { password, refresh_token, token_version, failed_login_count, locked_until, ...safe } = user;
     return safe;
   }
 

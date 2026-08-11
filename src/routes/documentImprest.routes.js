@@ -10,8 +10,10 @@ import authMiddleware from '../middlewares/auth.middleware.js';
 import requirePermission from '../middlewares/permission.middleware.js';
 import pool from '../config/db.js';
 import asyncHandler from '../utils/asyncHandler.js';
+import createRateLimiter from '../middlewares/rateLimit.middleware.js';
 
 const router = express.Router();
+const proofUploadLimiter = createRateLimiter({ windowMs: 15 * 60_000, max: 30, keyPrefix: 'document-imprest-upload:' });
 
 // In-memory storage — the buffer goes straight to the shared S3 util (same approach
 // as plot-documents). Proofs are camera captures, so images only, 10 MB cap.
@@ -35,7 +37,10 @@ router.get('/peers', requirePermission('document_imprest', 'read'), asyncHandler
     return res.status(400).json({ message: 'A valid site_id is required' });
   }
 
-  const { rows: siteRows } = await pool.query('SELECT id FROM sites WHERE id = $1 LIMIT 1', [siteId]);
+  const { rows: siteRows } = await pool.query(
+    'SELECT id FROM sites WHERE id = $1 AND organization_id = $2 LIMIT 1',
+    [siteId, req.user.organization_id],
+  );
   if (!siteRows[0]) return res.status(404).json({ message: 'Site not found' });
 
   if (req.user.role === 'sub_admin') {
@@ -50,6 +55,7 @@ router.get('/peers', requirePermission('document_imprest', 'read'), asyncHandler
     `SELECT u.id, u.name, u.email, u.role
        FROM users u
       WHERE u.is_active = true
+        AND u.organization_id = $3
         AND u.id != $1
         AND (
           u.role IN ('admin', 'super_admin')
@@ -66,13 +72,13 @@ router.get('/peers', requirePermission('document_imprest', 'read'), asyncHandler
       ORDER BY CASE u.role WHEN 'super_admin' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
                u.name ASC,
                u.email ASC`,
-    [req.user.id, siteId]
+    [req.user.id, siteId, req.user.organization_id]
   );
 
   res.json({ peers: rows });
 }));
-router.post('/', requirePermission('document_imprest', 'write'), upload.single('photo'), createDocumentImprest);
-router.post('/:id/return', requirePermission('document_imprest', 'update'), upload.single('photo'), returnDocumentImprest);
+router.post('/', requirePermission('document_imprest', 'write'), proofUploadLimiter, upload.single('photo'), createDocumentImprest);
+router.post('/:id/return', requirePermission('document_imprest', 'update'), proofUploadLimiter, upload.single('photo'), returnDocumentImprest);
 router.put('/:id', requirePermission('document_imprest', 'update'), updateDocumentImprest);
 router.delete('/:id', requirePermission('document_imprest', 'delete'), deleteDocumentImprest);
 

@@ -3,6 +3,7 @@ import { firmModel, firmTransactionModel } from '../models/Firm.model.js';
 import { cashFlowMonthModel, cashFlowEntryModel } from '../models/CashFlow.model.js';
 import pool from '../config/db.js';
 import { normalizeCashType } from '../utils/paymentMode.js';
+import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
 
 const normalizeTxnText = (value) => (value || '').toString().trim().replace(/\s+/g, ' ').toUpperCase();
 
@@ -230,7 +231,7 @@ export const deleteFirm = asyncHandler(async (req, res) => {
 export const createTransaction = asyncHandler(async (req, res) => {
   const { firm_id, date, description, debit, credit, name, purpose, remark, remark2, cheque_no, transaction_no,
           voucher_url, payment_mode, assigned_admin_id,
-          mapped_member_id, mapped_user_id } = req.body;
+          mapped_member_id, mapped_user_id, bank_account_id } = req.body;
 
   if (!firm_id) return res.status(400).json({ message: 'Firm is required' });
   if (!description || !description.trim()) return res.status(400).json({ message: 'Description is required' });
@@ -246,6 +247,11 @@ export const createTransaction = asyncHandler(async (req, res) => {
   const txnDebit = parseFloat(debit) || 0;
   const txnCredit = parseFloat(credit) || 0;
   const txnPaymentMode = normalizeCashType(payment_mode);
+  const selectedBankAccountId = await resolveBankAccountSelection({
+    siteId: firm.site_id,
+    paymentMode: txnPaymentMode,
+    bankAccountId: bank_account_id,
+  });
 
   const data = {
     firm_id: firmIdInt,
@@ -268,6 +274,7 @@ export const createTransaction = asyncHandler(async (req, res) => {
     cheque_status: txnPaymentMode === 'cheque' ? 'PENDING' : null,
     mapped_member_id: mapped_member_id ? parseInt(mapped_member_id) : null,
     mapped_user_id: mapped_user_id ? parseInt(mapped_user_id) : null,
+    bank_account_id: selectedBankAccountId,
   };
 
   const txn = await firmTransactionModel.create(data, pool);
@@ -293,6 +300,7 @@ export const createFirmToFirmTransfer = asyncHandler(async (req, res) => {
     cheque_no,
     voucher_url,
     assigned_admin_id,
+    bank_account_id,
   } = req.body;
 
   if (!from_firm_id) return res.status(400).json({ message: 'Source firm is required' });
@@ -309,12 +317,15 @@ export const createFirmToFirmTransfer = asyncHandler(async (req, res) => {
   // Parallelize: 2 firm lookups + site lookup. Was 3 serial round-trips.
   const [firmsRes, targetSiteRes] = await Promise.all([
     pool.query(
-      `SELECT id, site_id, name FROM firms WHERE id = ANY($1::int[])`,
-      [[fromFirmInt, toFirmInt]]
+      `SELECT f.id, f.site_id, f.name
+         FROM firms f
+         JOIN sites s ON s.id = f.site_id
+        WHERE f.id = ANY($1::int[]) AND s.organization_id = $2`,
+      [[fromFirmInt, toFirmInt], req.user.organization_id]
     ),
     pool.query(
-      `SELECT id, name FROM sites WHERE id = $1`,
-      [toSiteInt]
+      `SELECT id, name FROM sites WHERE id = $1 AND organization_id = $2`,
+      [toSiteInt, req.user.organization_id]
     ),
   ]);
   const firmsById = new Map(firmsRes.rows.map((f) => [f.id, f]));
@@ -332,9 +343,24 @@ export const createFirmToFirmTransfer = asyncHandler(async (req, res) => {
   }
 
   if (!targetSiteRes.rows[0]) return res.status(404).json({ message: 'Target site not found' });
+  if (req.user.role === 'sub_admin') {
+    const access = await pool.query(
+      `SELECT site_id FROM user_sites
+        WHERE user_id = $1 AND site_id = ANY($2::int[])`,
+      [req.user.id, [Number(sourceFirm.site_id), Number(targetFirm.site_id)]],
+    );
+    if (new Set(access.rows.map((row) => Number(row.site_id))).size !== new Set([Number(sourceFirm.site_id), Number(targetFirm.site_id)]).size) {
+      return res.status(403).json({ message: 'Access denied to one or more transfer sites' });
+    }
+  }
 
   const transferDate = date || new Date().toISOString().split('T')[0];
   const mode = normalizeCashType(payment_mode);
+  const selectedBankAccountId = await resolveBankAccountSelection({
+    siteId: sourceFirm.site_id,
+    paymentMode: mode,
+    bankAccountId: bank_account_id,
+  });
   const transferGroupId = buildTransferGroupId();
 
   const sourceDescription = description && description.trim()
@@ -347,6 +373,7 @@ export const createFirmToFirmTransfer = asyncHandler(async (req, res) => {
     date: transferDate,
     description: sourceDescription,
     payment_mode: mode,
+    bank_account_id: selectedBankAccountId,
     debit: transferAmount,
     credit: 0,
     name: targetFirm.name,
@@ -395,6 +422,9 @@ export const bulkCreateTransactions = asyncHandler(async (req, res) => {
 
   if (!Array.isArray(transactions) || transactions.length === 0) {
     return res.status(400).json({ message: 'transactions array is required and must not be empty' });
+  }
+  if (transactions.length > 100) {
+    return res.status(400).json({ message: 'Bulk imports are limited to 100 transactions per request' });
   }
 
   const startTs = Date.now();
@@ -720,7 +750,7 @@ export const getTransaction = asyncHandler(async (req, res) => {
  */
 export const updateTransaction = asyncHandler(async (req, res) => {
   const txnId = parseInt(req.params.id);
-  const { date, description, debit, credit, name, purpose, remark, remark2, cheque_no, transaction_no, voucher_url, payment_mode, assigned_admin_id } = req.body;
+  const { date, description, debit, credit, name, purpose, remark, remark2, cheque_no, transaction_no, voucher_url, payment_mode, assigned_admin_id, bank_account_id } = req.body;
 
   const existing = await firmTransactionModel.findById(txnId, pool);
   if (!existing) return res.status(404).json({ message: 'Transaction not found' });
@@ -730,6 +760,13 @@ export const updateTransaction = asyncHandler(async (req, res) => {
   }
 
   const updateData = {};
+  if (payment_mode !== undefined || bank_account_id !== undefined) {
+    updateData.bank_account_id = await resolveBankAccountSelection({
+      siteId: existing.site_id,
+      paymentMode: payment_mode !== undefined ? normalizeCashType(payment_mode) : existing.payment_mode,
+      bankAccountId: bank_account_id !== undefined ? bank_account_id : existing.bank_account_id,
+    });
+  }
   if (date !== undefined) updateData.date = date;
   if (description !== undefined) updateData.description = description.trim();
   if (debit !== undefined) updateData.debit = parseFloat(debit) || 0;
@@ -789,6 +826,9 @@ export const updateTransaction = asyncHandler(async (req, res) => {
       cfUpdate.cash_type = normalizeCashType(payment_mode);
       cfUpdate.cheque_status = updateData.cheque_status;
       cfUpdate.cheque_no = updateData.cheque_no;
+      cfUpdate.bank_account_id = updateData.bank_account_id;
+    } else if (bank_account_id !== undefined) {
+      cfUpdate.bank_account_id = updateData.bank_account_id;
     } else if (cheque_no !== undefined) {
       cfUpdate.cheque_no = updateData.cheque_no;
     }

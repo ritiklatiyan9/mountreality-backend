@@ -4,6 +4,8 @@ import { plotModel } from '../models/Plot.model.js';
 import pool from '../config/db.js';
 import { notifyPlotPaymentRecorded } from '../utils/notify.js';
 import { normalizeCashType } from '../utils/paymentMode.js';
+import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
+import { positiveId } from '../services/propertyLifecycle.service.js';
 
 let hasGracePeriodColumnCache = null;
 const hasGracePeriodColumn = async () => {
@@ -459,26 +461,28 @@ export const updateInstallmentSettings = asyncHandler(async (req, res) => {
 /** GET /plots/:id/installments — List installments for a plot */
 export const listInstallments = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const plot = await plotModel.findById(parseInt(id), pool);
+  const plotId = positiveId(id, 'plot_id');
+  // These reads are independent. Running them together removes the serial
+  // wait that previously delayed the Plot Detail page by two database trips.
+  const [plot, installments, totalRes] = await Promise.all([
+    plotModel.findById(plotId, pool),
+    installmentModel.findByPlotId(plotId, pool),
+    pool.query(
+      `SELECT COALESCE(SUM(amount), 0) AS total_received FROM (
+         SELECT amount FROM plot_payments
+          WHERE plot_id = $1
+            AND LOWER(COALESCE(status, '')) = 'approved'
+            AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+         UNION ALL
+         SELECT amount FROM plot_installment_payments
+          WHERE plot_id = $1
+            AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+       ) posted_payments`,
+      [plotId]
+    ),
+  ]);
   if (!plot) return res.status(404).json({ message: 'Plot not found' });
-
-  const installments = await installmentModel.findByPlotId(parseInt(id), pool);
   const today = new Date();
-
-  // Get total received from plot_payments (the single source of truth)
-  const totalRes = await pool.query(
-    `SELECT COALESCE(SUM(amount), 0) AS total_received FROM (
-       SELECT amount FROM plot_payments
-        WHERE plot_id = $1
-          AND LOWER(COALESCE(status, '')) = 'approved'
-          AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
-       UNION ALL
-       SELECT amount FROM plot_installment_payments
-        WHERE plot_id = $1
-          AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
-     ) posted_payments`,
-    [parseInt(id)]
-  );
   let remaining_pool = parseFloat(totalRes.rows[0].total_received) || 0;
 
   // Distribute total received across installments in sort order
@@ -539,11 +543,11 @@ export const listInstallments = asyncHandler(async (req, res) => {
 
   if (!protectedStatuses.includes(currentStatus)) {
     if (shouldUnderCancellation && currentStatus !== 'UNDER CANCELLATION') {
-      await plotModel.update(parseInt(id), { status: 'UNDER CANCELLATION' }, pool);
+      await plotModel.update(plotId, { status: 'UNDER CANCELLATION' }, pool);
       plot.status = 'UNDER CANCELLATION';
     }
     if (!shouldUnderCancellation && currentStatus === 'UNDER CANCELLATION') {
-      await plotModel.update(parseInt(id), { status: 'BOOKED' }, pool);
+      await plotModel.update(plotId, { status: 'BOOKED' }, pool);
       plot.status = 'BOOKED';
     }
   }
@@ -633,7 +637,7 @@ export const deleteInstallment = asyncHandler(async (req, res) => {
 /** POST /plots/:id/installment-payment — Record a payment, auto-apply to earliest unpaid */
 export const recordInstallmentPayment = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const { amount, payment_date, payment_mode, reference, notes, installment_id } = req.body;
+  const { amount, payment_date, payment_mode, reference, notes, installment_id, bank_account_id } = req.body;
 
   if (!amount || parseFloat(amount) <= 0)
     return res.status(400).json({ message: 'A positive payment amount is required' });
@@ -645,6 +649,11 @@ export const recordInstallmentPayment = asyncHandler(async (req, res) => {
 
   let remaining = parseFloat(amount);
   const normalizedPaymentMode = normalizeCashType(payment_mode);
+  const selectedBankAccountId = await resolveBankAccountSelection({
+    siteId: plot.site_id,
+    paymentMode: normalizedPaymentMode,
+    bankAccountId: bank_account_id,
+  });
   const payments = [];
 
   if (installment_id) {
@@ -664,6 +673,7 @@ export const recordInstallmentPayment = asyncHandler(async (req, res) => {
       payment_mode: normalizedPaymentMode,
       reference: reference || null,
       notes: notes || null,
+      bank_account_id: selectedBankAccountId,
       created_by: req.user.id,
     }, pool);
     payments.push(paymentRow);
@@ -687,6 +697,7 @@ export const recordInstallmentPayment = asyncHandler(async (req, res) => {
         payment_mode: normalizedPaymentMode,
         reference: reference || null,
         notes: notes || null,
+        bank_account_id: selectedBankAccountId,
         created_by: req.user.id,
       }, pool);
       payments.push(paymentRow);
@@ -722,7 +733,7 @@ export const recordInstallmentPayment = asyncHandler(async (req, res) => {
 /** GET /plots/:id/installment-payments — All payments for a plot's installments */
 export const listInstallmentPayments = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const payments = await installmentPaymentModel.findByPlotId(parseInt(id), pool);
+  const payments = await installmentPaymentModel.findByPlotId(positiveId(id, 'plot_id'), pool);
   res.json({ payments });
 });
 

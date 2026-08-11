@@ -10,8 +10,11 @@ import {
 import authMiddleware from '../middlewares/auth.middleware.js';
 import requireRole from '../middlewares/role.middleware.js';
 import requirePermission from '../middlewares/permission.middleware.js';
+import createRateLimiter from '../middlewares/rateLimit.middleware.js';
 
 const router = express.Router();
+const dmsUploadLimiter = createRateLimiter({ windowMs: 15 * 60_000, max: 20, keyPrefix: 'dms-upload:' });
+const dmsOcrLimiter = createRateLimiter({ windowMs: 60 * 60_000, max: 30, keyPrefix: 'dms-ocr:' });
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 const MIME_BY_EXTENSION = new Map([
   ['.jpg', new Set(['image/jpeg'])],
@@ -71,8 +74,8 @@ router.patch(
   assignUnassignedDmsDocument
 );
 router.get('/:id', requireRole('admin', 'sub_admin'), requirePermission('document_search', 'read'), getDmsDocument);
-router.post('/', requireRole('admin', 'sub_admin'), requirePermission('document_search', 'write'), receiveDocument, uploadDmsDocument);
-router.post('/:id/retry-ocr', requireRole('admin', 'sub_admin'), requirePermission('document_search', 'write'), retryOcr);
+router.post('/', requireRole('admin', 'sub_admin'), requirePermission('document_search', 'write'), dmsUploadLimiter, receiveDocument, uploadDmsDocument);
+router.post('/:id/retry-ocr', requireRole('admin', 'sub_admin'), requirePermission('document_search', 'write'), dmsOcrLimiter, retryOcr);
 router.patch('/:id', requireRole('admin', 'sub_admin'), requirePermission('document_search', 'update'), updateDmsDocument);
 router.delete('/:id', requireRole('admin', 'sub_admin'), requirePermission('document_search', 'delete'), deleteDmsDocument);
 

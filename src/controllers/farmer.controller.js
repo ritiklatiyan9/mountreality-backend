@@ -4,6 +4,7 @@ import { dayBookModel } from '../models/DayBook.model.js';
 import pool from '../config/db.js';
 import { buildVerifyUrl, verifyReceiptToken, ReceiptType } from '../utils/receiptToken.js';
 import { classifyPaymentMode } from '../utils/paymentMode.js';
+import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
 
 const SPLIT_EPSILON = 1e-9;
 
@@ -347,7 +348,7 @@ export const createPayment = asyncHandler(async (req, res) => {
     date, particular, amount, by_note, remarks,
     payment_mode, cash_amount, bank_amount, bank_name, bank_account_no, bank_reference, bank_ifsc,
     voucher_url, assigned_admin_id, mapped_member_id, mapped_user_id,
-    idempotency_key, schedule_item_id,
+    idempotency_key, schedule_item_id, bank_account_id,
   } = req.body;
 
   if (!particular) {
@@ -385,6 +386,11 @@ export const createPayment = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'Use the audited reversal action to correct an acquisition payment' });
   }
   const mode = allocation.mode;
+  const selectedBankAccountId = await resolveBankAccountSelection({
+    siteId,
+    paymentMode: mode,
+    bankAccountId: bank_account_id,
+  });
   const cashAmt = allocation.cash;
   const bankAmt = allocation.bank;
   const canSetCustomDate = req.user.role === 'admin' || req.user.role === 'super_admin';
@@ -447,9 +453,9 @@ export const createPayment = asyncHandler(async (req, res) => {
          farmer_id, date, particular, amount, by_note, remarks,
          payment_mode, cash_amount, bank_amount, bank_name, bank_account_no,
          bank_reference, bank_ifsc, voucher_url, assigned_admin_id, status,
-         cheque_no, cheque_status, created_by, mapped_member_id, mapped_user_id,idempotency_key
+         cheque_no, cheque_status, created_by, mapped_member_id, mapped_user_id,idempotency_key,bank_account_id
        )
-       SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $17, $18, $25, $26,$29
+       SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'pending', $16, $17, $18, $25, $26,$29,$31
        FROM f
        WHERE f.completed_at IS NULL
          AND (f.acquisition_reference IS NULL OR f.financial_terms_status='CONFIRMED')
@@ -495,7 +501,7 @@ export const createPayment = asyncHandler(async (req, res) => {
        INSERT INTO day_book (
          site_id, date, particular, entry_type, debit, credit, remarks,
          payment_mode, category, from_entity, to_entity,
-         account_no, branch, created_by, assigned_admin_id, farmer_payment_id
+         account_no, branch, created_by, assigned_admin_id, farmer_payment_id, bank_account_id
        )
        SELECT
          f.site_id,
@@ -504,7 +510,7 @@ export const createPayment = asyncHandler(async (req, res) => {
          'FARMER PAYMENT',
          $21::numeric, 0, $22::text,
          $23::text, 'FARMER PAYMENT', $24::text, UPPER(f.name),
-         $11::text, $13::text, $18::int, $15::int, np.id
+         $11::text, $13::text, $18::int, $15::int, np.id, $31::int
        FROM f, new_payment np
        WHERE $21::numeric > 0
        RETURNING *
@@ -551,6 +557,7 @@ export const createPayment = asyncHandler(async (req, res) => {
       organizationId,               // $28 (tenant boundary)
       idempotencyKey,               // $29 (duplicate-submit protection)
       scheduleItemId,               // $30 (optional acquisition schedule allocation)
+      selectedBankAccountId,        // $31 (canonical Site bank account)
     ]
   );
 
@@ -681,11 +688,15 @@ export const updatePayment = asyncHandler(async (req, res) => {
   const {
     date, particular, amount, by_note, remarks,
     payment_mode, cash_amount, bank_amount, bank_name, bank_account_no, bank_reference, bank_ifsc,
-    voucher_url, cheque_no,
+    voucher_url, cheque_no, bank_account_id,
   } = req.body;
 
   const existingResult = await pool.query(
-    `SELECT fp.*
+    `SELECT fp.*, f.acquisition_reference,
+            EXISTS (
+              SELECT 1 FROM land_acquisition_payment_allocations pa
+               WHERE pa.farmer_payment_id = fp.id
+            ) AS has_acquisition_allocation
        FROM farmer_payments fp
        JOIN farmers f ON f.id = fp.farmer_id AND f.site_id = $3
        JOIN sites s ON s.id = f.site_id AND s.organization_id = $4
@@ -694,6 +705,9 @@ export const updatePayment = asyncHandler(async (req, res) => {
   );
   const existing = existingResult.rows[0];
   if (!existing) return res.status(404).json({ message: 'Payment not found' });
+  if (existing.acquisition_reference || existing.has_acquisition_allocation) {
+    return res.status(409).json({ message: 'Acquisition payments are immutable here. Use the audited land-acquisition reversal workflow.' });
+  }
 
   const canSetCustomDate = req.user.role === 'admin' || req.user.role === 'super_admin';
   const updateData = {};
@@ -726,6 +740,13 @@ export const updatePayment = asyncHandler(async (req, res) => {
       updateData.cheque_status = null;
       updateData.cheque_no = null;
     }
+  }
+  if (allocationChanged || bank_account_id !== undefined) {
+    updateData.bank_account_id = await resolveBankAccountSelection({
+      siteId,
+      paymentMode: updateData.payment_mode || existing.payment_mode,
+      bankAccountId: bank_account_id !== undefined ? bank_account_id : existing.bank_account_id,
+    });
   }
   if (bank_name !== undefined) updateData.bank_name = bank_name;
   if (bank_account_no !== undefined) updateData.bank_account_no = bank_account_no;
@@ -774,6 +795,19 @@ export const deletePayment = asyncHandler(async (req, res) => {
   const farmerId = parseInt(req.params.farmerId);
   const paymentId = parseInt(req.params.paymentId);
   const { siteId, organizationId } = farmerScope(req);
+  const linked = await pool.query(
+    `SELECT 1
+       FROM farmer_payments fp
+       JOIN farmers f ON f.id = fp.farmer_id
+      WHERE fp.id = $1 AND fp.farmer_id = $2 AND f.site_id = $3
+        AND (f.acquisition_reference IS NOT NULL OR EXISTS (
+          SELECT 1 FROM land_acquisition_payment_allocations pa WHERE pa.farmer_payment_id = fp.id
+        ))`,
+    [paymentId, farmerId, siteId],
+  );
+  if (linked.rows[0]) {
+    return res.status(409).json({ message: 'Acquisition payments must be reversed through the audited land-acquisition workflow.' });
+  }
 
   // Single round-trip: cascade-delete the linked DayBook rows AND the payment
   // in one atomic statement (CTE). Previously: SELECT + DELETE day_book +
@@ -815,6 +849,20 @@ export const bulkDeletePayments = asyncHandler(async (req, res) => {
   const { siteId, organizationId } = farmerScope(req);
   const ids = Array.isArray(req.body.ids) ? req.body.ids.map((id) => parseInt(id)).filter(Number.isInteger) : [];
   if (ids.length === 0) return res.status(400).json({ message: 'ids array is required' });
+  if (ids.length > 100) return res.status(400).json({ message: 'Bulk requests are limited to 100 payments' });
+  const linked = await pool.query(
+    `SELECT 1
+       FROM farmer_payments fp
+       JOIN farmers f ON f.id = fp.farmer_id
+      WHERE fp.id = ANY($1::int[]) AND fp.farmer_id = $2 AND f.site_id = $3
+        AND (f.acquisition_reference IS NOT NULL OR EXISTS (
+          SELECT 1 FROM land_acquisition_payment_allocations pa WHERE pa.farmer_payment_id = fp.id
+        )) LIMIT 1`,
+    [ids, farmerId, siteId],
+  );
+  if (linked.rows[0]) {
+    return res.status(409).json({ message: 'Acquisition payments must be reversed through the audited land-acquisition workflow.' });
+  }
 
   const result = await pool.query(
     `WITH target AS (

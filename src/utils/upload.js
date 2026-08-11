@@ -14,13 +14,14 @@ export const uploadSingle = async (file, provider, options = {}) => {
   // Local development should not pretend a photo was saved when Cloudinary is
   // absent. Keep multer's file and return the API-served URL instead.
   if (provider === 'cloudinary' && !cloudinaryConfigured) {
+    if (process.env.NODE_ENV === 'production') throw new Error('Profile image storage is not configured');
     const baseUrl = (localBaseUrl || `http://localhost:${process.env.PORT || 8000}`).replace(/\/$/, '');
     return `${baseUrl}/uploads/members/${encodeURIComponent(file.filename)}`;
   }
 
   try {
     if (provider === 's3') {
-      return await uploadToS3(filePath, file.filename, file.mimetype, options.folder);
+      return await uploadToS3(filePath, file.filename, file.mimetype, options.folder, Boolean(options.returnKey));
     }
     return await uploadToCloudinary(filePath);
   } finally {
@@ -31,10 +32,7 @@ export const uploadSingle = async (file, provider, options = {}) => {
 };
 
 export const uploadMany = async (files, provider) => {
-  const urls = [];
-  for (const file of files) {
-    const url = await uploadSingle(file, provider);
-    urls.push(url);
-  }
-  return urls;
+  // Every upload owns and clears its temporary file, including when a sibling
+  // fails, so a partial batch cannot leave unbounded files on local disk.
+  return Promise.all(files.map((file) => uploadSingle(file, provider)));
 };

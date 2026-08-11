@@ -467,6 +467,45 @@ async function loadProjectWorkspace(req, siteId, selectedProject, policy) {
 
   const organizationId = req.user.organization_id;
   const projectId = selectedProject.id;
+
+  // Development-authorised builders use the same canonical project records,
+  // but do not need the regulatory workspace's requirements, evidence,
+  // stakeholder or audit queries. Keep that initial request intentionally
+  // lean so the project planner opens without loading RERA-only data.
+  if (policy?.capabilities?.rera_workspace !== true) {
+    const { rows: phases } = await pool.query(
+      `SELECT ph.*,ca.name AS authority_record_name
+         FROM rera_project_phases ph
+         LEFT JOIN compliance_authorities ca
+           ON ca.id=ph.authority_id AND ca.organization_id=ph.organization_id AND ca.deleted_at IS NULL
+        WHERE ph.organization_id=$1 AND ph.site_id=$2 AND ph.rera_project_id=$3
+          AND ph.deleted_at IS NULL ORDER BY ph.phase_code,ph.id`,
+      [organizationId, siteId, projectId],
+    );
+    return {
+      phases,
+      requirements: [],
+      approvals: [],
+      stakeholders: [],
+      stakeholder_catalog: [],
+      evidence: [],
+      upcoming: [],
+      attention: [],
+      activity: [],
+      summary: {
+        requirements_total: 0,
+        requirements_documented: null,
+        approvals_total: null,
+        approvals_recorded: null,
+        evidence_total: null,
+        evidence_reviewed: null,
+        stakeholders_linked: 0,
+        profile_revision: policy?.policy_revision || null,
+        ruleset_name: null,
+      },
+    };
+  }
+
   const [canApprovals, canEvidence] = await Promise.all([
     canReadModule(req, policy, 'rera_approvals'),
     canReadModule(req, policy, 'rera_evidence'),

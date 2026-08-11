@@ -12,11 +12,13 @@ test('procurement orders expose their payment-derived status instead of a stale 
   assert.match(controller, /ORDER_PAYMENT_STATUS_SQL\} AS payment_status/);
 });
 
-test('recorded non-cheque vendor payments post to approved financial state', async () => {
+test('new non-cheque vendor payments post while edits preserve approval separation', async () => {
   const controller = await source('src/controllers/vendor.controller.js');
   assert.match(controller, /const paymentStatus = isChequePayment \? 'pending' : 'approved'/);
   assert.match(controller, /approved_by, approved_at/);
-  assert.match(controller, /const nextStatus = nextPaymentMode === 'cheque'/);
+  assert.match(controller, /Posted vendor payments are immutable/);
+  assert.match(controller, /status = 'pending', approved_by = NULL, approved_at = NULL/);
+  assert.match(controller, /FROM vendor_commitments[\s\S]*FOR UPDATE/);
 });
 
 test('migration replaces the legacy delivery-based trigger and reconciles linked payment records', async () => {

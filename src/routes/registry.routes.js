@@ -20,8 +20,10 @@ import requireRole from '../middlewares/role.middleware.js';
 import requirePermission from '../middlewares/permission.middleware.js';
 import requireRegistrySiteAccess from '../middlewares/registrySiteAccess.middleware.js';
 import { cacheResponse, invalidateCacheOnSuccess } from '../middlewares/cache.middleware.js';
+import createRateLimiter from '../middlewares/rateLimit.middleware.js';
 
 const registryReadCache = cacheResponse({ ttlSeconds: 30, namespace: 'registries' });
+const registryUploadLimiter = createRateLimiter({ windowMs: 15 * 60_000, max: 30, keyPrefix: 'registry-document-upload:' });
 // Autocomplete (member names, firms, plot options, recent bank/cheque payments)
 // is the heaviest single endpoint AND changes rarely — long-TTL meta cache
 // that survives registry/payment writes.
@@ -81,7 +83,7 @@ router.use(authMiddleware);
 router.get('/documents/plots', requireRole('admin', 'sub_admin'), requirePermission('plot_registry', 'read'), accessByQuerySite, listRegistryDocumentPlots);
 router.get('/documents/plot/:plotId', requireRole('admin', 'sub_admin'), requirePermission('plot_registry', 'read'), accessByParamDocumentPlot, getRegistryDocuments);
 // Resolve site access before Multer buffers the file in memory.
-router.post('/documents/plot/:plotId', requireRole('admin', 'sub_admin'), requirePermission('plot_registry', 'write'), accessByParamDocumentPlot, receiveRegistryDocument, bustRegistryCache, uploadRegistryDocument);
+router.post('/documents/plot/:plotId', requireRole('admin', 'sub_admin'), requirePermission('plot_registry', 'write'), accessByParamDocumentPlot, registryUploadLimiter, receiveRegistryDocument, bustRegistryCache, uploadRegistryDocument);
 router.delete('/documents/:docId', requireRole('admin', 'sub_admin'), requirePermission('plot_registry', 'delete'), accessByParamDocument, bustRegistryCache, deleteRegistryDocument);
 
 // ── Registry Payment endpoints (BEFORE /:id to avoid route conflict) ──

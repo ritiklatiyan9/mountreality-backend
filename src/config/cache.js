@@ -29,6 +29,18 @@ export const cacheSet = async (key, value, ttlSeconds = stdTTL) => {
   cache.set(key, value, ttlSeconds);
 };
 
+/** Atomic within this Node process: no await boundary between read and write. */
+export const incrementRateLimit = (key, windowMs) => {
+  const now = Date.now();
+  const existing = cache.get(key);
+  const entry = existing && existing.resetAt > now
+    ? { count: existing.count + 1, resetAt: existing.resetAt }
+    : { count: 1, resetAt: now + windowMs };
+  const ttlSeconds = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+  cache.set(key, entry, ttlSeconds);
+  return { ...entry, ttlSeconds };
+};
+
 /**
  * Clear all cache keys matching any of the given prefixes/namespaces.
  * Mirrors the old Redis `SCAN MATCH *prefix*` semantics: unanchored match,
