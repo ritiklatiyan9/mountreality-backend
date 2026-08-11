@@ -4,6 +4,7 @@ import { dayBookModel } from '../models/DayBook.model.js';
 import pool from '../config/db.js';
 import { buildVerifyUrl, ReceiptType } from '../utils/receiptToken.js';
 import { classifyPaymentMode } from '../utils/paymentMode.js';
+import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
 
 const commissionScope = (req) => ({
   siteId: Number.parseInt(req.commissionSiteId ?? req.siteContextId, 10),
@@ -498,6 +499,11 @@ export const createPlotCommissionPayment = asyncHandler(async (req, res) => {
   const isCheque = classifyPaymentMode(mode) === 'cheque';
   const chequeStatus = isCheque ? 'PENDING' : null;
   const chequeNumber = isCheque && cheque_no ? String(cheque_no).trim() : null;
+  const selectedBankAccountId = await resolveBankAccountSelection({
+    siteId,
+    paymentMode: mode,
+    bankAccountId: req.body.bank_account_id,
+  });
 
   // Single CTE round-trip: lookup master + insert payment + snapshot the live
   // approved balance atomically. The new row is pending, so it must not reduce
@@ -522,14 +528,14 @@ export const createPlotCommissionPayment = asyncHandler(async (req, res) => {
          site_id, plot_commission_id, date, amount, balance_after_payment,
          payment_mode, bank_name, transaction_id, remarks, status,
          voucher_number, voucher_url, assigned_admin_id, created_by,
-         cheque_no, cheque_status, mapped_member_id, mapped_user_id
+         cheque_no, cheque_status, mapped_member_id, mapped_user_id, bank_account_id
        )
        SELECT
          m.site_id, $1, $2::date, $3::numeric,
          (m.total_commission - m.already_paid),
          $4::text, $5::text, $6::text, $7::text, 'pending',
          $8::text, $9::text, $10::int, $11::int,
-         $12::text, $13::text, $14::int, $15::int
+         $12::text, $13::text, $14::int, $15::int, $18::int
        FROM master m
        RETURNING *
      )
@@ -552,6 +558,7 @@ export const createPlotCommissionPayment = asyncHandler(async (req, res) => {
       mappedUserId,                                                // $15
       siteId,                                                     // $16
       organizationId,                                             // $17
+      selectedBankAccountId,                                      // $18
     ]
   );
 
@@ -682,7 +689,7 @@ export const updatePlotCommissionPayment = asyncHandler(async (req, res) => {
   if (isNaN(numId)) return res.status(400).json({ message: 'Invalid payment ID' });
   const { siteId, organizationId } = commissionScope(req);
 
-  const { date, amount, payment_mode, bank_name, transaction_id, cheque_no, remarks, voucher_url, assigned_admin_id } = req.body;
+  const { date, amount, payment_mode, bank_name, transaction_id, cheque_no, remarks, voucher_url, assigned_admin_id, bank_account_id } = req.body;
   if (assigned_admin_id !== undefined) {
     const assignedAdminId = assigned_admin_id ? parseInt(assigned_admin_id) : null;
     if (!await userBelongsToSite(assignedAdminId, siteId, organizationId)) {
@@ -700,6 +707,20 @@ export const updatePlotCommissionPayment = asyncHandler(async (req, res) => {
     ? (String(payment_mode || 'BANK').trim().toUpperCase() || 'BANK')
     : undefined;
   let paymentModeParamIndex = null;
+
+  if (bank_account_id !== undefined || normalizedPaymentMode !== undefined) {
+    const current = await pool.query(
+      `SELECT payment_mode,bank_account_id FROM plot_commission_payments WHERE id=$1 AND (site_id=$2 OR site_id IS NULL) LIMIT 1`,
+      [numId, siteId],
+    );
+    if (!current.rows[0]) return res.status(404).json({ message: 'Payment not found' });
+    const selectedBankAccountId = await resolveBankAccountSelection({
+      siteId,
+      paymentMode: normalizedPaymentMode ?? current.rows[0].payment_mode,
+      bankAccountId: bank_account_id !== undefined ? bank_account_id : current.rows[0].bank_account_id,
+    });
+    add('bank_account_id', selectedBankAccountId);
+  }
 
   if (date !== undefined) add('date', date);
   if (amount !== undefined) add('amount', parseFloat(amount));

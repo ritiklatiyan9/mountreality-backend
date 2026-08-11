@@ -32,11 +32,25 @@ export const ALL_COMPONENTS = [
   'compliance_watch',
 ];
 
+const getManagedUser = async (userId, organizationId) => {
+  const { rows } = await pool.query(
+    `SELECT id, role FROM users
+      WHERE id = $1 AND organization_id = $2
+        AND role IN ('admin', 'sub_admin') AND is_active = true
+      LIMIT 1`,
+    [userId, organizationId],
+  );
+  return rows[0] || null;
+};
+
 // GET /dashboard-permissions/:userId
 // Returns the component permissions for any user (admin / sub-admin).
 export const getDashboardPermissions = asyncHandler(async (req, res) => {
   const userId = parseInt(req.params.userId);
   if (!userId) return res.status(400).json({ message: 'Invalid userId' });
+  if (!await getManagedUser(userId, req.user.organization_id)) {
+    return res.status(404).json({ message: 'User not found' });
+  }
 
   const { rows } = await pool.query(
     `SELECT component, allowed
@@ -76,6 +90,11 @@ export const getMyDashboardPermissions = asyncHandler(async (req, res) => {
 export const updateDashboardPermissions = asyncHandler(async (req, res) => {
   const userId = parseInt(req.params.userId);
   if (!userId) return res.status(400).json({ message: 'Invalid userId' });
+  const targetUser = await getManagedUser(userId, req.user.organization_id);
+  if (!targetUser) return res.status(404).json({ message: 'User not found' });
+  if (targetUser.role !== 'sub_admin' && userId !== req.user.id) {
+    return res.status(403).json({ message: 'You can update only sub-admins you manage' });
+  }
 
   const { permissions } = req.body;
   if (!permissions || typeof permissions !== 'object') {
@@ -134,9 +153,11 @@ export const listUsersWithDashboardPermissions = asyncHandler(async (req, res) =
        COUNT(dcp.component) FILTER (WHERE dcp.allowed = false) AS restricted_count
      FROM users u
      LEFT JOIN dashboard_component_permissions dcp ON dcp.user_id = u.id
-     WHERE u.role IN ('admin', 'sub_admin') AND u.is_active = true
+     WHERE u.organization_id = $1
+       AND u.role IN ('admin', 'sub_admin') AND u.is_active = true
      GROUP BY u.id, u.name, u.email, u.role
-     ORDER BY u.role, u.name`
+     ORDER BY u.role, u.name`,
+    [req.user.organization_id],
   );
   res.json({ users: rows });
 });

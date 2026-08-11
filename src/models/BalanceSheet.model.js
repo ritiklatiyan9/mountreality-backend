@@ -315,6 +315,35 @@ const REPORT_QUERY = `${NORMALIZED_LEDGER_CTE}
         GROUP BY CASE WHEN $10::text = 'day' THEN entry_date ELSE DATE_TRUNC('month', entry_date)::date END
       ) t
     ), '[]'::jsonb),
+    'position', (
+      SELECT jsonb_build_object(
+        'current', jsonb_build_object(
+          'as_at', $3::date,
+          'cash', COALESCE(SUM(credit - debit) FILTER (
+            WHERE bucket = 'cash' AND ($3::date IS NULL OR entry_date <= $3::date)
+          ), 0)::numeric,
+          'bank', COALESCE(SUM(credit - debit) FILTER (
+            WHERE bucket = 'bank' AND ($3::date IS NULL OR entry_date <= $3::date)
+          ), 0)::numeric,
+          'total', COALESCE(SUM(credit - debit) FILTER (
+            WHERE $3::date IS NULL OR entry_date <= $3::date
+          ), 0)::numeric
+        ),
+        'previous', jsonb_build_object(
+          'as_at', $11::date,
+          'cash', COALESCE(SUM(credit - debit) FILTER (
+            WHERE bucket = 'cash' AND $11::date IS NOT NULL AND entry_date <= $11::date
+          ), 0)::numeric,
+          'bank', COALESCE(SUM(credit - debit) FILTER (
+            WHERE bucket = 'bank' AND $11::date IS NOT NULL AND entry_date <= $11::date
+          ), 0)::numeric,
+          'total', COALESCE(SUM(credit - debit) FILTER (
+            WHERE $11::date IS NOT NULL AND entry_date <= $11::date
+          ), 0)::numeric
+        )
+      )
+      FROM book_entries
+    ),
     'quality', jsonb_build_object(
       'invalid_date_entries', (
         SELECT COUNT(*)::int FROM source_rows
@@ -349,6 +378,7 @@ class BalanceSheetModel {
     search = '',
     limit = 2500,
     grain = 'day',
+    comparativeTo = null,
   }) {
     const result = await pool.query(REPORT_QUERY, [
       siteId,
@@ -361,6 +391,7 @@ class BalanceSheetModel {
       search,
       limit,
       grain,
+      comparativeTo,
     ]);
     return result.rows[0]?.report || null;
   }

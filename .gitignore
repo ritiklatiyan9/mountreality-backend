@@ -15,5 +15,12 @@ npm-debug.log*
 uploads/
 src/uploads/
 
+# Customer exports and database snapshots must never enter source control.
+data/
+.private-data/
+*.sql
+*.dump
+*.backup
+
 # Firebase Admin SDK service-account key (server secret — never commit)
 secrets/

@@ -281,16 +281,43 @@ class ImprestLedgerModel extends MasterModel {
    * Create a ledger entry with computed balance_after
    */
   async createEntry(data, pool) {
-    // Get current balance
-    const currentBalance = await this.getBalance(data.user_id, data.site_id || null, pool);
-    const newBalance = currentBalance + parseFloat(data.amount);
-
-    const entryData = {
-      ...data,
-      balance_after: newBalance,
-    };
-
-    return await this.create(entryData, pool);
+    const amount = Number(data.amount);
+    if (!Number.isFinite(amount) || amount === 0) throw new Error('Imprest ledger amount must be non-zero');
+    const { rows } = await pool.query(
+      `WITH posting_lock AS MATERIALIZED (
+         SELECT pg_advisory_xact_lock(hashtext($1))
+       ), current_balance AS (
+         SELECT COALESCE(SUM(il.amount),0)::numeric AS amount
+           FROM imprest_ledger il,posting_lock
+          WHERE il.user_id=$2 AND COALESCE(il.site_id,0)=COALESCE($3::int,0)
+       )
+       INSERT INTO imprest_ledger
+         (user_id,site_id,type,source_module,reference_id,amount,balance_after,remarks,created_by)
+       SELECT $2,$3,$4,$5,$6,$7,current_balance.amount+$7,$8,$9
+         FROM current_balance
+        WHERE $10::boolean OR current_balance.amount + $7 >= 0
+       ON CONFLICT DO NOTHING
+       RETURNING *`,
+      [
+        `imprest:${data.user_id}:${data.site_id || 0}`,
+        data.user_id,
+        data.site_id || null,
+        data.type,
+        data.source_module || null,
+        data.reference_id || null,
+        amount,
+        data.remarks || null,
+        data.created_by || null,
+        data.allow_negative === true,
+      ]
+    );
+    if (!rows[0] && amount < 0 && data.allow_negative !== true) {
+      const error = new Error('Insufficient imprest balance for this debit');
+      error.status = 409;
+      error.code = 'IMPREST_INSUFFICIENT_BALANCE';
+      throw error;
+    }
+    return rows[0] || null;
   }
 
   /**

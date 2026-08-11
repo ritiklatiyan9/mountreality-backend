@@ -5,6 +5,7 @@ import pool from '../config/db.js';
 import { clearCacheByPrefixes } from '../config/cache.js';
 import { buildVerifyUrl, ReceiptType } from '../utils/receiptToken.js';
 import { classifyPaymentMode, normalizeCashType } from '../utils/paymentMode.js';
+import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
 
 const findEligibleLedgerUser = async (userId, siteId) => {
   if (!Number.isInteger(userId)) return null;
@@ -279,6 +280,7 @@ export const createEntry = asyncHandler(async (req, res) => {
     to_firm_id,
     to_name,
     assigned_admin_id,
+    bank_account_id,
   } = req.body;
 
   if (!cash_flow_month_id) return res.status(400).json({ message: 'Cash flow month is required' });
@@ -343,6 +345,11 @@ export const createEntry = asyncHandler(async (req, res) => {
   }
 
   const normalizedCashType = normalizeCashType(cash_type);
+  const selectedBankAccountId = await resolveBankAccountSelection({
+    siteId: cfMonth.site_id,
+    paymentMode: normalizedCashType,
+    bankAccountId: bank_account_id,
+  });
   const data = {
     cash_flow_month_id: monthIdInt,
     site_id: cfMonth.site_id,
@@ -364,6 +371,7 @@ export const createEntry = asyncHandler(async (req, res) => {
     from_firm_id: fromFirmId,
     to_firm_id: toFirmId,
     to_name: toName,
+    bank_account_id: selectedBankAccountId,
   };
 
   const entry = await cashFlowEntryModel.create(data, pool);
@@ -462,6 +470,7 @@ export const updateEntry = asyncHandler(async (req, res) => {
     to_name,
     assigned_admin_id,
     cheque_no,
+    bank_account_id,
   } = req.body;
 
   // ── Single round-trip lookup: existing entry + its month's lock state in
@@ -469,7 +478,7 @@ export const updateEntry = asyncHandler(async (req, res) => {
   const lookupRes = await pool.query(
     `SELECT cfe.id, cfe.cash_flow_month_id, cfe.site_id, cfe.is_firm_transaction,
             cfe.from_firm_id, cfe.to_firm_id, cfe.to_name,
-            cfe.cash_type, cfe.cheque_status, cfe.cheque_no,
+            cfe.cash_type, cfe.cheque_status, cfe.cheque_no,cfe.bank_account_id,
             cfm.is_locked
        FROM cash_flow_entries cfe
        JOIN cash_flow_months cfm ON cfm.id = cfe.cash_flow_month_id
@@ -501,6 +510,13 @@ export const updateEntry = asyncHandler(async (req, res) => {
     const existingIsCheque = classifyPaymentMode(existing.cash_type) === 'cheque';
     updateData.cheque_no = existingIsCheque && cheque_no ? String(cheque_no).trim() : null;
     if (existingIsCheque) updateData.cheque_status = existing.cheque_status || 'PENDING';
+  }
+  if (cash_type !== undefined || bank_account_id !== undefined) {
+    updateData.bank_account_id = await resolveBankAccountSelection({
+      siteId: existing.site_id,
+      paymentMode: cash_type !== undefined ? normalizeCashType(cash_type) : existing.cash_type,
+      bankAccountId: bank_account_id !== undefined ? bank_account_id : existing.bank_account_id,
+    });
   }
   if (remarks !== undefined) updateData.remarks = remarks ? remarks.trim() : null;
   if (voucher_url !== undefined) updateData.voucher_url = voucher_url || null;

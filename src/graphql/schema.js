@@ -29,6 +29,10 @@ function requireModuleRead(ctx, module, rawSiteId) {
     throw new GraphQLError('A valid siteId is required', { extensions: { code: 'BAD_USER_INPUT' } });
   }
 
+  if (!ctx.siteIds?.has(siteId)) {
+    throw new GraphQLError('Access denied to this site', { extensions: { code: 'FORBIDDEN' } });
+  }
+
   if (PRIVILEGED_ROLES.has(ctx.user.role)) return siteId;
   if (ctx.user.role !== 'sub_admin') {
     throw new GraphQLError('Insufficient permissions', { extensions: { code: 'FORBIDDEN' } });
@@ -37,10 +41,6 @@ function requireModuleRead(ctx, module, rawSiteId) {
   if (ctx.permissions?.get(module)?.can_read !== true) {
     throw new GraphQLError(`Read access to ${module} is required`, { extensions: { code: 'FORBIDDEN' } });
   }
-  if (!ctx.siteIds?.has(siteId)) {
-    throw new GraphQLError('Access denied to this site', { extensions: { code: 'FORBIDDEN' } });
-  }
-
   return siteId;
 }
 
@@ -876,7 +876,7 @@ const QueryType = new GraphQLObjectType({
       async resolve(_, { siteId, page = 1, limit = 20, filters = {}, includeBreakdowns = false }, ctx) {
         const id = requireModuleRead(ctx, 'expenses', siteId);
         const safePage = Number.isFinite(page) ? Math.max(1, page) : 1;
-        const safeLimit = Number.isFinite(limit) ? Math.max(0, limit) : 20;
+        const safeLimit = Number.isFinite(limit) ? Math.min(100, Math.max(1, limit)) : 20;
         const normalizedFilters = {
           search: filters.search || undefined,
           mode: filters.mode || undefined,

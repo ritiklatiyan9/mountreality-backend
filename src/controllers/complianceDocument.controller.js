@@ -38,6 +38,41 @@ const getLandAcquisitionEvidenceEntity = async (req, _res, id) => {
   return rows[0] || null;
 };
 
+const constructionEvidenceResolver = (table) => async (req, _res, id) => {
+  const params = [id, req.user.organization_id];
+  let assignment = '';
+  if (!isOrgAdmin(req.user)) {
+    params.push(req.user.id);
+    assignment = `AND EXISTS (
+      SELECT 1 FROM user_sites us WHERE us.user_id=$3 AND us.site_id=record.site_id
+    )`;
+  }
+  const { rows } = await pool.query(
+    `SELECT record.* FROM ${table} record
+      JOIN sites s ON s.id=record.site_id AND s.organization_id=$2
+     WHERE record.id=$1 AND record.organization_id=$2 ${assignment} LIMIT 1`,
+    params,
+  );
+  return rows[0] || null;
+};
+
+const getFilingSubmissionEvidenceEntity = async (req, _res, id) => {
+  const params = [id, req.user.organization_id];
+  let assignment = '';
+  if (!isOrgAdmin(req.user)) {
+    params.push(req.user.id);
+    assignment = `AND EXISTS (SELECT 1 FROM user_sites us WHERE us.user_id=$3 AND us.site_id=f.site_id)`;
+  }
+  const { rows } = await pool.query(
+    `SELECT submission.*,f.organization_id,f.site_id,f.rera_project_id,f.rera_project_phase_id
+       FROM rera_filing_submissions submission
+       JOIN rera_filing_periods f ON f.id=submission.filing_period_id
+      WHERE submission.id=$1 AND f.organization_id=$2 ${assignment} LIMIT 1`,
+    params,
+  );
+  return rows[0] || null;
+};
+
 const ENTITY = Object.freeze({
   COMPLIANCE: { table: 'compliance_items', module: 'compliance' },
   LICENCE: { table: 'compliance_licences', module: 'compliance' },
@@ -49,10 +84,25 @@ const ENTITY = Object.freeze({
   RERA_APPROVAL: { module: 'rera_evidence', resolver: getReraApproval },
   RERA_STAKEHOLDER: { module: 'rera_evidence', resolver: getReraStakeholder },
   LAND_ACQUISITION: { module: 'farmers', resolver: getLandAcquisitionEvidenceEntity },
+  CONSTRUCTION_PROJECT: { module: 'construction', resolver: constructionEvidenceResolver('construction_projects') },
+  CONSTRUCTION_WORK_PACKAGE: { module: 'construction', resolver: constructionEvidenceResolver('construction_work_packages') },
+  CONSTRUCTION_DAILY_UPDATE: { module: 'construction', resolver: constructionEvidenceResolver('construction_daily_updates') },
+  CONSTRUCTION_CERTIFICATION: { module: 'rera_evidence', resolver: constructionEvidenceResolver('construction_certifications') },
+  RERA_FILING_PERIOD: { module: 'rera_evidence', resolver: constructionEvidenceResolver('rera_filing_periods') },
+  RERA_FILING_SUBMISSION: { module: 'rera_evidence', resolver: getFilingSubmissionEvidenceEntity },
+  RERA_PROJECT_CHANGE: { module: 'rera_evidence', resolver: constructionEvidenceResolver('rera_project_change_requests') },
+  RERA_PROJECT_EXTENSION: { module: 'rera_evidence', resolver: constructionEvidenceResolver('rera_project_extensions') },
 });
-const RERA_ENTITY_TYPES = new Set(['RERA_PROJECT', 'RERA_PHASE', 'RERA_APPROVAL', 'RERA_STAKEHOLDER']);
-const SITE_SCOPED_ENTITY_TYPES = new Set([...RERA_ENTITY_TYPES, 'LAND_ACQUISITION']);
-const HISTORICAL_EVIDENCE_TYPES = new Set([...RERA_ENTITY_TYPES, 'LAND_ACQUISITION']);
+const RERA_ENTITY_TYPES = new Set([
+  'RERA_PROJECT', 'RERA_PHASE', 'RERA_APPROVAL', 'RERA_STAKEHOLDER',
+  'CONSTRUCTION_CERTIFICATION', 'RERA_FILING_PERIOD', 'RERA_FILING_SUBMISSION',
+  'RERA_PROJECT_CHANGE', 'RERA_PROJECT_EXTENSION',
+]);
+const CONSTRUCTION_ENTITY_TYPES = new Set([
+  'CONSTRUCTION_PROJECT', 'CONSTRUCTION_WORK_PACKAGE', 'CONSTRUCTION_DAILY_UPDATE',
+]);
+const SITE_SCOPED_ENTITY_TYPES = new Set([...RERA_ENTITY_TYPES, ...CONSTRUCTION_ENTITY_TYPES, 'LAND_ACQUISITION']);
+const HISTORICAL_EVIDENCE_TYPES = new Set([...RERA_ENTITY_TYPES, ...CONSTRUCTION_ENTITY_TYPES, 'LAND_ACQUISITION']);
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const SOURCE_TYPES = new Set(['USER_UPLOADED', 'OFFICIAL_PORTAL', 'AUTHORITY_DOCUMENT', 'IMPORTED', 'OTHER']);
 const REVIEW_STATUSES = new Set(['NOT_REVIEWED', 'PENDING', 'ACCEPTED', 'REJECTED']);
@@ -151,6 +201,18 @@ const reraDocumentScope = ({ entityType, entityId, entity }) => {
       projectId: entity.rera_project_id || null,
       phaseId: entity.rera_project_phase_id || null,
     };
+  }
+  if (entityType === 'CONSTRUCTION_PROJECT') {
+    return { projectId: entity.rera_project_id || null, phaseId: entity.rera_project_phase_id || null };
+  }
+  if (['CONSTRUCTION_WORK_PACKAGE', 'CONSTRUCTION_DAILY_UPDATE', 'CONSTRUCTION_CERTIFICATION'].includes(entityType)) {
+    return { projectId: entity.rera_project_id || null, phaseId: entity.rera_project_phase_id || null };
+  }
+  if (['RERA_FILING_PERIOD', 'RERA_PROJECT_CHANGE', 'RERA_PROJECT_EXTENSION'].includes(entityType)) {
+    return { projectId: entity.rera_project_id || null, phaseId: entity.rera_project_phase_id || null };
+  }
+  if (entityType === 'RERA_FILING_SUBMISSION') {
+    return { projectId: entity.rera_project_id || null, phaseId: entity.rera_project_phase_id || null };
   }
   return { projectId: null, phaseId: null };
 };
@@ -491,7 +553,11 @@ export const listExpiringComplianceDocuments = asyncHandler(async (req, res) => 
            ON candidate.organization_id=s.organization_id AND candidate.site_id=s.id
         WHERE s.organization_id=$1 ${assignmentScope}
           AND candidate.deleted_at IS NULL AND candidate.expiry_date IS NOT NULL
-          AND candidate.entity_type IN ('RERA_PROJECT','RERA_PHASE','RERA_APPROVAL','RERA_STAKEHOLDER')
+          AND candidate.entity_type IN (
+            'RERA_PROJECT','RERA_PHASE','RERA_APPROVAL','RERA_STAKEHOLDER',
+            'CONSTRUCTION_CERTIFICATION','RERA_FILING_PERIOD','RERA_FILING_SUBMISSION',
+            'RERA_PROJECT_CHANGE','RERA_PROJECT_EXTENSION'
+          )
         ORDER BY s.id`,
       siteParams
     );
@@ -510,11 +576,19 @@ export const listExpiringComplianceDocuments = asyncHandler(async (req, res) => 
   if (reraEvidenceSiteIds.length > 0) {
     params.push(reraEvidenceSiteIds);
     where.push(`(
-      d.entity_type NOT IN ('RERA_PROJECT','RERA_PHASE','RERA_APPROVAL','RERA_STAKEHOLDER')
+      d.entity_type NOT IN (
+        'RERA_PROJECT','RERA_PHASE','RERA_APPROVAL','RERA_STAKEHOLDER',
+        'CONSTRUCTION_CERTIFICATION','RERA_FILING_PERIOD','RERA_FILING_SUBMISSION',
+        'RERA_PROJECT_CHANGE','RERA_PROJECT_EXTENSION'
+      )
       OR d.site_id = ANY($${params.length}::bigint[])
     )`);
   } else {
-    where.push(`d.entity_type NOT IN ('RERA_PROJECT','RERA_PHASE','RERA_APPROVAL','RERA_STAKEHOLDER')`);
+    where.push(`d.entity_type NOT IN (
+      'RERA_PROJECT','RERA_PHASE','RERA_APPROVAL','RERA_STAKEHOLDER',
+      'CONSTRUCTION_CERTIFICATION','RERA_FILING_PERIOD','RERA_FILING_SUBMISSION',
+      'RERA_PROJECT_CHANGE','RERA_PROJECT_EXTENSION'
+    )`);
   }
   // Land Acquisition documents are exposed only through the farmers-permissioned
   // acquisition workspace, not the Compliance expiry register.

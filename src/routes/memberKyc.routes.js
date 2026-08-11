@@ -11,8 +11,10 @@ import requireRole from '../middlewares/role.middleware.js';
 import { invalidateCacheOnSuccess } from '../middlewares/cache.middleware.js';
 import permissionModel from '../models/Permission.model.js';
 import pool from '../config/db.js';
+import createRateLimiter from '../middlewares/rateLimit.middleware.js';
 
 const router = express.Router();
+const kycProcessingLimiter = createRateLimiter({ windowMs: 15 * 60_000, max: 30, keyPrefix: 'kyc-processing:' });
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -109,10 +111,10 @@ router.get('/case/:id', requirePermission('clients', 'read'), getCase);
 router.patch('/case/:id/customer', requireKycMutationPermission('params'), bustMemberCache, updateCaseCustomer);
 // Multer must parse the multipart body before the ownership middleware can read
 // kyc_case_id. Authentication/role checks have already run at router level.
-router.post('/upload', acceptUpload, requireKycMutationPermission('body'), uploadDocument);
+router.post('/upload', kycProcessingLimiter, acceptUpload, requireKycMutationPermission('body'), uploadDocument);
 router.get('/document/:id', requirePermission('clients', 'read'), getDocument);
-router.post('/document/:id/retry', requireKycMutationPermission('document'), retryDocument);
-router.post('/case/:id/extract-preview', requirePermission('clients', 'read'), extractPreview);
+router.post('/document/:id/retry', kycProcessingLimiter, requireKycMutationPermission('document'), retryDocument);
+router.post('/case/:id/extract-preview', requirePermission('clients', 'read'), kycProcessingLimiter, extractPreview);
 router.post('/case/:id/verify', requireKycMutationPermission('params'), bustMemberCache, verifyCase);
 
 export default router;

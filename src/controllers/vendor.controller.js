@@ -2,6 +2,7 @@ import asyncHandler from '../utils/asyncHandler.js';
 import pool from '../config/db.js';
 import { buildVerifyUrl, ReceiptType } from '../utils/receiptToken.js';
 import { normalizeCashType } from '../utils/paymentMode.js';
+import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
 
 const asInt = (v) => parseInt(v, 10);
 
@@ -650,6 +651,7 @@ export const addVendorPayment = asyncHandler(async (req, res) => {
     assigned_admin_id,
     mapped_member_id,
     mapped_user_id,
+    bank_account_id,
   } = req.body;
 
   const paymentAmount = parseFloat(amount);
@@ -688,10 +690,16 @@ export const addVendorPayment = asyncHandler(async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(409).json({ message: `Payment exceeds the commitment balance by ${Math.max(0, paymentAmount - outstanding).toFixed(2)}` });
     }
+    const selectedBankAccountId = await resolveBankAccountSelection({
+      siteId,
+      paymentMode: vendorPayMode,
+      bankAccountId: bank_account_id,
+      db: client,
+    });
 
     const paymentResult = await client.query(
-      `INSERT INTO vendor_payments (commitment_id, site_id, payment_date, amount, payment_mode, reference_no, note, voucher_url, status, created_by, assigned_admin_id, cheque_no, cheque_status, mapped_member_id, mapped_user_id, approved_by, approved_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+      `INSERT INTO vendor_payments (commitment_id, site_id, payment_date, amount, payment_mode, reference_no, note, voucher_url, status, created_by, assigned_admin_id, cheque_no, cheque_status, mapped_member_id, mapped_user_id, approved_by, approved_at, bank_account_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
        RETURNING *`,
       [
         commitmentId, siteId, payment_date, paymentAmount, vendorPayMode,
@@ -703,6 +711,7 @@ export const addVendorPayment = asyncHandler(async (req, res) => {
         mapped_user_id ? parseInt(mapped_user_id) : null,
         approvedBy,
         approvedAt,
+        selectedBankAccountId,
       ]
     );
     await client.query('UPDATE vendor_commitments SET updated_at = CURRENT_TIMESTAMP WHERE id = $1', [commitmentId]);
@@ -731,6 +740,7 @@ export const updateVendorPayment = asyncHandler(async (req, res) => {
     voucher_url,
     assigned_admin_id,
     cheque_no,
+    bank_account_id,
   } = req.body;
 
   const nextAmount = parseFloat(amount);
@@ -744,13 +754,16 @@ export const updateVendorPayment = asyncHandler(async (req, res) => {
   // a tx but didn't actually enforce any invariant, so all that latency was
   // wasted. We compose the WHERE on the UPDATE so it stays atomic.
   const existingResult = await pool.query(
-    `SELECT id, site_id, commitment_id, assigned_admin_id, payment_mode, cheque_no, cheque_status, status, approved_by, approved_at
+    `SELECT id, site_id, commitment_id, assigned_admin_id, payment_mode, cheque_no, cheque_status, status, approved_by, approved_at, bank_account_id
      FROM vendor_payments WHERE id = $1`,
     [paymentId]
   );
   const existing = existingResult.rows[0];
   if (!existing || existing.site_id !== siteId) {
     return res.status(404).json({ message: 'Payment not found' });
+  }
+  if (String(existing.status || '').toLowerCase() !== 'pending') {
+    return res.status(409).json({ message: 'Posted vendor payments are immutable. Use the reversal workflow to correct this payment.' });
   }
 
   const nextPaymentMode = normalizeCashType(payment_mode !== undefined ? payment_mode : existing.payment_mode);
@@ -762,23 +775,37 @@ export const updateVendorPayment = asyncHandler(async (req, res) => {
         ? (cheque_no ? String(cheque_no).trim() : null)
         : (normalizeCashType(existing.payment_mode) === 'cheque' ? existing.cheque_no || null : null))
     : null;
-  const nextStatus = nextPaymentMode === 'cheque'
-    ? existing.status
-    : (existing.status === 'pending' ? 'approved' : existing.status);
-  const nextApprovedBy = nextStatus === 'approved'
-    ? (existing.approved_by || req.user.id)
-    : existing.approved_by;
-  const nextApprovedAt = nextStatus === 'approved'
-    ? (existing.approved_at || new Date())
-    : existing.approved_at;
+  const selectedBankAccountId = await resolveBankAccountSelection({
+    siteId,
+    paymentMode: nextPaymentMode,
+    bankAccountId: bank_account_id !== undefined ? bank_account_id : existing.bank_account_id,
+  });
   const updatedPaymentResult = await pool.query(
-    `UPDATE vendor_payments
+    `WITH commitment AS (
+       SELECT contract_amount
+         FROM vendor_commitments
+        WHERE id = $13 AND site_id = $12
+        FOR UPDATE
+     ), sibling_totals AS (
+       SELECT COALESCE(SUM(amount), 0) AS committed_amount
+         FROM vendor_payments
+        WHERE commitment_id = $13 AND id <> $11
+          AND LOWER(COALESCE(status, '')) NOT IN ('rejected', 'cancelled')
+          AND UPPER(COALESCE(cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+     ), eligible AS (
+       SELECT 1 FROM commitment, sibling_totals
+        WHERE $2::numeric <= commitment.contract_amount - sibling_totals.committed_amount + 0.005
+     )
+     UPDATE vendor_payments vp
         SET payment_date = $1, amount = $2, payment_mode = $3,
             reference_no = $4, note = $5, voucher_url = $6,
             assigned_admin_id = $7, cheque_no = $8, cheque_status = $9,
-            status = $10, approved_by = $11, approved_at = $12
-      WHERE id = $13 AND site_id = $14
-     RETURNING *`,
+            status = 'pending', approved_by = NULL, approved_at = NULL,
+            bank_account_id = $10
+       FROM eligible
+      WHERE vp.id = $11 AND vp.site_id = $12 AND vp.commitment_id = $13
+        AND LOWER(COALESCE(vp.status, '')) = 'pending'
+     RETURNING vp.*`,
     [
       payment_date,
       nextAmount,
@@ -789,13 +816,15 @@ export const updateVendorPayment = asyncHandler(async (req, res) => {
       assigned_admin_id !== undefined ? (assigned_admin_id ? parseInt(assigned_admin_id) : null) : existing.assigned_admin_id,
       nextChequeNo,
       nextChequeStatus,
-      nextStatus,
-      nextApprovedBy,
-      nextApprovedAt,
+      selectedBankAccountId,
       paymentId,
       siteId,
+      existing.commitment_id,
     ]
   );
+  if (!updatedPaymentResult.rows[0]) {
+    return res.status(409).json({ message: 'Payment exceeds the remaining commitment balance or is no longer editable' });
+  }
 
   // Touch parent (fire-and-forget).
   pool.query(

@@ -20,6 +20,15 @@ const shiftIsoDays = (iso, days) => {
   return date.toISOString().slice(0, 10);
 };
 
+const previousYearIso = (iso) => {
+  const [year, month, day] = iso.split('-').map(Number);
+  const candidate = new Date(Date.UTC(year - 1, month - 1, day));
+  // 29 February becomes 1 March in a non-leap year; CA comparatives should
+  // use the final valid day of the same month instead.
+  if (candidate.getUTCMonth() !== month - 1) candidate.setUTCDate(0);
+  return candidate.toISOString().slice(0, 10);
+};
+
 const presetRange = (preset) => {
   const today = todayInIndia();
   const [year, month] = today.split('-').map(Number);
@@ -73,29 +82,60 @@ export const getBalanceSheet = asyncHandler(async (req, res) => {
     : null;
   const grain = rangeDays !== null && rangeDays <= 62 ? 'day' : 'month';
 
-  const [siteResult, report] = await Promise.all([
-    pool.query('SELECT id, name, code, address, city, state FROM sites WHERE id = $1', [siteId]),
-    balanceSheetModel.getReport({
-      siteId,
-      dateFrom,
-      dateTo,
-      scope,
-      source,
-      paymentMode,
-      direction,
-      search,
-      limit,
-      grain,
-    }),
-  ]);
+  const organizationId = Number(req.user?.organization_id);
+  const siteResult = await pool.query(
+    `SELECT
+       s.id, s.name, s.code, s.address, s.city, s.state,
+       o.name AS organization_name,
+       ok.company_name, ok.registered_address, ok.gst_number, ok.director_name
+     FROM sites s
+     JOIN organizations o ON o.id = s.organization_id
+     LEFT JOIN organization_kyc ok ON ok.organization_id = o.id
+     WHERE s.id = $1 AND s.organization_id = $2`,
+    [siteId, organizationId],
+  );
+  const siteRow = siteResult.rows[0];
+  if (!siteRow) return res.status(404).json({ message: 'Site not found' });
 
-  const site = siteResult.rows[0];
-  if (!site) return res.status(404).json({ message: 'Site not found' });
+  const requestedComparative = String(req.query.comparative_to || '').trim();
+  if (requestedComparative && !DATE_RE.test(requestedComparative)) {
+    return res.status(400).json({ message: 'comparative_to must be YYYY-MM-DD' });
+  }
+  const comparativeTo = requestedComparative || previousYearIso(dateTo || todayInIndia());
+  const report = await balanceSheetModel.getReport({
+    siteId,
+    dateFrom,
+    dateTo,
+    scope,
+    source,
+    paymentMode,
+    direction,
+    search,
+    limit,
+    grain,
+    comparativeTo,
+  });
+
+  const site = {
+    id: siteRow.id,
+    name: siteRow.name,
+    code: siteRow.code,
+    address: siteRow.address,
+    city: siteRow.city,
+    state: siteRow.state,
+  };
+  const organization = {
+    name: siteRow.company_name || siteRow.organization_name,
+    registered_address: siteRow.registered_address || '',
+    gst_number: siteRow.gst_number || '',
+    director_name: siteRow.director_name || '',
+  };
 
   res.json({
     site,
+    organization,
     scope,
-    period: { preset, date_from: dateFrom, date_to: dateTo, grain },
+    period: { preset, date_from: dateFrom, date_to: dateTo, comparative_to: comparativeTo, grain },
     filters: { source, payment_mode: paymentMode, direction, q: search },
     ...report,
   });

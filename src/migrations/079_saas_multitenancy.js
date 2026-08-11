@@ -8,7 +8,7 @@ import { hashPassword } from '../config/jwt.js';
  *  - organization_id on users + sites (every other table is already site-scoped)
  *  - backfills all pre-SaaS rows into a "Default Organization" with a long-lived
  *    subscription so the existing deployment keeps working untouched
- *  - seeds the platform owner login (owner@gmail.com / owner@123)
+ *  - optionally bootstraps a platform owner from explicit deployment secrets
  */
 const migrate = async () => {
   const client = await pool.connect();
@@ -119,17 +119,54 @@ const migrate = async () => {
       }
     }
 
-    // ── Seed platform owner ──
-    const { rows: owner } = await client.query(`SELECT id FROM users WHERE email = 'owner@gmail.com' LIMIT 1`);
-    if (!owner.length) {
-      const hashed = await hashPassword('owner@123');
-      await client.query(
-        `INSERT INTO users (name, email, password, role, is_active, token_version)
-         VALUES ('Platform Owner', 'owner@gmail.com', $1, 'owner', true, 1)`,
-        [hashed]
+    // ── Secure platform-owner bootstrap ──
+    // Never create or promote an account from source-controlled credentials.
+    // The legacy public account is disabled even if this migration ran before;
+    // its sessions are revoked through token_version as part of the same write.
+    await client.query(
+      `UPDATE users
+          SET is_active = false,
+              token_version = COALESCE(token_version, 0) + 1,
+              refresh_token = NULL
+        WHERE lower(email) = 'owner@gmail.com' AND role = 'owner' AND is_active = true`,
+    );
+
+    const ownerEmail = String(process.env.PLATFORM_OWNER_EMAIL || '').trim().toLowerCase();
+    const ownerPassword = String(process.env.PLATFORM_OWNER_PASSWORD || '');
+    if ((ownerEmail && !ownerPassword) || (!ownerEmail && ownerPassword)) {
+      throw new Error('PLATFORM_OWNER_EMAIL and PLATFORM_OWNER_PASSWORD must be configured together');
+    }
+    if (ownerEmail) {
+      if (ownerEmail === 'owner@gmail.com') {
+        throw new Error('PLATFORM_OWNER_EMAIL must not use the revoked legacy owner address');
+      }
+      if (ownerPassword.length < 16 || !/[a-z]/.test(ownerPassword) || !/[A-Z]/.test(ownerPassword)
+        || !/\d/.test(ownerPassword) || !/[^A-Za-z0-9]/.test(ownerPassword)) {
+        throw new Error('PLATFORM_OWNER_PASSWORD must be 16+ characters with upper, lower, number and symbol');
+      }
+
+      const { rows: existing } = await client.query(
+        'SELECT id, role FROM users WHERE lower(email) = $1 LIMIT 1',
+        [ownerEmail],
       );
-    } else {
-      await client.query(`UPDATE users SET role = 'owner', organization_id = NULL WHERE email = 'owner@gmail.com'`);
+      if (existing[0] && existing[0].role !== 'owner') {
+        throw new Error('Refusing to promote an existing tenant user to platform owner');
+      }
+      if (!existing[0]) {
+        const hashed = await hashPassword(ownerPassword);
+        await client.query(
+          `INSERT INTO users (name, email, password, role, organization_id, is_active, token_version)
+           VALUES ('Platform Owner', $1, $2, 'owner', NULL, true, 1)`,
+          [ownerEmail, hashed],
+        );
+      }
+    }
+
+    const { rows: activeOwners } = await client.query(
+      `SELECT 1 FROM users WHERE role = 'owner' AND is_active = true LIMIT 1`,
+    );
+    if (!activeOwners.length && process.env.NODE_ENV === 'production') {
+      throw new Error('No active platform owner. Configure a unique PLATFORM_OWNER_EMAIL and strong PLATFORM_OWNER_PASSWORD once');
     }
 
     await client.query('COMMIT');

@@ -145,12 +145,13 @@ test('only approved cleared receipts reduce schedule due and overdue balances', 
   assert.match(controller, /NOT IN \('BOUNCED','RETURNED'\)/);
 });
 
-test('cancellation preserves receipts and releases a zero-refund property only after admin decision', async () => {
+test('cancellation preserves receipts and posts refunds through the canonical bank-mapped Day Book path', async () => {
   const controller = await readFile(new URL('../src/controllers/propertyLifecycle.controller.js', import.meta.url), 'utf8');
   assert.match(controller, /releaseWithoutRefund/);
   assert.match(controller, /current_booking_id=NULL/);
   assert.match(controller, /INSERT INTO day_book/);
-  assert.match(controller, /INSERT INTO firm_transactions/);
+  assert.match(controller, /bank_account_id/);
+  assert.doesNotMatch(controller, /INSERT INTO firm_transactions/);
   assert.doesNotMatch(controller, /DELETE FROM plot_payments/);
 });
 

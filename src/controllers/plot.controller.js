@@ -7,6 +7,7 @@ import { normalizeCashType } from '../utils/paymentMode.js';
 import { resolveCollectionGuard } from '../services/collectionGuard.service.js';
 import { money, positiveId } from '../services/propertyLifecycle.service.js';
 import { writeComplianceAudit } from '../utils/complianceAccess.js';
+import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
 
 const normalizePlotPaymentType = (paymentType) => {
   // payment_type is the accounting settlement field. payment_from describes
@@ -422,7 +423,7 @@ export const searchPlots = asyncHandler(async (req, res) => {
 /** GET /plots/:id — Get single plot with totals */
 export const getPlot = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const plot = await plotModel.findByIdWithTotals(parseInt(id), pool);
+  const plot = await plotModel.findByIdWithTotals(positiveId(id, 'plot_id'), pool);
   if (!plot) return res.status(404).json({ message: 'Plot not found' });
   res.json({ plot });
 });
@@ -708,13 +709,19 @@ export const createPayment = asyncHandler(async (req, res) => {
         );
         agreementId = agreements[0]?.id || null;
       }
+      const selectedBankAccountId = await resolveBankAccountSelection({
+        siteId: plot.site_id,
+        paymentMode: normalizedPaymentType,
+        bankAccountId: req.body.bank_account_id,
+        db: client,
+      });
       const { rows: inserted } = await client.query(
         `INSERT INTO plot_payments (
            plot_id,site_id,date,payment_from,payment_type,bank_details,bank_name,branch,narration,amount,
            created_by,voucher_url,assigned_admin_id,status,cheque_no,cheque_status,buyer_name,booked_by,
            mapped_member_id,mapped_user_id,booking_id,allottee_member_id,rera_project_id,rera_project_phase_id,
-           agreement_id,firm_id,idempotency_key,ruleset_decision,reconciliation_status
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending',$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,'UNMATCHED')
+           agreement_id,firm_id,idempotency_key,ruleset_decision,reconciliation_status,bank_account_id
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending',$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,'UNMATCHED',$28)
          RETURNING *`,
         [plotIdInt, plot.site_id, date || todayInIndia(), payment_from ? payment_from.trim().toUpperCase() : null,
           normalizedPaymentType, bank_details ? bank_details.trim().toUpperCase() : null,
@@ -728,7 +735,8 @@ export const createPayment = asyncHandler(async (req, res) => {
           booked_by ? booked_by.trim().toUpperCase() : null, effectiveMemberId,
           effectiveUserId, bookingId,
           effectiveMemberId, plot.booking_project_id || plot.rera_project_id || null,
-          plot.booking_phase_id || plot.rera_project_phase_id || null, agreementId, requestedFirmId, idempotencyKey, decision],
+          plot.booking_phase_id || plot.rera_project_phase_id || null, agreementId, requestedFirmId, idempotencyKey, decision,
+          selectedBankAccountId],
       );
       payment = inserted[0];
       const receiptNo = `RCPT-${new Date().getFullYear()}-${String(payment.id).padStart(6, '0')}`;
@@ -759,63 +767,101 @@ export const listPayments = asyncHandler(async (req, res) => {
   const { plot_id } = req.query;
   if (!plot_id) return res.status(400).json({ message: 'plot_id is required' });
 
-  const plotIdInt = parseInt(plot_id);
+  const plotIdInt = positiveId(plot_id, 'plot_id');
 
-  // 4-way parallel reads (was already parallel — keep). Site lookup needs
-  // plot.site_id, but in practice that comes from the plot row itself —
-  // we can fold it into a single LATERAL JOIN to avoid the extra round-trip.
+  // The detail page needs the aggregate cards and both breakdowns together.
+  // Build them from one receipt population so we scan each payments table once
+  // instead of running a separate query for every card/breakdown.
   const plotPromise = pool.query(
     `SELECT p.*,
             COALESCE(agg.total_received, 0) AS total_received,
             COALESCE(agg.received_bank,  0) AS received_bank,
             COALESCE(agg.received_cash,  0) AS received_cash,
             COALESCE(agg.payment_count,  0) AS payment_count,
+            COALESCE(agg.from_breakdown, '[]'::json) AS _from_breakdown,
+            COALESCE(agg.received_by_breakdown, '[]'::json) AS _received_by_breakdown,
             s.name  AS _site_name,
             s.city  AS _site_city,
             s.state AS _site_state
        FROM plots p
        LEFT JOIN sites s ON s.id = p.site_id
        LEFT JOIN LATERAL (
-         SELECT
-           SUM(pp.amount) FILTER (
-             WHERE LOWER(COALESCE(pp.status, 'approved')) = 'approved'
-               AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
-           ) AS total_received,
-           SUM(pp.amount) FILTER (
-             WHERE ledger_bucket(pp.payment_type) <> 'cash'
-               AND LOWER(COALESCE(pp.status, 'approved')) = 'approved'
-               AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
-           ) AS received_bank,
-           SUM(pp.amount) FILTER (
-             WHERE ledger_bucket(pp.payment_type) = 'cash'
-               AND LOWER(COALESCE(pp.status, 'approved')) = 'approved'
-               AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
-           ) AS received_cash,
-           COUNT(*) FILTER (
-             WHERE LOWER(COALESCE(pp.status, 'approved')) = 'approved'
-               AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
-           )::int AS payment_count
-         FROM (
-           SELECT amount, payment_type, status, cheque_status
-           FROM plot_payments
-           WHERE plot_id = p.id
+         WITH receipts AS (
+           SELECT pp.amount, pp.payment_type, pp.payment_from, pp.received_by,
+                  (LOWER(COALESCE(pp.status, 'approved')) = 'approved'
+                    AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')) AS is_posted,
+                  'DIRECT'::varchar AS source
+             FROM plot_payments pp
+            WHERE pp.plot_id = p.id
            UNION ALL
-           SELECT amount, payment_mode AS payment_type, 'approved'::varchar AS status, cheque_status
-           FROM plot_installment_payments
-           WHERE plot_id = p.id
-         ) pp
+           SELECT pip.amount, pip.payment_mode, pip.payment_mode, NULL::varchar,
+                  UPPER(COALESCE(pip.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED'),
+                  'INSTALLMENT'::varchar AS source
+             FROM plot_installment_payments pip
+            WHERE pip.plot_id = p.id
+         )
+         SELECT
+           SUM(amount) FILTER (WHERE is_posted) AS total_received,
+           SUM(amount) FILTER (WHERE is_posted AND ledger_bucket(payment_type) <> 'cash') AS received_bank,
+           SUM(amount) FILTER (WHERE is_posted AND ledger_bucket(payment_type) = 'cash') AS received_cash,
+           COUNT(*) FILTER (WHERE is_posted)::int AS payment_count,
+           COALESCE((
+             SELECT json_agg(json_build_object(
+               'payment_from', payment_from,
+               'entries', entries,
+               'total_amount', total_amount,
+               'source', source
+             ) ORDER BY total_amount DESC)
+             FROM (
+               SELECT
+                 COALESCE(NULLIF(UPPER(TRIM(payment_from)), ''), NULLIF(UPPER(TRIM(payment_type)), ''), 'OTHER') AS payment_from,
+                 COUNT(*)::int AS entries,
+                 COALESCE(SUM(amount), 0) AS total_amount,
+                 CASE WHEN COUNT(DISTINCT source) = 1 THEN MIN(source) ELSE 'MIXED' END AS source
+               FROM receipts
+               WHERE is_posted
+               GROUP BY COALESCE(NULLIF(UPPER(TRIM(payment_from)), ''), NULLIF(UPPER(TRIM(payment_type)), ''), 'OTHER')
+             ) payment_from_summary
+           ), '[]'::json) AS from_breakdown,
+           COALESCE((
+             SELECT json_agg(json_build_object(
+               'received_by', received_by,
+               'entries', entries,
+               'total_amount', total_amount,
+               'source', source
+             ) ORDER BY total_amount DESC)
+             FROM (
+               SELECT
+                 CASE
+                   WHEN source = 'INSTALLMENT' THEN 'INSTALLMENT AUTO-POST'
+                   ELSE COALESCE(NULLIF(UPPER(TRIM(received_by)), ''), 'UNKNOWN')
+                 END AS received_by,
+                 COUNT(*)::int AS entries,
+                 COALESCE(SUM(amount), 0) AS total_amount,
+                 CASE WHEN COUNT(DISTINCT source) = 1 THEN MIN(source) ELSE 'MIXED' END AS source
+               FROM receipts
+               WHERE is_posted
+               GROUP BY CASE
+                 WHEN source = 'INSTALLMENT' THEN 'INSTALLMENT AUTO-POST'
+                 ELSE COALESCE(NULLIF(UPPER(TRIM(received_by)), ''), 'UNKNOWN')
+               END
+             ) received_by_summary
+           ), '[]'::json) AS received_by_breakdown
+         FROM receipts
        ) agg ON TRUE
       WHERE p.id = $1`,
     [plotIdInt]
   );
 
-  const [paymentsRes, plotRes, fromBreakdown, receivedByBreakdown] = await Promise.all([
+  const [paymentsRes, plotRes] = await Promise.all([
     pool.query(
       `SELECT pp.*, 'payment' AS source, u.name AS created_by_name,
+              assigned.name AS assigned_admin_name,
               b.booking_no,m.full_name AS allottee_name,rp.name AS project_name,rpp.name AS phase_name,
               COALESCE(alloc.items,'[]'::jsonb) AS schedule_allocations
          FROM plot_payments pp
          LEFT JOIN users u ON u.id = pp.created_by
+         LEFT JOIN users assigned ON assigned.id = pp.assigned_admin_id
          LEFT JOIN bookings b ON b.id=pp.booking_id
          LEFT JOIN members m ON m.id=pp.allottee_member_id
          LEFT JOIN rera_projects rp ON rp.id=pp.rera_project_id
@@ -831,11 +877,11 @@ export const listPayments = asyncHandler(async (req, res) => {
       [plotIdInt]
     ),
     plotPromise,
-    plotPaymentModel.getFromBreakdown(plotIdInt, pool),
-    plotPaymentModel.getReceivedByBreakdown(plotIdInt, pool),
   ]);
   const payments = paymentsRes.rows;
   const plot = plotRes.rows[0] || null;
+  const fromBreakdown = plot?._from_breakdown || [];
+  const receivedByBreakdown = plot?._received_by_breakdown || [];
 
   const siteRow = plot
     ? { name: plot._site_name, city: plot._site_city, state: plot._site_state }
@@ -844,6 +890,8 @@ export const listPayments = asyncHandler(async (req, res) => {
     delete plot._site_name;
     delete plot._site_city;
     delete plot._site_state;
+    delete plot._from_breakdown;
+    delete plot._received_by_breakdown;
   }
 
   const paymentsWithVerify = payments.map((p) => ({
@@ -876,16 +924,38 @@ export const getPayment = asyncHandler(async (req, res) => {
 /** PUT /plots/payments/:id — Update a payment */
 export const updatePayment = asyncHandler(async (req, res) => {
   const paymentId = parseInt(req.params.id);
-  const { date, payment_from, payment_type, bank_details, bank_name, branch, narration, amount, voucher_url, assigned_admin_id, buyer_name, booked_by, cheque_no, cheque_status, received_by } = req.body;
+  const { date, payment_from, payment_type, bank_details, bank_name, branch, narration, amount, voucher_url, assigned_admin_id, buyer_name, booked_by, cheque_no, cheque_status, received_by, bank_account_id } = req.body;
 
   const existing = await plotPaymentModel.findById(paymentId, pool);
   if (!existing) return res.status(404).json({ message: 'Payment not found' });
+  const { rows: paymentGuards } = await pool.query(
+    `SELECT
+       EXISTS (SELECT 1 FROM plot_payment_allocations WHERE plot_payment_id = $1) AS has_allocation,
+       EXISTS (SELECT 1 FROM plot_registry_payments WHERE source_plot_payment_id = $1) AS has_registry_link`,
+    [paymentId],
+  );
+  const posted = String(existing.status || 'approved').toLowerCase() === 'approved'
+    && !['BOUNCED', 'RETURNED'].includes(String(existing.cheque_status || '').toUpperCase());
+  const reconciled = !['', 'UNRECONCILED', 'PENDING'].includes(String(existing.reconciliation_status || '').toUpperCase());
+  if (posted || reconciled || paymentGuards[0]?.has_allocation || paymentGuards[0]?.has_registry_link) {
+    return res.status(409).json({ message: 'Posted or allocated payments are immutable. Use the audited reversal workflow to correct this payment.' });
+  }
+  if (amount !== undefined && (!Number.isFinite(Number(amount)) || Number(amount) <= 0)) {
+    return res.status(400).json({ message: 'Payment amount must be greater than 0' });
+  }
 
   const updateData = {};
   const normalizedPaymentType = payment_type !== undefined
     ? normalizePlotPaymentType(payment_type)
     : undefined;
   const effectivePaymentType = normalizedPaymentType ?? normalizePlotPaymentType(existing.payment_type);
+  if (bank_account_id !== undefined || normalizedPaymentType !== undefined) {
+    updateData.bank_account_id = await resolveBankAccountSelection({
+      siteId: existing.site_id,
+      paymentMode: effectivePaymentType,
+      bankAccountId: bank_account_id !== undefined ? bank_account_id : existing.bank_account_id,
+    });
+  }
   if (date !== undefined) updateData.date = date;
   if (payment_from !== undefined) updateData.payment_from = payment_from ? payment_from.trim().toUpperCase() : null;
   if (normalizedPaymentType !== undefined) {
@@ -902,7 +972,7 @@ export const updatePayment = asyncHandler(async (req, res) => {
   if (bank_name !== undefined) updateData.bank_name = bank_name ? bank_name.trim().toUpperCase() : null;
   if (branch !== undefined) updateData.branch = branch ? branch.trim().toUpperCase() : null;
   if (narration !== undefined) updateData.narration = narration ? narration.trim().toUpperCase() : null;
-  if (amount !== undefined) updateData.amount = parseFloat(amount) || 0;
+  if (amount !== undefined) updateData.amount = Number(amount);
   if (voucher_url !== undefined) updateData.voucher_url = voucher_url || null;
   if (assigned_admin_id !== undefined) updateData.assigned_admin_id = assigned_admin_id ? parseInt(assigned_admin_id) : null;
   if (buyer_name !== undefined) updateData.buyer_name = buyer_name ? buyer_name.trim().toUpperCase() : null;
@@ -937,15 +1007,21 @@ export const updatePayment = asyncHandler(async (req, res) => {
 /** DELETE /plots/payments/:id — Delete a payment */
 export const deletePayment = asyncHandler(async (req, res) => {
   const paymentId = parseInt(req.params.id);
-  const { rows: registryLinks } = await pool.query(
-    `SELECT id FROM plot_registry_payments
-      WHERE source_plot_payment_id = $1
-      LIMIT 1`,
+  const { rows: paymentGuards } = await pool.query(
+    `SELECT pp.status, pp.cheque_status, pp.reconciliation_status,
+       EXISTS (SELECT 1 FROM plot_registry_payments WHERE source_plot_payment_id = pp.id) AS has_registry_link,
+       EXISTS (SELECT 1 FROM plot_payment_allocations WHERE plot_payment_id = pp.id) AS has_allocation
+       FROM plot_payments pp WHERE pp.id = $1`,
     [paymentId]
   );
-  if (registryLinks[0]) {
+  const guard = paymentGuards[0];
+  if (!guard) return res.status(404).json({ message: 'Payment not found' });
+  const posted = String(guard.status || 'approved').toLowerCase() === 'approved'
+    && !['BOUNCED', 'RETURNED'].includes(String(guard.cheque_status || '').toUpperCase());
+  const reconciled = !['', 'UNRECONCILED', 'PENDING'].includes(String(guard.reconciliation_status || '').toUpperCase());
+  if (posted || reconciled || guard.has_registry_link || guard.has_allocation) {
     return res.status(409).json({
-      message: 'This payment is linked to a Plot Registry record. Remove the registry link before deleting it.',
+      message: 'Posted or allocated payments cannot be deleted. Use the audited reversal workflow.',
     });
   }
 

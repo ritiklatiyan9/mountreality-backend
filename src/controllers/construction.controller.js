@@ -82,7 +82,12 @@ export const listProjects = asyncHandler(async (req, res) => {
 export const createProject = asyncHandler(async (req, res) => {
   const siteId = requireSite(req, res); if (!siteId) return;
   const { organizationId } = constructionScope(req);
-  const { name, code, status, start_date, target_end_date, budget, notes, assigned_admin_id } = req.body;
+  const {
+    name, code, status, start_date, target_end_date, budget, notes, assigned_admin_id,
+    rera_project_id, rera_project_phase_id, scope_type, scope_label, plan_version,
+    cost_centre_code, baseline_start_date, baseline_end_date, revised_start_date,
+    revised_end_date, forecast_end_date, progress_method,
+  } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ message: 'Project name is required' });
   const assignedAdminId = assigned_admin_id ? positiveId(assigned_admin_id) : null;
   if (assigned_admin_id && !assignedAdminId) {
@@ -91,14 +96,39 @@ export const createProject = asyncHandler(async (req, res) => {
   if (!await userBelongsToSite(assignedAdminId, siteId, organizationId)) {
     return res.status(400).json({ message: 'Assigned admin is not available for this Site' });
   }
+  const reraProjectId = rera_project_id ? positiveId(rera_project_id) : null;
+  const reraPhaseId = rera_project_phase_id ? positiveId(rera_project_phase_id) : null;
+  if ((rera_project_id && !reraProjectId) || (rera_project_phase_id && !reraPhaseId) || (reraPhaseId && !reraProjectId)) {
+    return res.status(400).json({ message: 'A valid RERA Project and matching Phase are required' });
+  }
+  if (reraProjectId) {
+    const mapping = await pool.query(
+      `SELECT rp.id FROM rera_projects rp
+        LEFT JOIN rera_project_phases phase ON phase.id=$4 AND phase.organization_id=rp.organization_id
+         AND phase.site_id=rp.site_id AND phase.rera_project_id=rp.id AND phase.deleted_at IS NULL
+       WHERE rp.id=$1 AND rp.site_id=$2 AND rp.organization_id=$3 AND rp.deleted_at IS NULL
+         AND ($4::bigint IS NULL OR phase.id IS NOT NULL)`,
+      [reraProjectId, siteId, organizationId, reraPhaseId],
+    );
+    if (!mapping.rows[0]) return res.status(400).json({ message: 'RERA Project or Phase is outside this Site' });
+  }
   const { rows } = await pool.query(
-    `INSERT INTO construction_projects (site_id, name, code, status, start_date, target_end_date, budget, notes, assigned_admin_id, created_by)
-     SELECT $1,$2,$3,COALESCE($4,'PLANNING'),$5,$6,$7,$8,$9,$10
+    `INSERT INTO construction_projects (
+       organization_id,site_id,name,code,status,start_date,target_end_date,budget,notes,assigned_admin_id,created_by,
+       rera_project_id,rera_project_phase_id,scope_type,scope_label,plan_version,cost_centre_code,
+       baseline_start_date,baseline_end_date,revised_start_date,revised_end_date,forecast_end_date,progress_method
+     )
+     SELECT $11,$1,$2,$3,COALESCE($4,'PLANNING'),$5,$6,$7,$8,$9,$10,$12,$13,$14,$15,$16,$17,
+            COALESCE($18,$5),COALESCE($19,$6),COALESCE($20,$5),COALESCE($21,$6),COALESCE($22,$6),$23
        FROM sites s WHERE s.id = $1 AND s.organization_id = $11
      RETURNING *`,
     [siteId, name.trim(), code?.trim() || null, status?.toUpperCase() || null,
      start_date || null, target_end_date || null, num(budget) || 0, notes?.trim() || null,
-     assignedAdminId, req.user.id, organizationId]
+     assignedAdminId, req.user.id, organizationId, reraProjectId, reraPhaseId,
+     String(scope_type || 'GENERAL').toUpperCase(), scope_label?.trim() || null,
+     plan_version?.trim() || null, cost_centre_code?.trim() || null,
+     baseline_start_date || null, baseline_end_date || null, revised_start_date || null,
+     revised_end_date || null, forecast_end_date || null, String(progress_method || 'MANUAL').toUpperCase()]
   );
   if (!rows[0]) return res.status(404).json({ message: 'Site not found' });
   res.status(201).json({ project: rows[0] });
@@ -117,7 +147,7 @@ export const getProject = asyncHandler(async (req, res) => {
   const project = rows[0];
   if (!project) return res.status(404).json({ message: 'Project not found' });
 
-  const [tasks, requests, cost] = await Promise.all([
+  const [tasks, requests, cost, workPackages] = await Promise.all([
     pool.query(
       `SELECT t.* FROM construction_tasks t
         JOIN construction_projects p ON p.id = t.project_id AND p.site_id = $2
@@ -149,12 +179,22 @@ export const getProject = asyncHandler(async (req, res) => {
         WHERE im.movement_type='CONSUMPTION' AND im.project_id = $1 AND im.site_id = $2`,
       [id, siteId, organizationId],
     ),
+    pool.query(
+      `SELECT wp.*,u.name AS owner_name,next_owner.name AS next_action_owner_name
+         FROM construction_work_packages wp
+         LEFT JOIN users u ON u.id=wp.owner_user_id AND u.organization_id=wp.organization_id
+         LEFT JOIN users next_owner ON next_owner.id=wp.next_action_owner_id AND next_owner.organization_id=wp.organization_id
+        WHERE wp.construction_project_id=$1 AND wp.site_id=$2 AND wp.organization_id=$3 AND wp.deleted_at IS NULL
+        ORDER BY wp.code,wp.id`,
+      [id, siteId, organizationId],
+    ),
   ]);
 
   res.json({
     project: { ...project, actual_cost: parseFloat(cost.rows[0].actual_cost) || 0 },
     tasks: tasks.rows,
     material_requests: requests.rows,
+    work_packages: workPackages.rows,
   });
 });
 
@@ -162,17 +202,22 @@ export const updateProject = asyncHandler(async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const siteId = requireSite(req, res); if (!siteId) return;
   const { organizationId } = constructionScope(req);
-  const fields = ['name', 'code', 'status', 'start_date', 'target_end_date', 'actual_end_date', 'budget', 'progress_pct', 'notes', 'assigned_admin_id'];
+  const fields = [
+    'name', 'code', 'status', 'start_date', 'target_end_date', 'actual_end_date', 'budget',
+    'progress_pct', 'notes', 'assigned_admin_id', 'rera_project_id', 'rera_project_phase_id',
+    'scope_type', 'scope_label', 'plan_version', 'cost_centre_code', 'baseline_start_date',
+    'baseline_end_date', 'revised_start_date', 'revised_end_date', 'forecast_end_date', 'progress_method',
+  ];
   const sets = [];
   const params = [];
   for (const f of fields) {
     if (req.body[f] === undefined) continue;
     let v = req.body[f];
-    if (f === 'status') v = String(v).toUpperCase();
+    if (['status', 'scope_type', 'progress_method'].includes(f)) v = String(v).toUpperCase();
     else if (f === 'budget') v = num(v) || 0;
     else if (f === 'progress_pct') v = Math.max(0, Math.min(100, parseInt(v, 10) || 0));
-    else if (f === 'assigned_admin_id') v = v ? positiveId(v) : null;
-    else if (['start_date', 'target_end_date', 'actual_end_date'].includes(f)) v = v || null;
+    else if (['assigned_admin_id', 'rera_project_id', 'rera_project_phase_id'].includes(f)) v = v ? positiveId(v) : null;
+    else if (['start_date', 'target_end_date', 'actual_end_date', 'baseline_start_date', 'baseline_end_date', 'revised_start_date', 'revised_end_date', 'forecast_end_date'].includes(f)) v = v || null;
     else v = v === null ? null : String(v).trim() || null;
     params.push(v);
     sets.push(`${f} = $${params.length}`);
@@ -224,18 +269,37 @@ export const createTask = asyncHandler(async (req, res) => {
   const projectId = parseInt(req.params.id, 10);
   const siteId = requireSite(req, res); if (!siteId) return;
   const { organizationId } = constructionScope(req);
-  const { name, status, progress_pct, sequence, start_date, due_date } = req.body;
+  const {
+    name, status, progress_pct, sequence, start_date, due_date, work_package_id,
+    assignee_id, contractor_stakeholder_id, baseline_start_date, baseline_end_date,
+    revised_start_date, revised_end_date, forecast_end_date, progress_method,
+    weight, planned_quantity, completed_quantity, quantity_unit, blocker,
+  } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ message: 'Task name is required' });
   const { rows } = await pool.query(
-    `INSERT INTO construction_tasks (project_id, name, status, progress_pct, sequence, start_date, due_date, created_by)
-     SELECT p.id,$2,COALESCE($3,'PENDING'),$4,$5,$6,$7,$8
+    `INSERT INTO construction_tasks (
+       project_id,name,status,progress_pct,sequence,start_date,due_date,created_by,work_package_id,
+       assignee_id,contractor_stakeholder_id,baseline_start_date,baseline_end_date,revised_start_date,
+       revised_end_date,forecast_end_date,progress_method,weight,planned_quantity,completed_quantity,quantity_unit,blocker
+     )
+     SELECT p.id,$2,COALESCE($3,'PENDING'),$4,$5,$6,$7,$8,$11,$12,$13,
+            COALESCE($14,$6),COALESCE($15,$7),COALESCE($16,$6),COALESCE($17,$7),COALESCE($18,$7),$19,$20,$21,$22,$23,$24
        FROM construction_projects p
        JOIN sites s ON s.id = p.site_id AND s.organization_id = $10
+       LEFT JOIN construction_work_packages wp ON wp.id=$11 AND wp.construction_project_id=p.id
+        AND wp.organization_id=s.organization_id AND wp.site_id=p.site_id AND wp.deleted_at IS NULL
       WHERE p.id = $1 AND p.site_id = $9
+        AND ($11::bigint IS NULL OR wp.id IS NOT NULL)
      RETURNING *`,
     [projectId, name.trim(), status?.toUpperCase() || null,
      Math.max(0, Math.min(100, parseInt(progress_pct, 10) || 0)), parseInt(sequence, 10) || 0,
-     start_date || null, due_date || null, req.user.id, siteId, organizationId]
+     start_date || null, due_date || null, req.user.id, siteId, organizationId,
+     work_package_id ? positiveId(work_package_id) : null, assignee_id ? positiveId(assignee_id) : null,
+     contractor_stakeholder_id ? positiveId(contractor_stakeholder_id) : null,
+     baseline_start_date || null, baseline_end_date || null, revised_start_date || null,
+     revised_end_date || null, forecast_end_date || null, String(progress_method || 'MANUAL').toUpperCase(),
+     weight || null, planned_quantity || null, completed_quantity || null,
+     quantity_unit?.trim() || null, blocker?.trim() || null]
   );
   if (!rows[0]) return res.status(404).json({ message: 'Project not found' });
   res.status(201).json({ task: rows[0] });
@@ -245,15 +309,23 @@ export const updateTask = asyncHandler(async (req, res) => {
   const id = parseInt(req.params.taskId, 10);
   const siteId = requireSite(req, res); if (!siteId) return;
   const { organizationId } = constructionScope(req);
-  const fields = ['name', 'status', 'progress_pct', 'sequence', 'start_date', 'due_date'];
+  const fields = [
+    'name', 'status', 'progress_pct', 'sequence', 'start_date', 'due_date', 'work_package_id',
+    'assignee_id', 'contractor_stakeholder_id', 'baseline_start_date', 'baseline_end_date',
+    'revised_start_date', 'revised_end_date', 'forecast_end_date', 'actual_start_date',
+    'actual_end_date', 'progress_method', 'weight', 'planned_quantity', 'completed_quantity',
+    'quantity_unit', 'blocker',
+  ];
   const sets = [];
   const params = [];
   for (const f of fields) {
     if (req.body[f] === undefined) continue;
     let v = req.body[f];
-    if (f === 'status') v = String(v).toUpperCase();
+    if (['status', 'progress_method'].includes(f)) v = String(v).toUpperCase();
     else if (f === 'progress_pct') v = Math.max(0, Math.min(100, parseInt(v, 10) || 0));
     else if (f === 'sequence') v = parseInt(v, 10) || 0;
+    else if (['work_package_id', 'assignee_id', 'contractor_stakeholder_id'].includes(f)) v = v ? positiveId(v) : null;
+    else if (['weight', 'planned_quantity', 'completed_quantity'].includes(f)) v = v === '' || v === null ? null : Number(v);
     else if (f === 'name') v = String(v).trim();
     else v = v || null;
     params.push(v);
@@ -264,8 +336,11 @@ export const updateTask = asyncHandler(async (req, res) => {
   const idIndex = params.length - 2;
   const siteIndex = params.length - 1;
   const orgIndex = params.length;
+  const marksDone = req.body.status !== undefined && String(req.body.status).toUpperCase() === 'DONE';
   const { rows } = await pool.query(
-    `UPDATE construction_tasks t SET ${sets.join(', ')}, updated_at = NOW()
+    `UPDATE construction_tasks t SET ${sets.join(', ')}, workflow_version=workflow_version+1,
+        completed_at=${marksDone ? 'COALESCE(t.completed_at,NOW())' : 't.completed_at'},
+        updated_at = NOW()
       FROM construction_projects p, sites s
      WHERE t.id = $${idIndex} AND p.id = t.project_id AND p.site_id = $${siteIndex}
        AND s.id = p.site_id AND s.organization_id = $${orgIndex}
@@ -298,7 +373,7 @@ export const createMaterialRequest = asyncHandler(async (req, res) => {
   const projectId = parseInt(req.params.id, 10);
   const siteId = requireSite(req, res); if (!siteId) return;
   const { organizationId } = constructionScope(req);
-  const { task_id, note, items } = req.body;
+  const { task_id, work_package_id, note, items } = req.body;
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ message: 'At least one item is required' });
   const clean = items
     .map((i) => ({ material_id: parseInt(i.material_id, 10), qty: Number(i.qty ?? i.qty_requested) }))
@@ -317,12 +392,26 @@ export const createMaterialRequest = asyncHandler(async (req, res) => {
     if (!proj.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Project not found' }); }
     if (task_id) {
       const task = await client.query(
-        'SELECT 1 FROM construction_tasks WHERE id = $1 AND project_id = $2 LIMIT 1',
+        'SELECT work_package_id FROM construction_tasks WHERE id = $1 AND project_id = $2 LIMIT 1',
         [parseInt(task_id, 10), projectId],
       );
       if (!task.rows[0]) {
         await client.query('ROLLBACK');
         return res.status(400).json({ message: 'Task does not belong to this project' });
+      }
+      if (work_package_id && Number(task.rows[0].work_package_id) !== Number(work_package_id)) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'Task does not belong to this work package' });
+      }
+    }
+    if (work_package_id) {
+      const workPackage = await client.query(
+        'SELECT id FROM construction_work_packages WHERE id=$1 AND construction_project_id=$2 AND site_id=$3 AND organization_id=$4 AND deleted_at IS NULL',
+        [positiveId(work_package_id), projectId, siteId, organizationId],
+      );
+      if (!workPackage.rows[0]) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'Work package does not belong to this project' });
       }
     }
     const materialIds = [...new Set(clean.map((it) => it.material_id))];
@@ -336,9 +425,9 @@ export const createMaterialRequest = asyncHandler(async (req, res) => {
     }
 
     const reqRow = await client.query(
-      `INSERT INTO construction_material_requests (site_id, project_id, task_id, status, note, requested_by)
-       VALUES ($1,$2,$3,'REQUESTED',$4,$5) RETURNING *`,
-      [siteId, projectId, task_id || null, note?.trim() || null, req.user.id]
+      `INSERT INTO construction_material_requests (site_id, project_id, task_id, work_package_id, status, note, requested_by)
+       VALUES ($1,$2,$3,$4,'REQUESTED',$5,$6) RETURNING *`,
+      [siteId, projectId, task_id || null, work_package_id ? positiveId(work_package_id) : null, note?.trim() || null, req.user.id]
     );
     const request = reqRow.rows[0];
     for (const it of clean) {
@@ -430,6 +519,7 @@ export const issueMaterialRequest = asyncHandler(async (req, res) => {
         site_id: request.site_id, material_id: it.material_id, movement_type: 'ISSUE',
         qty: toIssue, rate: parseFloat(mat.rows[0]?.rate) || 0,
         project_id: request.project_id, task_id: request.task_id, request_id: request.id,
+        work_package_id: request.work_package_id,
         ref_type: 'material_request', ref_id: request.id, note: 'Issued against material request',
         created_by: req.user.id,
       }, client);
@@ -489,38 +579,79 @@ export const consumeMaterial = asyncHandler(async (req, res) => {
   const projectId = parseInt(req.params.id, 10);
   const siteId = requireSite(req, res); if (!siteId) return;
   const { organizationId } = constructionScope(req);
-  const { material_id, qty, task_id, note, rate } = req.body;
+  const { material_id, qty, task_id, work_package_id, note, rate } = req.body;
   const q = Number(qty);
   if (!material_id || !Number.isFinite(q) || q <= 0) return res.status(400).json({ message: 'material_id and a positive qty are required' });
-
-  const proj = await pool.query(
-    `SELECT p.site_id FROM construction_projects p
-      JOIN sites s ON s.id = p.site_id AND s.organization_id = $3
-     WHERE p.id = $1 AND p.site_id = $2`,
-    [projectId, siteId, organizationId],
-  );
-  if (!proj.rows[0]) return res.status(404).json({ message: 'Project not found' });
-  if (task_id) {
-    const task = await pool.query(
-      'SELECT 1 FROM construction_tasks WHERE id = $1 AND project_id = $2 LIMIT 1',
-      [parseInt(task_id, 10), projectId],
-    );
-    if (!task.rows[0]) return res.status(400).json({ message: 'Task does not belong to this project' });
+  const idempotencyKey = String(req.get('X-Idempotency-Key') || '').trim();
+  if (!/^[A-Za-z0-9._:-]{8,128}$/.test(idempotencyKey)) {
+    return res.status(400).json({ message: 'A valid X-Idempotency-Key header is required' });
   }
 
-  const mat = await pool.query('SELECT rate FROM inventory_materials WHERE id = $1 AND site_id = $2', [material_id, siteId]);
-  if (!mat.rows[0]) return res.status(404).json({ message: 'Material not found for this site' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const prior = await client.query(
+      'SELECT * FROM inventory_movements WHERE site_id=$1 AND idempotency_key=$2 LIMIT 1',
+      [siteId, idempotencyKey],
+    );
+    if (prior.rows[0]) {
+      await client.query('COMMIT');
+      return res.status(200).json({ movement: { ...prior.rows[0], idempotent: true } });
+    }
 
-  const stock = await inventoryModel.stockFor(material_id);
-  if (q > stock.on_hand) return res.status(400).json({ message: `Only ${stock.on_hand} in stock — cannot consume ${q}` });
+    const proj = await client.query(
+      `SELECT p.site_id FROM construction_projects p
+        JOIN sites s ON s.id = p.site_id AND s.organization_id = $3
+       WHERE p.id = $1 AND p.site_id = $2`,
+      [projectId, siteId, organizationId],
+    );
+    const mat = await client.query(
+      'SELECT id, rate FROM inventory_materials WHERE id = $1 AND site_id = $2 FOR UPDATE',
+      [material_id, siteId],
+    );
+    if (!proj.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Project not found' }); }
+    if (!mat.rows[0]) { await client.query('ROLLBACK'); return res.status(404).json({ message: 'Material not found for this site' }); }
 
-  const movement = await inventoryModel.insertMovement({
-    site_id: siteId, material_id, movement_type: 'CONSUMPTION', qty: q,
-    rate: rate !== undefined ? Number(rate) : parseFloat(mat.rows[0].rate) || 0,
-    project_id: projectId, task_id: task_id || null, ref_type: 'consumption',
-    note: note?.trim() || null, created_by: req.user.id,
-  });
-  res.status(201).json({ movement });
+    if (task_id) {
+      const task = await client.query(
+        'SELECT 1 FROM construction_tasks WHERE id = $1 AND project_id = $2 LIMIT 1',
+        [parseInt(task_id, 10), projectId],
+      );
+      if (!task.rows[0]) { await client.query('ROLLBACK'); return res.status(400).json({ message: 'Task does not belong to this project' }); }
+    }
+    if (work_package_id) {
+      const workPackage = await client.query(
+        `SELECT id FROM construction_work_packages WHERE id=$1 AND construction_project_id=$2
+          AND site_id=$3 AND organization_id=$4 AND deleted_at IS NULL`,
+        [positiveId(work_package_id), projectId, siteId, organizationId],
+      );
+      if (!workPackage.rows[0]) { await client.query('ROLLBACK'); return res.status(400).json({ message: 'Work package does not belong to this project' }); }
+    }
+
+    const stock = await inventoryModel.stockFor(material_id, client);
+    if (q > stock.available) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: `Only ${stock.available} available after reservations — cannot consume ${q}` });
+    }
+    const movementRate = rate !== undefined ? Number(rate) : parseFloat(mat.rows[0].rate) || 0;
+    if (!Number.isFinite(movementRate) || movementRate < 0) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'rate must be a non-negative number' });
+    }
+    const movement = await inventoryModel.insertMovement({
+      site_id: siteId, material_id, movement_type: 'CONSUMPTION', qty: q,
+      rate: movementRate, project_id: projectId, task_id: task_id || null,
+      ref_type: 'consumption', work_package_id: work_package_id ? positiveId(work_package_id) : null,
+      note: note?.trim() || null, created_by: req.user.id, idempotency_key: idempotencyKey,
+    }, client);
+    await client.query('COMMIT');
+    return res.status(movement?.idempotent ? 200 : 201).json({ movement });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 });
 
 // ── Dashboard summary ───────────────────────────────────────

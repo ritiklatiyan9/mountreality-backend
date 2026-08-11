@@ -3,6 +3,7 @@ import plotCommissionModel from '../models/PlotCommission.model.js';
 import { dayBookModel } from '../models/DayBook.model.js';
 import pool from '../config/db.js';
 import { classifyPaymentMode } from '../utils/paymentMode.js';
+import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
 
 const normalizePaymentMode = (raw) => String(raw || 'BANK').trim().toUpperCase() || 'BANK';
 const commissionScope = (req) => ({
@@ -42,7 +43,7 @@ const resolveChequeStatus = ({ currentMode, currentStatus, nextMode, requestedSt
  * Create a new commission entry
  */
 export const createCommission = asyncHandler(async (req, res) => {
-  const { site_id, date, particular, father_name, plot_no, plot_size, plot_rate, amount, by_note, payment_mode, remarks, voucher_url, assigned_admin_id, cheque_no } = req.body;
+  const { site_id, date, particular, father_name, plot_no, plot_size, plot_rate, amount, by_note, payment_mode, remarks, voucher_url, assigned_admin_id, cheque_no, bank_account_id } = req.body;
 
   if (!site_id) return res.status(400).json({ message: 'Site is required' });
   if (!particular) return res.status(400).json({ message: 'Particular (person name) is required' });
@@ -56,6 +57,11 @@ export const createCommission = asyncHandler(async (req, res) => {
   }
 
   const commissionPaymentMode = normalizePaymentMode(payment_mode || by_note);
+  const selectedBankAccountId = await resolveBankAccountSelection({
+    siteId,
+    paymentMode: commissionPaymentMode,
+    bankAccountId: bank_account_id,
+  });
   const isCheque = classifyPaymentMode(commissionPaymentMode) === 'cheque';
   const data = {
     site_id: siteId,
@@ -68,6 +74,7 @@ export const createCommission = asyncHandler(async (req, res) => {
     amount: parseFloat(amount) || 0,
     by_note: by_note ? by_note.trim() : null,
     payment_mode: commissionPaymentMode,
+    bank_account_id: selectedBankAccountId,
     cheque_no: isCheque && cheque_no ? String(cheque_no).trim() : null,
     cheque_status: isCheque ? 'PENDING' : null,
     remarks: remarks ? remarks.trim() : null,
@@ -92,6 +99,7 @@ export const createCommission = asyncHandler(async (req, res) => {
       credit: 0,
       remarks: remarks ? remarks.trim() : null,
       payment_mode: commissionPaymentMode,
+      bank_account_id: selectedBankAccountId,
       cheque_no: data.cheque_no,
       cheque_status: data.cheque_status,
       category: 'COMMISSION',
@@ -163,7 +171,7 @@ export const getCommission = asyncHandler(async (req, res) => {
 export const updateCommission = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { siteId, organizationId } = commissionScope(req);
-  const { date, particular, father_name, plot_no, plot_size, plot_rate, amount, by_note, payment_mode, remarks, voucher_url, cheque_no, cheque_status } = req.body;
+  const { date, particular, father_name, plot_no, plot_size, plot_rate, amount, by_note, payment_mode, remarks, voucher_url, cheque_no, cheque_status, bank_account_id } = req.body;
 
   const existing = await plotCommissionModel.findByIdScoped(
     parseInt(id), siteId, organizationId, pool,
@@ -188,6 +196,13 @@ export const updateCommission = asyncHandler(async (req, res) => {
     : currentPaymentMode;
   const currentIsCheque = classifyPaymentMode(currentPaymentMode) === 'cheque';
   const nextIsCheque = classifyPaymentMode(nextPaymentMode) === 'cheque';
+  if (payment_mode !== undefined || bank_account_id !== undefined) {
+    updateData.bank_account_id = await resolveBankAccountSelection({
+      siteId,
+      paymentMode: nextPaymentMode,
+      bankAccountId: bank_account_id !== undefined ? bank_account_id : existing.bank_account_id,
+    });
+  }
 
   if (payment_mode !== undefined) {
     updateData.payment_mode = nextPaymentMode;
@@ -243,6 +258,7 @@ export const updateCommission = asyncHandler(async (req, res) => {
         debit: parseFloat(updated.amount) || 0,
         remarks: updated.remarks || null,
         payment_mode: updated.payment_mode || 'BANK',
+        bank_account_id: updated.bank_account_id || null,
         cheque_no: updated.cheque_no || null,
         cheque_status: updated.cheque_status || null,
         status: updated.status || 'pending',

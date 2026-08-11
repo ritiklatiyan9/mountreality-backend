@@ -184,3 +184,8 @@ export const startSmsReminderScheduler = () => {
   timer.unref?.();
   console.log('[sms-reminders] hourly scheduler started');
 };
+
+export const stopSmsReminderScheduler = () => {
+  if (timer) clearInterval(timer);
+  timer = null;
+};

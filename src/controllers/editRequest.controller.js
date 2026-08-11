@@ -13,6 +13,7 @@ import { createRegistryRecord } from './registry.controller.js';
 import permissionModel from '../models/Permission.model.js';
 import pool from '../config/db.js';
 import { classifyPaymentMode, normalizeCashType } from '../utils/paymentMode.js';
+import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
 
 const canonicalPaymentMode = (raw) => {
   const bucket = classifyPaymentMode(raw);
@@ -183,6 +184,18 @@ const MODULE_MAP = {
           ? data.cheque_no || null
           : null;
       }
+      if (data.payment_mode !== undefined || data.bank_account_id !== undefined) {
+        const { rows } = await db.query(
+          `SELECT f.site_id FROM farmer_payments fp JOIN farmers f ON f.id=fp.farmer_id WHERE fp.id=$1 LIMIT 1`,
+          [parseInt(id)],
+        );
+        allowed.bank_account_id = await resolveBankAccountSelection({
+          siteId: rows[0]?.site_id,
+          paymentMode: allowed.payment_mode || current?.payment_mode,
+          bankAccountId: data.bank_account_id !== undefined ? data.bank_account_id : current?.bank_account_id,
+          db,
+        });
+      }
       if (Object.keys(allowed).length > 0) {
         return farmerPaymentModel.update(parseInt(id), allowed, db);
       }
@@ -245,6 +258,14 @@ const MODULE_MAP = {
           ? (data.cheque_status ? String(data.cheque_status).trim().toUpperCase() : 'PENDING')
           : null;
       }
+      if (data.payment_type !== undefined || data.bank_account_id !== undefined) {
+        allowed.bank_account_id = await resolveBankAccountSelection({
+          siteId: current?.site_id,
+          paymentMode: allowed.payment_type || current?.payment_type,
+          bankAccountId: data.bank_account_id !== undefined ? data.bank_account_id : current?.bank_account_id,
+          db,
+        });
+      }
       if (Object.keys(allowed).length > 0) {
         return plotPaymentModel.update(parseInt(id), allowed, db);
       }
@@ -283,6 +304,14 @@ const MODULE_MAP = {
             : null;
         }
       }
+      if (data.payment_mode !== undefined || data.bank_account_id !== undefined) {
+        allowed.bank_account_id = await resolveBankAccountSelection({
+          siteId: current?.site_id,
+          paymentMode: allowed.payment_mode || current?.payment_mode,
+          bankAccountId: data.bank_account_id !== undefined ? data.bank_account_id : current?.bank_account_id,
+          db,
+        });
+      }
       if (Object.keys(allowed).length > 0) {
         return dayBookModel.update(parseInt(id), allowed, db);
       }
@@ -311,6 +340,14 @@ const MODULE_MAP = {
           : null;
       } else if (data.cheque_no !== undefined) {
         allowed.cheque_no = classifyPaymentMode(current?.payment_mode) === 'cheque' ? data.cheque_no || null : null;
+      }
+      if (data.payment_mode !== undefined || data.bank_account_id !== undefined) {
+        allowed.bank_account_id = await resolveBankAccountSelection({
+          siteId: current?.site_id,
+          paymentMode: allowed.payment_mode || current?.payment_mode,
+          bankAccountId: data.bank_account_id !== undefined ? data.bank_account_id : current?.bank_account_id,
+          db,
+        });
       }
       if (data.debit !== undefined) allowed.debit = data.debit;
       if (data.credit !== undefined) allowed.credit = data.credit;
@@ -370,6 +407,18 @@ const MODULE_MAP = {
           ? data.cheque_no || null
           : null;
       }
+      if (data.payment_mode !== undefined || data.bank_account_id !== undefined) {
+        const { rows } = await db.query(
+          `SELECT f.site_id FROM farmer_payments fp JOIN farmers f ON f.id=fp.farmer_id WHERE fp.id=$1 LIMIT 1`,
+          [parseInt(id)],
+        );
+        fpUpdate.bank_account_id = await resolveBankAccountSelection({
+          siteId: rows[0]?.site_id,
+          paymentMode: fpUpdate.payment_mode || current?.payment_mode,
+          bankAccountId: data.bank_account_id !== undefined ? data.bank_account_id : current?.bank_account_id,
+          db,
+        });
+      }
       if (data.by_note !== undefined) fpUpdate.by_note = data.by_note;
       if (data.farmer_id !== undefined) fpUpdate.farmer_id = data.farmer_id;
       if (data.interest_rate !== undefined) fpUpdate.interest_rate = parseFloat(data.interest_rate) || 0;
@@ -389,6 +438,7 @@ const MODULE_MAP = {
         }
         if (fpUpdate.cheque_no !== undefined) dbUpdate.cheque_no = fpUpdate.cheque_no;
         if (fpUpdate.cheque_status !== undefined) dbUpdate.cheque_status = fpUpdate.cheque_status;
+        if (fpUpdate.bank_account_id !== undefined) dbUpdate.bank_account_id = fpUpdate.bank_account_id;
         if (Object.keys(dbUpdate).length > 0) {
           await dayBookModel.update(linkedDb.rows[0].id, dbUpdate, db);
         }
@@ -426,6 +476,14 @@ const MODULE_MAP = {
           ? data.cheque_no || null
           : null;
       }
+      if (data.payment_mode !== undefined || data.bank_account_id !== undefined) {
+        pcUpdate.bank_account_id = await resolveBankAccountSelection({
+          siteId: current?.site_id,
+          paymentMode: pcUpdate.payment_mode || current?.payment_mode,
+          bankAccountId: data.bank_account_id !== undefined ? data.bank_account_id : current?.bank_account_id,
+          db,
+        });
+      }
 
       if (Object.keys(pcUpdate).length > 0) {
         await plotCommissionModel.update(parseInt(id), pcUpdate, db);
@@ -440,6 +498,7 @@ const MODULE_MAP = {
         }
         if (pcUpdate.cheque_no !== undefined) dbUpdate.cheque_no = pcUpdate.cheque_no;
         if (pcUpdate.cheque_status !== undefined) dbUpdate.cheque_status = pcUpdate.cheque_status;
+        if (pcUpdate.bank_account_id !== undefined) dbUpdate.bank_account_id = pcUpdate.bank_account_id;
         if (Object.keys(dbUpdate).length > 0) {
           await dayBookModel.update(linkedDb.rows[0].id, dbUpdate, db);
         }
@@ -473,6 +532,14 @@ const MODULE_MAP = {
           ? data.cheque_no || null
           : null;
       }
+      if (data.payment_mode !== undefined || data.bank_account_id !== undefined) {
+        cfUpdate.bank_account_id = await resolveBankAccountSelection({
+          siteId: current?.site_id,
+          paymentMode: cfUpdate.cash_type || current?.cash_type || current?.payment_mode,
+          bankAccountId: data.bank_account_id !== undefined ? data.bank_account_id : current?.bank_account_id,
+          db,
+        });
+      }
 
       if (Object.keys(cfUpdate).length > 0) {
         await cashFlowEntryModel.update(parseInt(id), cfUpdate, db);
@@ -487,6 +554,7 @@ const MODULE_MAP = {
         }
         if (cfUpdate.cheque_no !== undefined) dbUpdate.cheque_no = cfUpdate.cheque_no;
         if (cfUpdate.cheque_status !== undefined) dbUpdate.cheque_status = cfUpdate.cheque_status;
+        if (cfUpdate.bank_account_id !== undefined) dbUpdate.bank_account_id = cfUpdate.bank_account_id;
         if (Object.keys(dbUpdate).length > 0) {
           await dayBookModel.update(linkedDb.rows[0].id, dbUpdate, db);
         }
@@ -522,6 +590,14 @@ const MODULE_MAP = {
           ? data.firm_cheque_no || null
           : null;
       }
+      if (data.payment_mode !== undefined || data.bank_account_id !== undefined) {
+        ftUpdate.bank_account_id = await resolveBankAccountSelection({
+          siteId: current?.site_id,
+          paymentMode: ftUpdate.payment_mode || current?.payment_mode,
+          bankAccountId: data.bank_account_id !== undefined ? data.bank_account_id : current?.bank_account_id,
+          db,
+        });
+      }
 
       if (Object.keys(ftUpdate).length > 0) {
         await firmTransactionModel.update(parseInt(id), ftUpdate, db);
@@ -536,6 +612,7 @@ const MODULE_MAP = {
         }
         if (ftUpdate.cheque_no !== undefined) dbUpdate.cheque_no = ftUpdate.cheque_no;
         if (ftUpdate.cheque_status !== undefined) dbUpdate.cheque_status = ftUpdate.cheque_status;
+        if (ftUpdate.bank_account_id !== undefined) dbUpdate.bank_account_id = ftUpdate.bank_account_id;
         if (Object.keys(dbUpdate).length > 0) {
           await dayBookModel.update(linkedDb.rows[0].id, dbUpdate, db);
         }
@@ -570,6 +647,14 @@ const MODULE_MAP = {
           ? data.pp_cheque_no || null
           : null;
       }
+      if (data.pp_payment_type !== undefined || data.bank_account_id !== undefined) {
+        ppUpdate.bank_account_id = await resolveBankAccountSelection({
+          siteId: current?.site_id,
+          paymentMode: ppUpdate.payment_type || current?.payment_type,
+          bankAccountId: data.bank_account_id !== undefined ? data.bank_account_id : current?.bank_account_id,
+          db,
+        });
+      }
       // For plot payments, the amount comes from credit (received) or debit (refund)
       if (data.credit !== undefined && parseFloat(data.credit) > 0) ppUpdate.amount = parseFloat(data.credit);
       else if (data.debit !== undefined && parseFloat(data.debit) > 0) ppUpdate.amount = -(parseFloat(data.debit));
@@ -588,6 +673,7 @@ const MODULE_MAP = {
         if (ppUpdate.payment_type !== undefined) dbUpdate.payment_mode = ppUpdate.payment_type;
         if (ppUpdate.cheque_no !== undefined) dbUpdate.cheque_no = ppUpdate.cheque_no;
         if (ppUpdate.cheque_status !== undefined) dbUpdate.cheque_status = ppUpdate.cheque_status;
+        if (ppUpdate.bank_account_id !== undefined) dbUpdate.bank_account_id = ppUpdate.bank_account_id;
         if (Object.keys(dbUpdate).length > 0) {
           await dayBookModel.update(linkedDb.rows[0].id, dbUpdate, db);
         }

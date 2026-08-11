@@ -11,6 +11,7 @@ import pool from '../config/db.js';
 import { buildVerifyUrl, ReceiptType } from '../utils/receiptToken.js';
 import { classifyPaymentMode, normalizeCashType, emptyBucketMap, BUCKETS } from '../utils/paymentMode.js';
 import { getRevenue, getExpenseBreakdown, getProfit } from '../graphql/services/kpi.service.js';
+import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
 
 // All-time bounds for endpoints that report a running total rather than a
 // date-windowed one (matches the wide bounds already used by getSiteCashflow).
@@ -44,6 +45,21 @@ const addIsoDays = (isoDate, days) => {
   const date = new Date(`${isoDate}T12:00:00Z`);
   date.setUTCDate(date.getUTCDate() + days);
   return date.toISOString().slice(0, 10);
+};
+
+const atomicWrite = async (work) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await work(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 };
 
 // ══════════════════════════════════════════════════
@@ -107,7 +123,7 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
     // Farmer payment fields
     farmer_id, interest_rate, interest_amount, by_note,
     assigned_admin_id, voucher_url,
-    mapped_member_id, mapped_user_id,
+    mapped_member_id, mapped_user_id, bank_account_id,
   } = req.body;
 
   if (!site_id) return res.status(400).json({ message: 'Site is required' });
@@ -132,6 +148,7 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
     const paymentDate = date || dateInIndia();
     const paymentAmount = parseFloat(debit) || 0;
     const farmerPaymentMode = payment_mode ? payment_mode.trim().toUpperCase() : 'BANK';
+    const selectedBankAccountId = await resolveBankAccountSelection({ siteId: site_id, paymentMode: farmerPaymentMode, bankAccountId: bank_account_id });
     const farmerBucket = classifyPaymentMode(farmerPaymentMode);
     const farmerChequeNo = farmerBucket === 'cheque' && req.body.cheque_no
       ? String(req.body.cheque_no).trim()
@@ -153,12 +170,13 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
       assigned_admin_id: assigned_admin_id ? parseInt(assigned_admin_id) : null,
       cheque_no: farmerChequeNo,
       cheque_status: farmerBucket === 'cheque' ? 'PENDING' : null,
+      bank_account_id: selectedBankAccountId,
     };
 
-    const farmerPayment = await farmerPaymentModel.create(fpData, pool);
-
-    // Also create the day book entry (linked via farmer_payment_id)
-    const dbData = {
+    // The authoritative payment and its Day Book mirror are one transaction.
+    const { farmerPayment, dayBookEntry } = await atomicWrite(async (db) => {
+      const farmerPayment = await farmerPaymentModel.create(fpData, db);
+      const dbData = {
       site_id: parseInt(site_id),
       date: paymentDate,
       particular: particular.trim().toUpperCase(),
@@ -178,9 +196,11 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
       voucher_url: voucher_url || null,
       farmer_payment_id: farmerPayment.id,
       assigned_admin_id: assigned_admin_id ? parseInt(assigned_admin_id) : null,
-    };
-
-    const dayBookEntry = await dayBookModel.create(dbData, pool);
+      bank_account_id: selectedBankAccountId,
+      };
+      const dayBookEntry = await dayBookModel.create(dbData, db);
+      return { farmerPayment, dayBookEntry };
+    });
     return res.status(201).json({
       entry: dayBookEntry,
       farmer_payment: farmerPayment,
@@ -196,6 +216,7 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
     const cDate = date || dateInIndia();
     const cAmount = parseFloat(debit) || 0;
     const commissionPaymentMode = payment_mode ? payment_mode.trim().toUpperCase() : 'BANK';
+    const selectedBankAccountId = await resolveBankAccountSelection({ siteId: site_id, paymentMode: commissionPaymentMode, bankAccountId: bank_account_id });
     const commissionBucket = classifyPaymentMode(commissionPaymentMode);
     const commissionChequeNo = commissionBucket === 'cheque' && req.body.cheque_no
       ? String(req.body.cheque_no).trim()
@@ -219,12 +240,12 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
       created_by: req.user.id,
       voucher_url: voucher_url || null,
       assigned_admin_id: assigned_admin_id ? parseInt(assigned_admin_id) : null,
+      bank_account_id: selectedBankAccountId,
     };
 
-    const commission = await plotCommissionModel.create(pcData, pool);
-
-    // Also create the day book entry (linked via commission_id)
-    const dbData = {
+    const { commission, dayBookEntry } = await atomicWrite(async (db) => {
+      const commission = await plotCommissionModel.create(pcData, db);
+      const dbData = {
       site_id: parseInt(site_id),
       date: cDate,
       particular: particular.trim().toUpperCase(),
@@ -244,9 +265,11 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
       voucher_url: voucher_url || null,
       commission_id: commission.id,
       assigned_admin_id: assigned_admin_id ? parseInt(assigned_admin_id) : null,
-    };
-
-    const dayBookEntry = await dayBookModel.create(dbData, pool);
+      bank_account_id: selectedBankAccountId,
+      };
+      const dayBookEntry = await dayBookModel.create(dbData, db);
+      return { commission, dayBookEntry };
+    });
     return res.status(201).json({
       entry: dayBookEntry,
       commission,
@@ -269,6 +292,7 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
     const cfDebit = parseFloat(debit) || 0;
     const cfCredit = parseFloat(credit) || 0;
     const cfCashType = normalizeCashType(payment_mode);
+    const selectedBankAccountId = await resolveBankAccountSelection({ siteId: site_id, paymentMode: cfCashType, bankAccountId: bank_account_id });
     const cashFlowChequeNo = cfCashType === 'cheque' && req.body.cheque_no
       ? String(req.body.cheque_no).trim()
       : null;
@@ -327,11 +351,16 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
       created_by: req.user.id,
       voucher_url: voucher_url || null,
       assigned_admin_id: assigned_admin_id ? parseInt(assigned_admin_id) : null,
+      bank_account_id: selectedBankAccountId,
     };
-    const cfEntry = await cashFlowEntryModel.create(cfData, pool);
-
-    // Create the day book entry (linked via cash_flow_entry_id)
-    const dbData = {
+    const { cfEntry, dayBookEntry } = await atomicWrite(async (db) => {
+      // Lock the ledger row so a concurrent month lock cannot race this post.
+      const lockedMonth = await db.query('SELECT is_locked FROM cash_flow_months WHERE id=$1 FOR UPDATE', [monthRecord.id]);
+      if (!lockedMonth.rows[0] || lockedMonth.rows[0].is_locked) {
+        const error = new Error('Cash flow month is locked'); error.status = 409; throw error;
+      }
+      const cfEntry = await cashFlowEntryModel.create(cfData, db);
+      const dbData = {
       site_id: parseInt(site_id),
       date: cfDate,
       particular: particular.trim().toUpperCase(),
@@ -351,8 +380,11 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
       voucher_url: voucher_url || null,
       cash_flow_entry_id: cfEntry.id,
       assigned_admin_id: assigned_admin_id ? parseInt(assigned_admin_id) : null,
-    };
-    const dayBookEntry = await dayBookModel.create(dbData, pool);
+      bank_account_id: selectedBankAccountId,
+      };
+      const dayBookEntry = await dayBookModel.create(dbData, db);
+      return { cfEntry, dayBookEntry };
+    });
 
     return res.status(201).json({
       entry: dayBookEntry,
@@ -379,6 +411,7 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
 
     // Create the firm_transactions record
     const normMode = normalizeCashType(payment_mode);
+    const selectedBankAccountId = await resolveBankAccountSelection({ siteId: site_id, paymentMode: normMode, bankAccountId: bank_account_id });
     const ftData = {
       firm_id,
       site_id: parseInt(site_id),
@@ -397,13 +430,13 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
       created_by: req.user.id,
       voucher_url: voucher_url || null,
       assigned_admin_id: assigned_admin_id ? parseInt(assigned_admin_id) : null,
+      bank_account_id: selectedBankAccountId,
     };
 
-    const firmTxn = await firmTransactionModel.create(ftData, pool);
-
-    // Also create the day book entry (linked via firm_transaction_id)
     const upperMode = normMode.toUpperCase();
-    const dbData = {
+    const { firmTxn, dayBookEntry } = await atomicWrite(async (db) => {
+      const firmTxn = await firmTransactionModel.create(ftData, db);
+      const dbData = {
       site_id: parseInt(site_id),
       date: ftDate,
       particular: particular.trim().toUpperCase(),
@@ -425,9 +458,11 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
       voucher_url: voucher_url || null,
       firm_transaction_id: firmTxn.id,
       assigned_admin_id: assigned_admin_id ? parseInt(assigned_admin_id) : null,
-    };
-
-    const dayBookEntry = await dayBookModel.create(dbData, pool);
+      bank_account_id: selectedBankAccountId,
+      };
+      const dayBookEntry = await dayBookModel.create(dbData, db);
+      return { firmTxn, dayBookEntry };
+    });
     return res.status(201).json({
       entry: dayBookEntry,
       firm_transaction: firmTxn,
@@ -450,6 +485,7 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
     const ppAmount = parseFloat(credit) || parseFloat(debit) || 0;
     const ppPaymentFrom = req.body.pp_payment_from ? req.body.pp_payment_from.trim().toUpperCase() : null;
     const ppPaymentType = normalizePlotPaymentType(req.body.pp_payment_type ?? payment_mode);
+    const selectedBankAccountId = await resolveBankAccountSelection({ siteId: site_id, paymentMode: ppPaymentType, bankAccountId: bank_account_id });
     const ppBankDetails = req.body.pp_bank_details ? req.body.pp_bank_details.trim().toUpperCase() : null;
     const ppNarration = req.body.pp_narration ? req.body.pp_narration.trim().toUpperCase() : null;
     const ppReceivedBy = req.body.pp_received_by ? req.body.pp_received_by.trim().toUpperCase() : null;
@@ -472,12 +508,12 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
       created_by: req.user.id,
       voucher_url: voucher_url || null,
       assigned_admin_id: assigned_admin_id ? parseInt(assigned_admin_id) : null,
+      bank_account_id: selectedBankAccountId,
     };
 
-    const plotPayment = await plotPaymentModel.create(ppData, pool);
-
-    // Also create the day book entry (linked via plot_payment_id)
-    const dbData = {
+    const { plotPayment, dayBookEntry } = await atomicWrite(async (db) => {
+      const plotPayment = await plotPaymentModel.create(ppData, db);
+      const dbData = {
       site_id: parseInt(site_id),
       date: ppDate,
       particular: particular.trim().toUpperCase(),
@@ -499,9 +535,11 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
       voucher_url: voucher_url || null,
       plot_payment_id: plotPayment.id,
       assigned_admin_id: assigned_admin_id ? parseInt(assigned_admin_id) : null,
-    };
-
-    const dayBookEntry = await dayBookModel.create(dbData, pool);
+      bank_account_id: selectedBankAccountId,
+      };
+      const dayBookEntry = await dayBookModel.create(dbData, db);
+      return { plotPayment, dayBookEntry };
+    });
     return res.status(201).json({
       entry: dayBookEntry,
       plot_payment: plotPayment,
@@ -511,6 +549,7 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
 
   // ── Standard day book entry (non-special type) ──
   const stdMode = payment_mode ? payment_mode.trim().toUpperCase() : 'BANK';
+  const selectedBankAccountId = await resolveBankAccountSelection({ siteId: site_id, paymentMode: stdMode, bankAccountId: bank_account_id });
   const data = {
     site_id: site_id,
     date: date || dateInIndia(),
@@ -534,6 +573,7 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
     assigned_admin_id: assigned_admin_id ? parseInt(assigned_admin_id) : null,
     mapped_member_id: mapped_member_id ? parseInt(mapped_member_id) : null,
     mapped_user_id: mapped_user_id ? parseInt(mapped_user_id) : null,
+    bank_account_id: selectedBankAccountId,
   };
 
   const dayBookEntry = await dayBookModel.create(data, pool);
@@ -664,6 +704,7 @@ export const listDayBookEntries = asyncHandler(async (req, res) => {
     credit: exp.credit,
     remarks: null,
     payment_mode: exp.payment_mode,
+    bank_account_id: exp.bank_account_id,
     category: exp.category,
     from_entity: exp.from_entity,
     to_entity: exp.to_entity,
@@ -707,6 +748,7 @@ export const listDayBookEntries = asyncHandler(async (req, res) => {
       // 'SPLIT'). The old code read fp.particular here which is the narration,
       // not the mode — that's why Cash Day Book totals disagreed with Main.
       payment_mode: (fp.payment_mode || 'BANK').toUpperCase(),
+      bank_account_id: fp.bank_account_id,
       cash_amount: parseFloat(fp.cash_amount) || 0,
       bank_amount: parseFloat(fp.bank_amount) || 0,
       category: null,
@@ -749,6 +791,7 @@ export const listDayBookEntries = asyncHandler(async (req, res) => {
           cash_amount: parseFloat(fp.cash_amount) || 0,
           bank_amount: parseFloat(fp.bank_amount) || 0,
           payment_mode: (fp.payment_mode || e.payment_mode || 'BANK').toUpperCase(),
+          bank_account_id: fp.bank_account_id ?? e.bank_account_id,
           cheque_status: fp.cheque_status,
           cheque_no: fp.cheque_no,
           voucher_url: fp.voucher_url || e.voucher_url,
@@ -773,6 +816,7 @@ export const listDayBookEntries = asyncHandler(async (req, res) => {
           commission_amount: pc.amount,
           commission_by_note: pc.by_note,
           payment_mode: pc.payment_mode || e.payment_mode || 'BANK',
+          bank_account_id: pc.bank_account_id ?? e.bank_account_id,
           cheque_status: pc.cheque_status,
           cheque_no: pc.cheque_no,
           voucher_url: pc.voucher_url || e.voucher_url,
@@ -796,6 +840,7 @@ export const listDayBookEntries = asyncHandler(async (req, res) => {
           cf_year: cf.cf_year,
           cash_flow_month_id: cf.cash_flow_month_id,
           payment_mode: cf.cash_type,
+          bank_account_id: cf.bank_account_id ?? e.bank_account_id,
           cheque_status: cf.cheque_status,
           cheque_no: cf.cheque_no,
           voucher_url: cf.voucher_url || e.voucher_url,
@@ -822,6 +867,7 @@ export const listDayBookEntries = asyncHandler(async (req, res) => {
           firm_remark: ft.remark,
           firm_cheque_no: ft.cheque_no,
           payment_mode: ft.payment_mode ? ft.payment_mode.toUpperCase() : e.payment_mode,
+          bank_account_id: ft.bank_account_id ?? e.bank_account_id,
           cheque_status: ft.cheque_status,
           cheque_no: ft.cheque_no,
           voucher_url: ft.voucher_url || e.voucher_url,
@@ -850,6 +896,7 @@ export const listDayBookEntries = asyncHandler(async (req, res) => {
           // payment_type is the accounting settlement mode. payment_from is
           // descriptive only and can contain values such as BOOKING/REFUND.
           payment_mode: pp.payment_type,
+          bank_account_id: pp.bank_account_id ?? e.bank_account_id,
           pp_bank_details: pp.bank_details,
           pp_narration: pp.narration,
           pp_received_by: pp.received_by,
@@ -871,6 +918,7 @@ export const listDayBookEntries = asyncHandler(async (req, res) => {
           credit: 0,
           remarks: vp.note,
           payment_mode: vp.payment_mode ? String(vp.payment_mode).toUpperCase() : e.payment_mode,
+          bank_account_id: vp.bank_account_id ?? e.bank_account_id,
           to_entity: vp.vendor_name || e.to_entity,
           cheque_status: vp.cheque_status,
           cheque_no: vp.cheque_no,
@@ -905,6 +953,7 @@ export const listDayBookEntries = asyncHandler(async (req, res) => {
       credit: 0,
       remarks: c.remarks,
       payment_mode: c.payment_mode || 'BANK',
+      bank_account_id: c.bank_account_id,
       category: 'COMMISSION',
       from_entity: null,
       to_entity: c.particular,
@@ -946,6 +995,7 @@ export const listDayBookEntries = asyncHandler(async (req, res) => {
       credit: cf.credit,
       remarks: cf.remarks,
       payment_mode: cf.cash_type,
+      bank_account_id: cf.bank_account_id,
       category: 'CASH FLOW',
       from_entity: null,
       to_entity: null,
@@ -989,6 +1039,7 @@ export const listDayBookEntries = asyncHandler(async (req, res) => {
       credit: ft.credit,
       remarks: ft.remark,
       payment_mode: ft.payment_mode ? ft.payment_mode.toUpperCase() : null,
+      bank_account_id: ft.bank_account_id,
       category: 'FIRM',
       from_entity: null,
       to_entity: ft.firm_name,
@@ -1043,6 +1094,7 @@ export const listDayBookEntries = asyncHandler(async (req, res) => {
       credit: pp.amount,
       remarks: pp.narration,
       payment_mode: pp.payment_type,
+      bank_account_id: pp.bank_account_id,
       category: 'PLOT PAYMENT',
       from_entity: pp.buyer_name,
       to_entity: pp.plot_no,
@@ -1078,6 +1130,7 @@ export const listDayBookEntries = asyncHandler(async (req, res) => {
     credit: 0,
     remarks: vp.note,
     payment_mode: vp.payment_mode ? String(vp.payment_mode).toUpperCase() : null,
+    bank_account_id: vp.bank_account_id,
     category: 'VENDOR PAYMENT',
     from_entity: null,
     to_entity: vp.vendor_name,
@@ -1106,6 +1159,7 @@ export const listDayBookEntries = asyncHandler(async (req, res) => {
     credit: 0,
     remarks: pcp.remarks,
     payment_mode: pcp.payment_mode ? String(pcp.payment_mode).toUpperCase() : null,
+    bank_account_id: pcp.bank_account_id,
     category: 'COMMISSION',
     from_entity: null,
     to_entity: pcp.agent_name,
@@ -1134,6 +1188,7 @@ export const listDayBookEntries = asyncHandler(async (req, res) => {
     credit: pip.amount,
     remarks: pip.notes,
     payment_mode: pip.payment_mode ? String(pip.payment_mode).toUpperCase() : null,
+    bank_account_id: pip.bank_account_id,
     category: 'PLOT PAYMENT',
     from_entity: pip.buyer_name,
     to_entity: pip.plot_no,
@@ -1477,12 +1532,18 @@ export const updateDayBookEntry = asyncHandler(async (req, res) => {
   const {
     date, particular, entry_type, debit, credit, remarks,
     payment_mode, category, from_entity, to_entity, account_no, branch, voucher_url,
-    cheque_no, cheque_status,
+    cheque_no, cheque_status, bank_account_id,
   } = req.body;
 
   const nextPaymentMode = payment_mode !== undefined
     ? (payment_mode ? payment_mode.trim().toUpperCase() : 'BANK')
     : existing.payment_mode;
+  const resolvedBankAccountId = await resolveBankAccountSelection({
+    siteId: existing.site_id,
+    paymentMode: nextPaymentMode,
+    bankAccountId: bank_account_id !== undefined ? bank_account_id : existing.bank_account_id,
+    db: pool,
+  });
 
   const data = {
     date: date || existing.date,
@@ -1492,6 +1553,7 @@ export const updateDayBookEntry = asyncHandler(async (req, res) => {
     credit: credit !== undefined ? (parseFloat(credit) || 0) : existing.credit,
     remarks: remarks !== undefined ? (remarks ? remarks.trim() : null) : existing.remarks,
     payment_mode: nextPaymentMode,
+    bank_account_id: resolvedBankAccountId,
     category: category !== undefined ? (category ? category.trim().toUpperCase() : null) : existing.category,
     from_entity: from_entity !== undefined ? (from_entity ? from_entity.trim().toUpperCase() : null) : existing.from_entity,
     to_entity: to_entity !== undefined ? (to_entity ? to_entity.trim().toUpperCase() : null) : existing.to_entity,
@@ -1551,18 +1613,25 @@ export const updateExpenseFromDayBook = asyncHandler(async (req, res) => {
   const {
     date, particular, debit, credit,
     payment_mode, category, from_entity, to_entity, account_no, branch,
-    cheque_no, cheque_status,
+    cheque_no, cheque_status, bank_account_id,
   } = req.body;
 
   const nextExpenseMode = payment_mode !== undefined
     ? (payment_mode ? payment_mode.trim().toUpperCase() : 'BANK')
     : existing.payment_mode;
+  const resolvedBankAccountId = await resolveBankAccountSelection({
+    siteId: existing.site_id,
+    paymentMode: nextExpenseMode,
+    bankAccountId: bank_account_id !== undefined ? bank_account_id : existing.bank_account_id,
+    db: pool,
+  });
 
   const data = {
     date: date || existing.date,
     from_entity: from_entity !== undefined ? (from_entity ? from_entity.trim().toUpperCase() : null) : existing.from_entity,
     to_entity: to_entity !== undefined ? (to_entity ? to_entity.trim().toUpperCase() : null) : existing.to_entity,
     payment_mode: nextExpenseMode,
+    bank_account_id: resolvedBankAccountId,
     debit: debit !== undefined ? (parseFloat(debit) || 0) : existing.debit,
     credit: credit !== undefined ? (parseFloat(credit) || 0) : existing.credit,
     remark: particular !== undefined ? (particular ? particular.trim().toUpperCase() : null) : existing.remark,
@@ -1637,12 +1706,19 @@ export const updateFarmerPaymentFromDayBook = asyncHandler(async (req, res) => {
   const {
     date, particular, debit, payment_mode, remarks,
     farmer_id, interest_rate, interest_amount, by_note,
-    from_entity, to_entity, account_no, branch, category, cheque_no,
+    from_entity, to_entity, account_no, branch, category, cheque_no, bank_account_id,
   } = req.body;
 
   const farmerPaymentMode = payment_mode !== undefined
     ? (payment_mode ? payment_mode.trim().toUpperCase() : 'BANK')
     : String(existing.payment_mode || existing.particular || 'BANK').trim().toUpperCase();
+  const farmerSite = await pool.query('SELECT site_id FROM farmers WHERE id = $1', [existing.farmer_id]);
+  const resolvedBankAccountId = await resolveBankAccountSelection({
+    siteId: farmerSite.rows[0]?.site_id,
+    paymentMode: farmerPaymentMode,
+    bankAccountId: bank_account_id !== undefined ? bank_account_id : existing.bank_account_id,
+    db: pool,
+  });
 
   const nextAmount = debit !== undefined ? (parseFloat(debit) || 0) : (parseFloat(existing.amount) || 0);
   const allocationChanged = payment_mode !== undefined || debit !== undefined;
@@ -1654,6 +1730,7 @@ export const updateFarmerPaymentFromDayBook = asyncHandler(async (req, res) => {
     date: date || existing.date,
     particular: farmerPaymentMode,
     payment_mode: farmerPaymentMode,
+    bank_account_id: resolvedBankAccountId,
     amount: nextAmount,
     by_note: by_note !== undefined ? (by_note ? by_note.trim() : null) : existing.by_note,
     interest_rate: interest_rate !== undefined ? (parseFloat(interest_rate) || 0) : existing.interest_rate,
@@ -1690,34 +1767,35 @@ export const updateFarmerPaymentFromDayBook = asyncHandler(async (req, res) => {
       : null;
   }
 
-  const updatedFp = await farmerPaymentModel.update(parseInt(id), fpUpdate, pool);
-
-  // Also update any linked day_book entry
-  const linkedDbQuery = await pool.query(
-    'SELECT id FROM day_book WHERE farmer_payment_id = $1',
-    [parseInt(id)]
-  );
-  if (linkedDbQuery.rows.length > 0) {
-    const dbId = linkedDbQuery.rows[0].id;
-    const dbUpdate = {
-      date: date || existing.date,
-      particular: particular !== undefined ? particular.trim().toUpperCase() : undefined,
-      entry_type: 'FARMER PAYMENT',
-      debit: debit !== undefined ? (parseFloat(debit) || 0) : existing.amount,
-      remarks: remarks !== undefined ? (remarks ? remarks.trim() : null) : existing.remarks,
-      payment_mode: payment_mode !== undefined ? farmerPaymentMode : undefined,
-      from_entity: from_entity !== undefined ? (from_entity ? from_entity.trim().toUpperCase() : null) : undefined,
-      to_entity: to_entity !== undefined ? (to_entity ? to_entity.trim().toUpperCase() : null) : undefined,
-      account_no: account_no !== undefined ? (account_no ? account_no.trim().toUpperCase() : null) : undefined,
-      branch: branch !== undefined ? (branch ? branch.trim().toUpperCase() : null) : undefined,
-      category: category !== undefined ? (category ? category.trim().toUpperCase() : null) : undefined,
-      cheque_no: allocationChanged || cheque_no !== undefined ? fpUpdate.cheque_no : undefined,
-      cheque_status: allocationChanged ? fpUpdate.cheque_status : undefined,
-    };
-    // Remove undefined keys
-    Object.keys(dbUpdate).forEach(k => dbUpdate[k] === undefined && delete dbUpdate[k]);
-    await dayBookModel.update(dbId, dbUpdate, pool);
-  }
+  const updatedFp = await atomicWrite(async (db) => {
+    const updated = await farmerPaymentModel.update(parseInt(id), fpUpdate, db);
+    const linkedDbQuery = await db.query(
+      'SELECT id FROM day_book WHERE farmer_payment_id = $1 FOR UPDATE',
+      [parseInt(id)]
+    );
+    if (linkedDbQuery.rows.length > 0) {
+      const dbId = linkedDbQuery.rows[0].id;
+      const dbUpdate = {
+        date: date || existing.date,
+        particular: particular !== undefined ? particular.trim().toUpperCase() : undefined,
+        entry_type: 'FARMER PAYMENT',
+        debit: debit !== undefined ? (parseFloat(debit) || 0) : existing.amount,
+        remarks: remarks !== undefined ? (remarks ? remarks.trim() : null) : existing.remarks,
+        payment_mode: payment_mode !== undefined ? farmerPaymentMode : undefined,
+        bank_account_id: resolvedBankAccountId,
+        from_entity: from_entity !== undefined ? (from_entity ? from_entity.trim().toUpperCase() : null) : undefined,
+        to_entity: to_entity !== undefined ? (to_entity ? to_entity.trim().toUpperCase() : null) : undefined,
+        account_no: account_no !== undefined ? (account_no ? account_no.trim().toUpperCase() : null) : undefined,
+        branch: branch !== undefined ? (branch ? branch.trim().toUpperCase() : null) : undefined,
+        category: category !== undefined ? (category ? category.trim().toUpperCase() : null) : undefined,
+        cheque_no: allocationChanged || cheque_no !== undefined ? fpUpdate.cheque_no : undefined,
+        cheque_status: allocationChanged ? fpUpdate.cheque_status : undefined,
+      };
+      Object.keys(dbUpdate).forEach(k => dbUpdate[k] === undefined && delete dbUpdate[k]);
+      await dayBookModel.update(dbId, dbUpdate, db);
+    }
+    return updated;
+  });
 
   res.json({ entry: updatedFp, message: 'Farmer payment updated' });
 });
@@ -1732,11 +1810,10 @@ export const deleteFarmerPaymentFromDayBook = asyncHandler(async (req, res) => {
   const existing = await farmerPaymentModel.findById(fpId, pool);
   if (!existing) return res.status(404).json({ message: 'Farmer payment not found' });
 
-  // Delete linked day_book entry first (if any)
-  await pool.query('DELETE FROM day_book WHERE farmer_payment_id = $1', [fpId]);
-
-  // Delete the farmer payment
-  await farmerPaymentModel.delete(fpId, pool);
+  await atomicWrite(async (db) => {
+    await db.query('DELETE FROM day_book WHERE farmer_payment_id = $1', [fpId]);
+    await farmerPaymentModel.delete(fpId, db);
+  });
   res.json({ message: 'Farmer payment deleted from Day Book and Farmer Payments' });
 });
 
@@ -1773,12 +1850,18 @@ export const updateCommissionFromDayBook = asyncHandler(async (req, res) => {
   const {
     date, particular, debit, payment_mode, remarks,
     plot_no, by_note,
-    from_entity, to_entity, account_no, branch, category, cheque_no,
+    from_entity, to_entity, account_no, branch, category, cheque_no, bank_account_id,
   } = req.body;
 
   const commissionPaymentMode = payment_mode !== undefined
     ? (payment_mode ? payment_mode.trim().toUpperCase() : 'BANK')
     : String(existing.payment_mode || 'BANK').trim().toUpperCase();
+  const resolvedBankAccountId = await resolveBankAccountSelection({
+    siteId: existing.site_id,
+    paymentMode: commissionPaymentMode,
+    bankAccountId: bank_account_id !== undefined ? bank_account_id : existing.bank_account_id,
+    db: pool,
+  });
 
   // Update plot_commissions record
   const pcUpdate = {
@@ -1791,6 +1874,7 @@ export const updateCommissionFromDayBook = asyncHandler(async (req, res) => {
     amount: debit !== undefined ? (parseFloat(debit) || 0) : existing.amount,
     by_note: by_note !== undefined ? (by_note ? by_note.trim() : null) : existing.by_note,
     payment_mode: commissionPaymentMode,
+    bank_account_id: resolvedBankAccountId,
     remarks: remarks !== undefined ? (remarks ? remarks.trim() : null) : existing.remarks,
   };
   if (payment_mode !== undefined) {
@@ -1808,33 +1892,35 @@ export const updateCommissionFromDayBook = asyncHandler(async (req, res) => {
       : null;
   }
 
-  const updatedPc = await plotCommissionModel.update(parseInt(id), pcUpdate, pool);
-
-  // Also update any linked day_book entry
-  const linkedDbQuery = await pool.query(
-    'SELECT id FROM day_book WHERE commission_id = $1',
-    [parseInt(id)]
-  );
-  if (linkedDbQuery.rows.length > 0) {
-    const dbId = linkedDbQuery.rows[0].id;
-    const dbUpdate = {
-      date: date || existing.date,
-      particular: particular !== undefined ? particular.trim().toUpperCase() : undefined,
-      entry_type: 'PLOT COMMISSION',
-      debit: debit !== undefined ? (parseFloat(debit) || 0) : existing.amount,
-      remarks: remarks !== undefined ? (remarks ? remarks.trim() : null) : existing.remarks,
-      payment_mode: commissionPaymentMode,
-      from_entity: from_entity !== undefined ? (from_entity ? from_entity.trim().toUpperCase() : null) : undefined,
-      to_entity: to_entity !== undefined ? (to_entity ? to_entity.trim().toUpperCase() : null) : undefined,
-      account_no: account_no !== undefined ? (account_no ? account_no.trim().toUpperCase() : null) : undefined,
-      branch: branch !== undefined ? (branch ? branch.trim().toUpperCase() : null) : undefined,
-      category: category !== undefined ? (category ? category.trim().toUpperCase() : null) : undefined,
-      cheque_no: payment_mode !== undefined || cheque_no !== undefined ? pcUpdate.cheque_no : undefined,
-      cheque_status: payment_mode !== undefined ? pcUpdate.cheque_status : undefined,
-    };
-    Object.keys(dbUpdate).forEach(k => dbUpdate[k] === undefined && delete dbUpdate[k]);
-    await dayBookModel.update(dbId, dbUpdate, pool);
-  }
+  const updatedPc = await atomicWrite(async (db) => {
+    const updated = await plotCommissionModel.update(parseInt(id), pcUpdate, db);
+    const linkedDbQuery = await db.query(
+      'SELECT id FROM day_book WHERE commission_id = $1 FOR UPDATE',
+      [parseInt(id)]
+    );
+    if (linkedDbQuery.rows.length > 0) {
+      const dbId = linkedDbQuery.rows[0].id;
+      const dbUpdate = {
+        date: date || existing.date,
+        particular: particular !== undefined ? particular.trim().toUpperCase() : undefined,
+        entry_type: 'PLOT COMMISSION',
+        debit: debit !== undefined ? (parseFloat(debit) || 0) : existing.amount,
+        remarks: remarks !== undefined ? (remarks ? remarks.trim() : null) : existing.remarks,
+        payment_mode: commissionPaymentMode,
+        bank_account_id: resolvedBankAccountId,
+        from_entity: from_entity !== undefined ? (from_entity ? from_entity.trim().toUpperCase() : null) : undefined,
+        to_entity: to_entity !== undefined ? (to_entity ? to_entity.trim().toUpperCase() : null) : undefined,
+        account_no: account_no !== undefined ? (account_no ? account_no.trim().toUpperCase() : null) : undefined,
+        branch: branch !== undefined ? (branch ? branch.trim().toUpperCase() : null) : undefined,
+        category: category !== undefined ? (category ? category.trim().toUpperCase() : null) : undefined,
+        cheque_no: payment_mode !== undefined || cheque_no !== undefined ? pcUpdate.cheque_no : undefined,
+        cheque_status: payment_mode !== undefined ? pcUpdate.cheque_status : undefined,
+      };
+      Object.keys(dbUpdate).forEach(k => dbUpdate[k] === undefined && delete dbUpdate[k]);
+      await dayBookModel.update(dbId, dbUpdate, db);
+    }
+    return updated;
+  });
 
   res.json({ entry: updatedPc, message: 'Commission updated' });
 });
@@ -1849,11 +1935,10 @@ export const deleteCommissionFromDayBook = asyncHandler(async (req, res) => {
   const existing = await plotCommissionModel.findById(pcId, pool);
   if (!existing) return res.status(404).json({ message: 'Commission not found' });
 
-  // Delete linked day_book entry first (if any)
-  await pool.query('DELETE FROM day_book WHERE commission_id = $1', [pcId]);
-
-  // Delete the commission
-  await plotCommissionModel.delete(pcId, pool);
+  await atomicWrite(async (db) => {
+    await db.query('DELETE FROM day_book WHERE commission_id = $1', [pcId]);
+    await plotCommissionModel.delete(pcId, db);
+  });
   res.json({ message: 'Commission deleted from Day Book and Commissions' });
 });
 
@@ -1891,7 +1976,7 @@ export const updateCashFlowEntryFromDayBook = asyncHandler(async (req, res) => {
 
   const {
     date, particular, debit, credit, remarks,
-    payment_mode, from_entity, to_entity, account_no, branch, category, cheque_no,
+    payment_mode, from_entity, to_entity, account_no, branch, category, cheque_no, bank_account_id,
   } = req.body;
   const ledger_name = req.body.ledger_name ? req.body.ledger_name.trim().toUpperCase() : null;
 
@@ -1933,6 +2018,13 @@ export const updateCashFlowEntryFromDayBook = asyncHandler(async (req, res) => {
 
   // Update cash_flow_entries record
   const nextCashType = payment_mode !== undefined ? normalizeCashType(payment_mode) : undefined;
+  const effectiveCashType = nextCashType ?? existing.cash_type;
+  const resolvedBankAccountId = await resolveBankAccountSelection({
+    siteId: existing.site_id,
+    paymentMode: effectiveCashType,
+    bankAccountId: bank_account_id !== undefined ? bank_account_id : existing.bank_account_id,
+    db: pool,
+  });
   const cfUpdate = {
     cash_flow_month_id: targetMonthId,
     date: newDate,
@@ -1940,6 +2032,7 @@ export const updateCashFlowEntryFromDayBook = asyncHandler(async (req, res) => {
     debit: debit !== undefined ? (parseFloat(debit) || 0) : existing.debit,
     credit: credit !== undefined ? (parseFloat(credit) || 0) : existing.credit,
     remarks: remarks !== undefined ? (remarks ? remarks.trim() : null) : existing.remarks,
+    bank_account_id: resolvedBankAccountId,
     ...(nextCashType !== undefined && {
       cash_type: nextCashType,
       cheque_status: resolveChequeStatus({
@@ -1958,34 +2051,36 @@ export const updateCashFlowEntryFromDayBook = asyncHandler(async (req, res) => {
       : null;
   }
 
-  const updatedCf = await cashFlowEntryModel.update(parseInt(id), cfUpdate, pool);
-
-  // Also update any linked day_book entry
-  const linkedDbQuery = await pool.query(
-    'SELECT id FROM day_book WHERE cash_flow_entry_id = $1',
-    [parseInt(id)]
-  );
-  if (linkedDbQuery.rows.length > 0) {
-    const dbId = linkedDbQuery.rows[0].id;
-    const dbUpdate = {
-      date: newDate,
-      particular: particular !== undefined ? particular.trim().toUpperCase() : undefined,
-      entry_type: 'CASH FLOW',
-      debit: debit !== undefined ? (parseFloat(debit) || 0) : undefined,
-      credit: credit !== undefined ? (parseFloat(credit) || 0) : undefined,
-      remarks: remarks !== undefined ? (remarks ? remarks.trim() : null) : undefined,
-      payment_mode: nextCashType !== undefined ? nextCashType.toUpperCase() : undefined,
-      from_entity: from_entity !== undefined ? (from_entity ? from_entity.trim().toUpperCase() : null) : undefined,
-      to_entity: to_entity !== undefined ? (to_entity ? to_entity.trim().toUpperCase() : null) : undefined,
-      account_no: account_no !== undefined ? (account_no ? account_no.trim().toUpperCase() : null) : undefined,
-      branch: branch !== undefined ? (branch ? branch.trim().toUpperCase() : null) : undefined,
-      category: category !== undefined ? (category ? category.trim().toUpperCase() : null) : undefined,
-      cheque_no: nextCashType !== undefined || cheque_no !== undefined ? cfUpdate.cheque_no : undefined,
-      cheque_status: nextCashType !== undefined ? cfUpdate.cheque_status : undefined,
-    };
-    Object.keys(dbUpdate).forEach(k => dbUpdate[k] === undefined && delete dbUpdate[k]);
-    await dayBookModel.update(dbId, dbUpdate, pool);
-  }
+  const updatedCf = await atomicWrite(async (db) => {
+    const updated = await cashFlowEntryModel.update(parseInt(id), cfUpdate, db);
+    const linkedDbQuery = await db.query(
+      'SELECT id FROM day_book WHERE cash_flow_entry_id = $1 FOR UPDATE',
+      [parseInt(id)]
+    );
+    if (linkedDbQuery.rows.length > 0) {
+      const dbId = linkedDbQuery.rows[0].id;
+      const dbUpdate = {
+        date: newDate,
+        particular: particular !== undefined ? particular.trim().toUpperCase() : undefined,
+        entry_type: 'CASH FLOW',
+        debit: debit !== undefined ? (parseFloat(debit) || 0) : undefined,
+        credit: credit !== undefined ? (parseFloat(credit) || 0) : undefined,
+        remarks: remarks !== undefined ? (remarks ? remarks.trim() : null) : undefined,
+        payment_mode: nextCashType !== undefined ? nextCashType.toUpperCase() : undefined,
+        bank_account_id: resolvedBankAccountId,
+        from_entity: from_entity !== undefined ? (from_entity ? from_entity.trim().toUpperCase() : null) : undefined,
+        to_entity: to_entity !== undefined ? (to_entity ? to_entity.trim().toUpperCase() : null) : undefined,
+        account_no: account_no !== undefined ? (account_no ? account_no.trim().toUpperCase() : null) : undefined,
+        branch: branch !== undefined ? (branch ? branch.trim().toUpperCase() : null) : undefined,
+        category: category !== undefined ? (category ? category.trim().toUpperCase() : null) : undefined,
+        cheque_no: nextCashType !== undefined || cheque_no !== undefined ? cfUpdate.cheque_no : undefined,
+        cheque_status: nextCashType !== undefined ? cfUpdate.cheque_status : undefined,
+      };
+      Object.keys(dbUpdate).forEach(k => dbUpdate[k] === undefined && delete dbUpdate[k]);
+      await dayBookModel.update(dbId, dbUpdate, db);
+    }
+    return updated;
+  });
 
   res.json({ entry: updatedCf, message: 'Cash flow entry updated' });
 });
@@ -2006,11 +2101,10 @@ export const deleteCashFlowEntryFromDayBook = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'This cash flow month is locked.' });
   }
 
-  // Delete linked day_book entry first (if any)
-  await pool.query('DELETE FROM day_book WHERE cash_flow_entry_id = $1', [cfId]);
-
-  // Delete the cash flow entry
-  await cashFlowEntryModel.delete(cfId, pool);
+  await atomicWrite(async (db) => {
+    await db.query('DELETE FROM day_book WHERE cash_flow_entry_id = $1', [cfId]);
+    await cashFlowEntryModel.delete(cfId, db);
+  });
   res.json({ message: 'Cash flow entry deleted from Day Book and Cash Flow' });
 });
 
@@ -2041,11 +2135,18 @@ export const updateFirmTransactionFromDayBook = asyncHandler(async (req, res) =>
 
   const {
     date, particular, debit, credit, remarks,
-    payment_mode, from_entity, to_entity, account_no, branch, category,
+    payment_mode, from_entity, to_entity, account_no, branch, category, bank_account_id,
   } = req.body;
 
   // Update firm_transactions record
   const updNormMode = payment_mode !== undefined ? normalizeCashType(payment_mode) : undefined;
+  const effectiveFirmMode = updNormMode ?? existing.payment_mode;
+  const resolvedBankAccountId = await resolveBankAccountSelection({
+    siteId: existing.site_id,
+    paymentMode: effectiveFirmMode,
+    bankAccountId: bank_account_id !== undefined ? bank_account_id : existing.bank_account_id,
+    db: pool,
+  });
   const requestedFirmChequeNo = req.body.firm_cheque_no;
   const ftUpdate = {
     date: date || existing.date,
@@ -2055,6 +2156,7 @@ export const updateFirmTransactionFromDayBook = asyncHandler(async (req, res) =>
     name: req.body.firm_name !== undefined ? (req.body.firm_name ? req.body.firm_name.trim().toUpperCase() : null) : existing.name,
     purpose: req.body.firm_purpose !== undefined ? (req.body.firm_purpose ? req.body.firm_purpose.trim().toUpperCase() : null) : existing.purpose,
     remark: req.body.firm_remark !== undefined ? (req.body.firm_remark ? req.body.firm_remark.trim().toUpperCase() : null) : existing.remark,
+    bank_account_id: resolvedBankAccountId,
     cheque_no: requestedFirmChequeNo !== undefined
       ? (classifyPaymentMode(updNormMode ?? existing.payment_mode) === 'cheque' && requestedFirmChequeNo
         ? requestedFirmChequeNo.trim().toUpperCase()
@@ -2070,36 +2172,36 @@ export const updateFirmTransactionFromDayBook = asyncHandler(async (req, res) =>
     }),
   };
 
-  const updatedFt = await firmTransactionModel.update(parseInt(id), ftUpdate, pool);
-
-  // Also update any linked day_book entry
-  const linkedDbQuery = await pool.query(
-    'SELECT id FROM day_book WHERE firm_transaction_id = $1',
-    [parseInt(id)]
-  );
-  if (linkedDbQuery.rows.length > 0) {
-    const dbId = linkedDbQuery.rows[0].id;
-    const dbUpdate = {
-      date: date || existing.date,
-      particular: particular !== undefined ? particular.trim().toUpperCase() : undefined,
-      entry_type: 'FIRM TRANSACTION',
-      debit: debit !== undefined ? (parseFloat(debit) || 0) : undefined,
-      credit: credit !== undefined ? (parseFloat(credit) || 0) : undefined,
-      remarks: remarks !== undefined ? (remarks ? remarks.trim() : null) : undefined,
-      payment_mode: updNormMode !== undefined ? updNormMode.toUpperCase() : undefined,
-      from_entity: from_entity !== undefined ? (from_entity ? from_entity.trim().toUpperCase() : null) : undefined,
-      to_entity: to_entity !== undefined ? (to_entity ? to_entity.trim().toUpperCase() : null) : undefined,
-      account_no: account_no !== undefined ? (account_no ? account_no.trim().toUpperCase() : null) : undefined,
-      branch: branch !== undefined ? (branch ? branch.trim().toUpperCase() : null) : undefined,
-      category: category !== undefined ? (category ? category.trim().toUpperCase() : null) : undefined,
-      cheque_no: requestedFirmChequeNo !== undefined || updNormMode !== undefined ? ftUpdate.cheque_no : undefined,
-      cheque_status: updNormMode !== undefined
-        ? ftUpdate.cheque_status
-        : undefined,
-    };
-    Object.keys(dbUpdate).forEach(k => dbUpdate[k] === undefined && delete dbUpdate[k]);
-    await dayBookModel.update(dbId, dbUpdate, pool);
-  }
+  const updatedFt = await atomicWrite(async (db) => {
+    const updated = await firmTransactionModel.update(parseInt(id), ftUpdate, db);
+    const linkedDbQuery = await db.query(
+      'SELECT id FROM day_book WHERE firm_transaction_id = $1 FOR UPDATE',
+      [parseInt(id)]
+    );
+    if (linkedDbQuery.rows.length > 0) {
+      const dbId = linkedDbQuery.rows[0].id;
+      const dbUpdate = {
+        date: date || existing.date,
+        particular: particular !== undefined ? particular.trim().toUpperCase() : undefined,
+        entry_type: 'FIRM TRANSACTION',
+        debit: debit !== undefined ? (parseFloat(debit) || 0) : undefined,
+        credit: credit !== undefined ? (parseFloat(credit) || 0) : undefined,
+        remarks: remarks !== undefined ? (remarks ? remarks.trim() : null) : undefined,
+        payment_mode: updNormMode !== undefined ? updNormMode.toUpperCase() : undefined,
+        bank_account_id: resolvedBankAccountId,
+        from_entity: from_entity !== undefined ? (from_entity ? from_entity.trim().toUpperCase() : null) : undefined,
+        to_entity: to_entity !== undefined ? (to_entity ? to_entity.trim().toUpperCase() : null) : undefined,
+        account_no: account_no !== undefined ? (account_no ? account_no.trim().toUpperCase() : null) : undefined,
+        branch: branch !== undefined ? (branch ? branch.trim().toUpperCase() : null) : undefined,
+        category: category !== undefined ? (category ? category.trim().toUpperCase() : null) : undefined,
+        cheque_no: requestedFirmChequeNo !== undefined || updNormMode !== undefined ? ftUpdate.cheque_no : undefined,
+        cheque_status: updNormMode !== undefined ? ftUpdate.cheque_status : undefined,
+      };
+      Object.keys(dbUpdate).forEach(k => dbUpdate[k] === undefined && delete dbUpdate[k]);
+      await dayBookModel.update(dbId, dbUpdate, db);
+    }
+    return updated;
+  });
 
   res.json({ entry: updatedFt, message: 'Firm transaction updated' });
 });
@@ -2114,11 +2216,10 @@ export const deleteFirmTransactionFromDayBook = asyncHandler(async (req, res) =>
   const existing = await firmTransactionModel.findById(ftId, pool);
   if (!existing) return res.status(404).json({ message: 'Firm transaction not found' });
 
-  // Delete linked day_book entry first (if any)
-  await pool.query('DELETE FROM day_book WHERE firm_transaction_id = $1', [ftId]);
-
-  // Delete the firm transaction
-  await firmTransactionModel.delete(ftId, pool);
+  await atomicWrite(async (db) => {
+    await db.query('DELETE FROM day_book WHERE firm_transaction_id = $1', [ftId]);
+    await firmTransactionModel.delete(ftId, db);
+  });
   res.json({ message: 'Firm transaction deleted from Day Book and Firm Transactions' });
 });
 
@@ -2149,7 +2250,7 @@ export const updatePlotPaymentFromDayBook = asyncHandler(async (req, res) => {
 
   const {
     date, particular, debit, credit, remarks,
-    payment_mode, from_entity, to_entity, account_no, branch, category,
+    payment_mode, from_entity, to_entity, account_no, branch, category, bank_account_id,
   } = req.body;
 
   const ppAmount = parseFloat(credit) || parseFloat(debit) || 0;
@@ -2160,6 +2261,12 @@ export const updatePlotPaymentFromDayBook = asyncHandler(async (req, res) => {
       ? payment_mode
       : existing.payment_type;
   const ppPaymentType = normalizePlotPaymentType(requestedPaymentType);
+  const resolvedBankAccountId = await resolveBankAccountSelection({
+    siteId: existing.site_id,
+    paymentMode: ppPaymentType,
+    bankAccountId: bank_account_id !== undefined ? bank_account_id : existing.bank_account_id,
+    db: pool,
+  });
   const ppBankDetails = req.body.pp_bank_details !== undefined ? (req.body.pp_bank_details ? req.body.pp_bank_details.trim().toUpperCase() : null) : existing.bank_details;
   const ppNarration = req.body.pp_narration !== undefined ? (req.body.pp_narration ? req.body.pp_narration.trim().toUpperCase() : null) : existing.narration;
   const ppReceivedBy = req.body.pp_received_by !== undefined ? (req.body.pp_received_by ? req.body.pp_received_by.trim().toUpperCase() : null) : existing.received_by;
@@ -2176,6 +2283,7 @@ export const updatePlotPaymentFromDayBook = asyncHandler(async (req, res) => {
     date: date || existing.date,
     payment_from: ppPaymentFrom,
     payment_type: ppPaymentType,
+    bank_account_id: resolvedBankAccountId,
     bank_details: ppBankDetails,
     narration: ppNarration,
     received_by: ppReceivedBy,
@@ -2184,34 +2292,36 @@ export const updatePlotPaymentFromDayBook = asyncHandler(async (req, res) => {
     cheque_status: ppChequeStatus,
   };
 
-  const updatedPp = await plotPaymentModel.update(parseInt(id), ppUpdate, pool);
-
-  // Also update any linked day_book entry
-  const linkedDbQuery = await pool.query(
-    'SELECT id FROM day_book WHERE plot_payment_id = $1',
-    [parseInt(id)]
-  );
-  if (linkedDbQuery.rows.length > 0) {
-    const dbId = linkedDbQuery.rows[0].id;
-    const dbUpdate = {
-      date: date || existing.date,
-      particular: particular !== undefined ? particular.trim().toUpperCase() : undefined,
-      entry_type: 'PLOT PAYMENT',
-      debit: debit !== undefined ? (parseFloat(debit) || 0) : undefined,
-      credit: credit !== undefined ? (parseFloat(credit) || 0) : undefined,
-      remarks: remarks !== undefined ? (remarks ? remarks.trim() : null) : undefined,
-      payment_mode: ppPaymentType,
-      from_entity: from_entity !== undefined ? (from_entity ? from_entity.trim().toUpperCase() : null) : undefined,
-      to_entity: to_entity !== undefined ? (to_entity ? to_entity.trim().toUpperCase() : null) : undefined,
-      account_no: account_no !== undefined ? (account_no ? account_no.trim().toUpperCase() : null) : undefined,
-      branch: branch !== undefined ? (branch ? branch.trim().toUpperCase() : null) : undefined,
-      category: category !== undefined ? (category ? category.trim().toUpperCase() : null) : undefined,
-      cheque_no: ppPaymentType === 'CHEQUE' ? ppChequeNo : null,
-      cheque_status: ppChequeStatus,
-    };
-    Object.keys(dbUpdate).forEach(k => dbUpdate[k] === undefined && delete dbUpdate[k]);
-    await dayBookModel.update(dbId, dbUpdate, pool);
-  }
+  const updatedPp = await atomicWrite(async (db) => {
+    const updated = await plotPaymentModel.update(parseInt(id), ppUpdate, db);
+    const linkedDbQuery = await db.query(
+      'SELECT id FROM day_book WHERE plot_payment_id = $1 FOR UPDATE',
+      [parseInt(id)]
+    );
+    if (linkedDbQuery.rows.length > 0) {
+      const dbId = linkedDbQuery.rows[0].id;
+      const dbUpdate = {
+        date: date || existing.date,
+        particular: particular !== undefined ? particular.trim().toUpperCase() : undefined,
+        entry_type: 'PLOT PAYMENT',
+        debit: debit !== undefined ? (parseFloat(debit) || 0) : undefined,
+        credit: credit !== undefined ? (parseFloat(credit) || 0) : undefined,
+        remarks: remarks !== undefined ? (remarks ? remarks.trim() : null) : undefined,
+        payment_mode: ppPaymentType,
+        bank_account_id: resolvedBankAccountId,
+        from_entity: from_entity !== undefined ? (from_entity ? from_entity.trim().toUpperCase() : null) : undefined,
+        to_entity: to_entity !== undefined ? (to_entity ? to_entity.trim().toUpperCase() : null) : undefined,
+        account_no: account_no !== undefined ? (account_no ? account_no.trim().toUpperCase() : null) : undefined,
+        branch: branch !== undefined ? (branch ? branch.trim().toUpperCase() : null) : undefined,
+        category: category !== undefined ? (category ? category.trim().toUpperCase() : null) : undefined,
+        cheque_no: ppPaymentType === 'CHEQUE' ? ppChequeNo : null,
+        cheque_status: ppChequeStatus,
+      };
+      Object.keys(dbUpdate).forEach(k => dbUpdate[k] === undefined && delete dbUpdate[k]);
+      await dayBookModel.update(dbId, dbUpdate, db);
+    }
+    return updated;
+  });
 
   res.json({ entry: updatedPp, message: 'Plot payment updated' });
 });
@@ -2226,11 +2336,10 @@ export const deletePlotPaymentFromDayBook = asyncHandler(async (req, res) => {
   const existing = await plotPaymentModel.findById(ppId, pool);
   if (!existing) return res.status(404).json({ message: 'Plot payment not found' });
 
-  // Delete linked day_book entry first (if any)
-  await pool.query('DELETE FROM day_book WHERE plot_payment_id = $1', [ppId]);
-
-  // Delete the plot payment
-  await plotPaymentModel.delete(ppId, pool);
+  await atomicWrite(async (db) => {
+    await db.query('DELETE FROM day_book WHERE plot_payment_id = $1', [ppId]);
+    await plotPaymentModel.delete(ppId, db);
+  });
   res.json({ message: 'Plot payment deleted from Day Book and Plot Payments' });
 });
 
@@ -2692,9 +2801,9 @@ export const getLatestDate = asyncHandler(async (req, res) => {
 //  sync via the module triggers.
 // ══════════════════════════════════════════════════
 const DAYBOOK_MODULE_TABLES = {
-  'vendor-payment':      { table: 'vendor_payments',           dateCol: 'payment_date', modeCol: 'payment_mode', remarksCol: 'note',    lowerMode: true },
-  'commission-payment':  { table: 'plot_commission_payments',  dateCol: 'date',         modeCol: 'payment_mode', remarksCol: 'remarks' },
-  'installment-payment': { table: 'plot_installment_payments', dateCol: 'payment_date', modeCol: 'payment_mode', remarksCol: 'notes' },
+  'vendor-payment':      { table: 'vendor_payments',           dateCol: 'payment_date', modeCol: 'payment_mode', remarksCol: 'note',    lowerMode: true, siteSql: 'payment.site_id', joinSql: '' },
+  'commission-payment':  { table: 'plot_commission_payments',  dateCol: 'date',         modeCol: 'payment_mode', remarksCol: 'remarks', siteSql: 'payment.site_id', joinSql: '' },
+  'installment-payment': { table: 'plot_installment_payments', dateCol: 'payment_date', modeCol: 'payment_mode', remarksCol: 'notes',   siteSql: 'plot.site_id', joinSql: 'JOIN plots plot ON plot.id = payment.plot_id' },
 };
 
 export const updateModulePaymentFromDayBook = asyncHandler(async (req, res) => {
@@ -2703,13 +2812,15 @@ export const updateModulePaymentFromDayBook = asyncHandler(async (req, res) => {
   const id = parseInt(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ message: 'Invalid id' });
 
-  const { date, debit, credit, payment_mode, remarks, cheque_no } = req.body;
+  const { date, debit, credit, payment_mode, remarks, cheque_no, bank_account_id } = req.body;
   const amount = (parseFloat(debit) || 0) || (parseFloat(credit) || 0);
 
   const currentResult = await pool.query(
-    `SELECT ${cfg.modeCol} AS payment_mode, cheque_status, cheque_no
-       FROM ${cfg.table}
-      WHERE id = $1`,
+    `SELECT payment.${cfg.modeCol} AS payment_mode, payment.cheque_status,
+            payment.cheque_no, payment.bank_account_id, ${cfg.siteSql} AS site_id
+       FROM ${cfg.table} payment
+       ${cfg.joinSql}
+      WHERE payment.id = $1`,
     [id]
   );
   const current = currentResult.rows[0];
@@ -2718,6 +2829,17 @@ export const updateModulePaymentFromDayBook = asyncHandler(async (req, res) => {
   const sets = [];
   const params = [];
   const add = (col, val) => { params.push(val); sets.push(`${col} = $${params.length}`); };
+
+  const effectiveMode = payment_mode !== undefined
+    ? (String(payment_mode ?? '').trim() || 'BANK')
+    : current.payment_mode;
+  const resolvedBankAccountId = await resolveBankAccountSelection({
+    siteId: current.site_id,
+    paymentMode: effectiveMode,
+    bankAccountId: bank_account_id !== undefined ? bank_account_id : current.bank_account_id,
+    db: pool,
+  });
+  add('bank_account_id', resolvedBankAccountId);
 
   if (date) add(cfg.dateCol, date);
   if (amount > 0) add('amount', amount);

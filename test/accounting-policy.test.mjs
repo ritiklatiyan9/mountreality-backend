@@ -222,6 +222,37 @@ test('Balance Sheet exports distinguish whole-book accounting from filtered rows
   assert.match(source, /Row movement only · no closing balance/);
 });
 
+test('Balance Sheet exposes a Schedule III comparative position and CA-ready export controls', async () => {
+  const frontend = await readFile(
+    new URL('../../Frontend/src/pages/BalanceSheet.jsx', import.meta.url),
+    'utf8'
+  );
+  const model = await readFile(
+    new URL('../src/models/BalanceSheet.model.js', import.meta.url),
+    'utf8'
+  );
+  const controller = await readFile(
+    new URL('../src/controllers/balanceSheet.controller.js', import.meta.url),
+    'utf8'
+  );
+
+  assert.match(model, /'position',[\s\S]*?'current',[\s\S]*?'previous'/);
+  assert.match(model, /entry_date <= \$11::date/);
+  assert.match(controller, /s\.organization_id = \$2/);
+  assert.match(controller, /comparative_to must be YYYY-MM-DD/);
+  assert.match(frontend, /Schedule III, Division I presentation/);
+  assert.match(frontend, /XLSX\.utils\.book_append_sheet\(workbook, statementSheet, 'Balance Sheet'\)/);
+  assert.match(frontend, /XLSX\.utils\.book_append_sheet\(workbook, notesSheet, 'Notes'\)/);
+  assert.match(frontend, /XLSX\.utils\.book_append_sheet\(workbook, ledgerSheet, 'Supporting Ledger'\)/);
+  assert.match(frontend, /XLSX\.utils\.book_append_sheet\(workbook, validationSheet, 'Validation'\)/);
+  assert.match(frontend, /SUPPORTING LEDGER PRINT SCHEDULE/);
+  assert.match(frontend, /@page ledger/);
+  assert.match(frontend, /included in PDF and Excel/);
+  assert.match(frontend, /Firm Registration No\.:/);
+  assert.match(frontend, /UDIN:/);
+  assert.match(frontend, /CA review required before statutory use/);
+});
+
 test('plot payment accounting uses payment_type, never payment_from', async () => {
   const source = await readFile(
     new URL('../src/controllers/plot.controller.js', import.meta.url),

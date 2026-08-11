@@ -30,7 +30,9 @@ class FolderModel extends MasterModel {
     async createFolder(name, parentId, siteId, userId, pool) {
         const query = `
             INSERT INTO file_folders (name, parent_id, site_id, created_by)
-            VALUES ($1, $2, $3, $4)
+            SELECT $1, $2, $3, $4
+             WHERE $2::int IS NULL
+                OR EXISTS (SELECT 1 FROM file_folders WHERE id = $2 AND site_id = $3)
             RETURNING *
         `;
         const result = await pool.query(query, [name, parentId || null, siteId, userId]);

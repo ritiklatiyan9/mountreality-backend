@@ -11,6 +11,7 @@
     "migrate:saas": "node src/migrations/079_saas_multitenancy.js",
     "migrate:plot-documents": "node src/migrations/059_plot_documents.js",
     "migrate:dms": "node src/migrations/069_dms_documents.js",
+    "migrate:dms-tenant-isolation": "node src/migrations/111_dms_tenant_isolation.js",
     "migrate:member-kyc-document-field": "node src/migrations/072_member_kyc_document_field.js",
     "migrate:member-categories": "node src/migrations/003_member_categories.js",
     "migrate:balance-sheet": "node src/migrations/073_balance_sheet_performance.js",
@@ -35,7 +36,7 @@
     "test:finance-forecast": "node --test test/finance-forecast.test.mjs",
     "test:compliance": "node --test test/compliance-*.test.mjs",
     "worker:sms": "node src/workers/smsWorker.js",
-    "start:with-migrations": "npm run migrate:plot-documents && npm run migrate:dms && npm run migrate:member-kyc-document-field && npm run migrate:member-categories && npm run migrate:balance-sheet && npm run migrate:application-settings && npm run migrate:registry-payment-invariants && npm run migrate:transaction-person-mapping && npm run migrate:sms-reminder-log && npm run migrate:accounting && npm run migrate:saas && npm run migrate:compliance && npm run migrate:org-subdomain && npm run migrate:org-kyc && npm run migrate:plan-features && npm run migrate:vendor-inventory-robustness && npm run migrate:rera-foundation && npm run migrate:land-acquisition && npm run migrate:property-lifecycle && npm run migrate:procurement-payment-integrity && node src/server.js",
+    "start:with-migrations": "npm run migrate:plot-documents && npm run migrate:dms && npm run migrate:member-kyc-document-field && npm run migrate:member-categories && npm run migrate:balance-sheet && npm run migrate:application-settings && npm run migrate:registry-payment-invariants && npm run migrate:transaction-person-mapping && npm run migrate:sms-reminder-log && npm run migrate:accounting && npm run migrate:saas && npm run migrate:dms-tenant-isolation && npm run migrate:compliance && npm run migrate:org-subdomain && npm run migrate:org-kyc && npm run migrate:plan-features && npm run migrate:vendor-inventory-robustness && npm run migrate:property-lifecycle && npm run migrate:procurement-payment-integrity && npm run migrate:construction-phase3 && npm run migrate:phase4 && npm run migrate:phase4-performance && npm run migrate:phase4-collaboration && npm run migrate:phase4-enterprise-performance && npm run migrate:session-security && npm run migrate:financial-idempotency && npm run migrate:inventory-invariants && npm run migrate:phase34-ledger-reconciliation && npm run migrate:bank-account-ledger && npm run migrate:company-appearance && npm run migrate:plot-detail-performance && npm run migrate:plot-payments-list-rollup && node src/server.js",
     "check:cors": "node src/checks/cors-allowlist.mjs",
     "migrate:org-subdomain": "node src/migrations/090_org_subdomain.js",
     "check:subdomain": "node src/checks/subdomain.check.mjs",
@@ -47,15 +48,33 @@
     "migrate:land-acquisition": "node src/migrations/095_land_acquisition_workspace.js",
     "migrate:property-lifecycle": "node src/migrations/096_property_customer_finance_lifecycle.js",
     "migrate:procurement-payment-integrity": "node src/migrations/097_procurement_payment_integrity.js",
+    "migrate:construction-phase3": "node src/migrations/098_construction_certification_filing.js",
     "test:rera": "node --test test/rera-*.test.mjs",
     "test:land-acquisition": "node --test test/land-acquisition.test.mjs",
-    "test:property-lifecycle": "node --test test/property-lifecycle.test.mjs"
+    "test:property-lifecycle": "node --test test/property-lifecycle.test.mjs",
+    "test:construction-phase3": "node --test test/construction-phase3.test.mjs",
+    "migrate:phase4": "node src/migrations/099_phase4_portals_enterprise.js",
+    "migrate:phase4-performance": "node src/migrations/100_phase4_performance_hardening.js",
+    "migrate:phase4-collaboration": "node src/migrations/101_phase4_portal_collaboration.js",
+    "migrate:phase4-enterprise-performance": "node src/migrations/102_phase4_enterprise_rollup_performance.js",
+    "migrate:session-security": "node src/migrations/103_session_security_hardening.js",
+    "migrate:financial-idempotency": "node src/migrations/104_financial_idempotency_hardening.js",
+    "migrate:inventory-invariants": "node src/migrations/105_inventory_invariants.js",
+    "migrate:phase34-ledger-reconciliation": "node src/migrations/106_phase34_migration_ledger_reconciliation.js",
+    "migrate:bank-account-ledger": "node src/migrations/107_bank_account_ledger.js",
+    "migrate:company-appearance": "node src/migrations/108_company_appearance_preferences.js",
+    "migrate:plot-detail-performance": "node src/migrations/109_plot_detail_performance.js",
+    "migrate:plot-payments-list-rollup": "node src/migrations/110_plot_payments_list_rollup.js",
+    "check:phase4-performance": "node src/checks/phase4-performance.mjs",
+    "test:phase4": "node --test test/phase4-*.test.mjs",
+    "test:hardening": "node --test test/production-hardening.test.mjs",
+    "test:phases1-4": "node --test test/*.test.mjs"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "3.700.0",
-    "@aws-sdk/client-sqs": "^3.699.0",
-    "@aws-sdk/lib-storage": "3.700.0",
-    "@aws-sdk/s3-request-presigner": "3.700.0",
+    "@aws-sdk/client-s3": "^3.1106.0",
+    "@aws-sdk/client-sqs": "^3.1106.0",
+    "@aws-sdk/lib-storage": "^3.1106.0",
+    "@aws-sdk/s3-request-presigner": "^3.1106.0",
     "@graphql-tools/schema": "^10.0.32",
     "bcrypt": "^6.0.0",
     "cloudinary": "^2.9.0",
@@ -82,7 +101,7 @@
     "nodemon": "^3.0.2"
   },
   "overrides": {
-    "fast-xml-parser": "4.5.6",
-    "semver": "7.7.2"
+    "semver": "7.7.2",
+    "uuid": "11.1.1"
   }
 }

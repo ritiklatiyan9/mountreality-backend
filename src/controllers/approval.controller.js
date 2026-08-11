@@ -19,12 +19,110 @@ const ALLOWED_TABLES = {
   plot_payment: 'plot_payments',
   expense: 'expenses',
   daybook: 'day_book',
+  daybook_farmer: 'day_book',
+  daybook_commission: 'day_book',
+  daybook_expense: 'day_book',
+  daybook_general: 'day_book',
 };
 
 function getTableName(source) {
   const table = ALLOWED_TABLES[source];
   if (!table) throw new Error(`Invalid source: ${source}`);
   return table;
+}
+
+const directSiteSources = new Set([
+  'plot_commission', 'plot_commission_payment', 'cash_flow_entry',
+  'firm_transaction', 'plot_payment', 'expense', 'daybook',
+  'daybook_farmer', 'daybook_commission', 'daybook_expense',
+  'daybook_general', 'vendor_payment',
+]);
+
+async function resolveApprovalSite(source, entryId, db = pool) {
+  if (source === 'farmer_payment') {
+    const { rows } = await db.query(
+      `SELECT f.site_id FROM farmer_payments fp
+        JOIN farmers f ON f.id=fp.farmer_id WHERE fp.id=$1 LIMIT 1`,
+      [entryId]
+    );
+    return rows[0]?.site_id || null;
+  }
+  if (!directSiteSources.has(source)) return null;
+  const table = ALLOWED_TABLES[source] || CHEQUE_TABLES[source];
+  const { rows } = await db.query(`SELECT site_id FROM ${table} WHERE id=$1 LIMIT 1`, [entryId]);
+  return rows[0]?.site_id || null;
+}
+
+async function assertApprovalSiteAccess(req, res, source, entryId, db = pool) {
+  const siteId = Number(await resolveApprovalSite(source, entryId, db));
+  if (!Number.isInteger(siteId) || siteId <= 0) {
+    res.status(404).json({ message: 'Entry not found' });
+    return null;
+  }
+  if (req.siteContextId && Number(req.siteContextId) !== siteId) {
+    res.status(409).json({ code: 'SITE_CONTEXT_MISMATCH', message: 'Selected site does not match the requested record' });
+    return null;
+  }
+  const { rows } = await db.query(
+    `SELECT s.id FROM sites s
+      WHERE s.id=$1 AND s.organization_id=$2
+        AND ($3::boolean = FALSE OR EXISTS (
+          SELECT 1 FROM user_sites us WHERE us.site_id=s.id AND us.user_id=$4
+        ))
+      LIMIT 1`,
+    [siteId, req.user.organization_id, req.user.role === 'sub_admin', req.user.id]
+  );
+  if (!rows[0]) {
+    res.status(404).json({ message: 'Entry not found' });
+    return null;
+  }
+  req.siteContextId = siteId;
+  return siteId;
+}
+
+const imprestSourceModule = (source) => ({
+  expense: 'expenses', farmer_payment: 'farmer_payments',
+  plot_commission: 'plot_commissions', plot_commission_payment: 'plot_commission_payments',
+  vendor_payment: 'vendor_payments',
+}[source] || (String(source).startsWith('daybook') ? 'day_book' : source));
+
+async function postApprovalImprest({ entry, source, actorId, reverse = false, db }) {
+  const eligible = new Set(['expense', 'farmer_payment', 'plot_commission_payment', 'vendor_payment', 'daybook', 'daybook_farmer', 'daybook_commission', 'daybook_expense', 'daybook_general']);
+  if (!eligible.has(source)) return;
+  const amount = Number(entry.debit || entry.amount) || 0;
+  if (amount <= 0 || !entry.created_by) return;
+  const user = await db.query('SELECT role FROM users WHERE id=$1 LIMIT 1', [entry.created_by]);
+  if (user.rows[0]?.role !== 'sub_admin') return;
+  const siteId = entry.site_id || await resolveApprovalSite(source, entry.id, db);
+  const sourceModule = imprestSourceModule(source);
+  if (reverse) {
+    const deduction = await db.query(
+      `SELECT 1 FROM imprest_ledger
+        WHERE user_id=$1 AND COALESCE(site_id,0)=COALESCE($2::int,0)
+          AND source_module=$3 AND reference_id=$4 AND type='EXPENSE' AND amount<0 LIMIT 1`,
+      [entry.created_by, siteId, sourceModule, entry.id]
+    );
+    if (!deduction.rows[0]) return;
+  }
+  await imprestLedgerModel.createEntry({
+    user_id: entry.created_by,
+    site_id: siteId,
+    type: reverse ? 'ADJUSTMENT' : 'EXPENSE',
+    source_module: sourceModule,
+    reference_id: entry.id,
+    amount: reverse ? amount : -amount,
+    remarks: `${reverse ? 'REVERSED (REJECTED): ' : ''}${source.toUpperCase()} #${entry.id}`,
+    created_by: actorId,
+  }, db);
+}
+
+function requireApprovalSite(req, res) {
+  const siteId = Number.parseInt(req.query.site_id, 10);
+  if (!Number.isInteger(siteId) || siteId <= 0 || Number(req.siteContextId) !== siteId) {
+    res.status(400).json({ message: 'A valid selected site_id is required' });
+    return null;
+  }
+  return siteId;
 }
 
 async function ensureInboundFirmTransferForApproval(entry, approverId, db = pool) {
@@ -223,6 +321,7 @@ function moduleVisibility(user, allowed, moduleKey) {
  */
 export const listAllPending = asyncHandler(async (req, res) => {
   const { site_id, date_from, date_to, module, assigned_admin_id } = req.query;
+  if (!requireApprovalSite(req, res)) return;
   const allowedModules = await getAllowedModules(req.user);
 
   const results = [];
@@ -565,7 +664,14 @@ export const listAllPending = asyncHandler(async (req, res) => {
     return dB - dA || b.id - a.id;
   });
 
-  res.json({ entries: results, total: results.length });
+  const total = results.length;
+  const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 100, 1), 200);
+  const offset = Math.max(Number.parseInt(req.query.offset, 10) || 0, 0);
+  const totals = results.reduce((sum, entry) => ({
+    debit: sum.debit + (Number(entry.debit) || 0),
+    credit: sum.credit + (Number(entry.credit) || 0),
+  }), { debit: 0, credit: 0 });
+  res.json({ entries: results.slice(offset, offset + limit), total, totals, limit, offset });
 });
 
 /**
@@ -575,6 +681,7 @@ export const listAllPending = asyncHandler(async (req, res) => {
  */
 export const getPendingCounts = asyncHandler(async (req, res) => {
   const { site_id } = req.query;
+  if (!requireApprovalSite(req, res)) return;
   const allowedModules = await getAllowedModules(req.user);
 
   // Build an "assigned to me" clause for sub-admins lacking module grants —
@@ -651,6 +758,7 @@ export const approveEntry = asyncHandler(async (req, res) => {
 
   const table = getTableName(source);
   const entryId = parseInt(id);
+  if (!Number.isInteger(entryId) || !await assertApprovalSiteAccess(req, res, source, entryId)) return;
 
   // Check current status + assignment up-front — assignment overrides module-level permission,
   // so a sub-admin can approve an entry that was explicitly delegated to them even without a
@@ -725,6 +833,7 @@ export const approveEntry = asyncHandler(async (req, res) => {
       }
       await ensureInboundFirmTransferForApproval(entry, req.user.id, client);
     }
+    await postApprovalImprest({ entry, source, actorId: req.user.id, db: client });
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
@@ -777,6 +886,7 @@ export const rejectEntry = asyncHandler(async (req, res) => {
 
   const table = getTableName(source);
   const entryId = parseInt(id);
+  if (!Number.isInteger(entryId) || !await assertApprovalSiteAccess(req, res, source, entryId)) return;
 
   const check = await pool.query(`SELECT status, assigned_admin_id, created_by FROM ${table} WHERE id = $1`, [entryId]);
   if (!check.rows[0]) return res.status(404).json({ message: 'Entry not found' });
@@ -836,42 +946,15 @@ export const rejectEntry = asyncHandler(async (req, res) => {
         );
       }
     }
+    if (wasApproved) {
+      await postApprovalImprest({ entry: result.rows[0], source, actorId: req.user.id, reverse: true, db: client });
+    }
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
   } finally {
     client.release();
-  }
-
-  // Reverse imprest deduction if entry was previously approved
-  const IMPREST_SOURCES = ['expense', 'farmer_payment', 'plot_commission_payment', 'vendor_payment', 'daybook'];
-  if (wasApproved && IMPREST_SOURCES.includes(source)) {
-    const entry = result.rows[0];
-    const debitAmount = parseFloat(entry.debit || entry.amount) || 0;
-    if (debitAmount > 0 && entry.created_by) {
-      try {
-        const userResult = await pool.query('SELECT role FROM users WHERE id = $1', [entry.created_by]);
-        if (userResult.rows[0]?.role === 'sub_admin') {
-          const existingDeduction = await pool.query(
-            `SELECT id FROM imprest_ledger WHERE user_id = $1 AND reference_id = $2 AND type = 'EXPENSE' AND amount < 0 LIMIT 1`,
-            [entry.created_by, entryId]
-          );
-          if (existingDeduction.rows.length > 0) {
-            await imprestLedgerModel.createEntry({
-              user_id: entry.created_by,
-              type: 'ADJUSTMENT',
-              reference_id: entryId,
-              amount: debitAmount,
-              remarks: `REVERSED (REJECTED): ${source.toUpperCase()} #${entryId}`,
-              created_by: req.user.id,
-            }, pool);
-          }
-        }
-      } catch (err) {
-        console.error('[Imprest] Failed to reverse on rejection for', source, entryId, err.message);
-      }
-    }
   }
 
   // Update overall commission status if plot_commission_payment was rejected
@@ -914,7 +997,7 @@ export const rejectEntry = asyncHandler(async (req, res) => {
 export const bulkApprove = asyncHandler(async (req, res) => {
   const { items } = req.body;
 
-  if (!Array.isArray(items) || items.length === 0) {
+  if (!Array.isArray(items) || items.length === 0 || items.length > 100) {
     return res.status(400).json({ message: 'items array is required' });
   }
 
@@ -927,6 +1010,7 @@ export const bulkApprove = asyncHandler(async (req, res) => {
     if (!ALLOWED_TABLES[item.source]) continue;
     const itemId = Number.parseInt(item.id);
     if (!Number.isInteger(itemId)) continue;
+    if (!await assertApprovalSiteAccess(req, res, item.source, itemId)) return;
     const table = getTableName(item.source);
     if (!grouped[table]) grouped[table] = { source: item.source, ids: new Set() };
     grouped[table].ids.add(itemId);
@@ -965,6 +1049,9 @@ export const bulkApprove = asyncHandler(async (req, res) => {
         for (const row of result.rows) {
           await ensureInboundFirmTransferForApproval(row, req.user.id, client);
         }
+      }
+      for (const row of result.rows) {
+        await postApprovalImprest({ entry: row, source: group.source, actorId: req.user.id, db: client });
       }
       await client.query('COMMIT');
     } catch (error) {
@@ -1029,7 +1116,7 @@ export const bulkApprove = asyncHandler(async (req, res) => {
 export const bulkReject = asyncHandler(async (req, res) => {
   const { items } = req.body;
 
-  if (!Array.isArray(items) || items.length === 0) {
+  if (!Array.isArray(items) || items.length === 0 || items.length > 100) {
     return res.status(400).json({ message: 'items array is required' });
   }
 
@@ -1039,6 +1126,7 @@ export const bulkReject = asyncHandler(async (req, res) => {
     if (!ALLOWED_TABLES[item.source]) continue;
     const itemId = Number.parseInt(item.id);
     if (!Number.isInteger(itemId)) continue;
+    if (!await assertApprovalSiteAccess(req, res, item.source, itemId)) return;
     const table = getTableName(item.source);
     if (!grouped[table]) grouped[table] = { source: item.source, ids: new Set() };
     grouped[table].ids.add(itemId);
@@ -1081,6 +1169,9 @@ export const bulkReject = asyncHandler(async (req, res) => {
             [groups, req.user.id]
           );
         }
+      }
+      for (const row of result.rows) {
+        await postApprovalImprest({ entry: row, source: group.source, actorId: req.user.id, reverse: true, db: client });
       }
       await client.query('COMMIT');
     } catch (error) {
@@ -1159,6 +1250,7 @@ const CHEQUE_TABLES = {
  */
 export const listChequeEntries = asyncHandler(async (req, res) => {
   const { site_id, status } = req.query;
+  if (!requireApprovalSite(req, res)) return;
 
   const statusFilter = status && status !== 'all' ? status.toUpperCase() : null;
 
@@ -1313,6 +1405,8 @@ export const updateChequeStatus = asyncHandler(async (req, res) => {
   if (!table) {
     return res.status(400).json({ message: `Invalid source: ${source}` });
   }
+  const entryId = Number.parseInt(id, 10);
+  if (!Number.isInteger(entryId) || !await assertApprovalSiteAccess(req, res, source, entryId)) return;
 
   const trimmedChequeNo = cheque_no !== undefined ? (cheque_no ? String(cheque_no).trim() : null) : undefined;
 
@@ -1326,7 +1420,7 @@ export const updateChequeStatus = asyncHandler(async (req, res) => {
     paramIdx++;
   }
 
-  queryParams.push(parseInt(id));
+  queryParams.push(entryId);
 
   const result = await pool.query(
     `UPDATE ${table}
@@ -1376,7 +1470,7 @@ export const updateChequeStatus = asyncHandler(async (req, res) => {
       cfParams.push(trimmedChequeNo);
       cfIdx++;
     }
-    cfParams.push(table, parseInt(id));
+    cfParams.push(table, entryId);
     await pool.query(
       `UPDATE cash_flow_entries
        SET ${cfSetParts.join(', ')}

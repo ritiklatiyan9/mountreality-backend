@@ -1,5 +1,6 @@
 import asyncHandler from '../utils/asyncHandler.js';
 import pool from '../config/db.js';
+import { enforceEntitySiteAccess } from '../utils/siteAccessPolicy.js';
 
 // One endpoint signs any receipt row. Strict allowlist: target → table +
 // permission module. Only the two signature columns are writable here, so
@@ -52,8 +53,6 @@ export const SIGN_TARGETS = {
   },
 };
 
-const ADMIN_ROLES = new Set(['admin', 'super_admin']);
-
 const requireTargetSiteAccess = async (req, res, target, id) => {
   const { rows } = await pool.query(target.siteQuery, [id]);
   if (!rows[0]) {
@@ -61,24 +60,13 @@ const requireTargetSiteAccess = async (req, res, target, id) => {
     return false;
   }
 
-  if (ADMIN_ROLES.has(req.user.role)) return true;
-
   const siteId = Number(rows[0].site_id);
   if (!Number.isInteger(siteId) || siteId <= 0) {
     res.status(403).json({ message: 'Record is not linked to an accessible site' });
     return false;
   }
 
-  const access = await pool.query(
-    'SELECT 1 FROM user_sites WHERE user_id = $1 AND site_id = $2 LIMIT 1',
-    [req.user.id, siteId]
-  );
-  if (!access.rows[0]) {
-    res.status(403).json({ message: 'Access denied to this site' });
-    return false;
-  }
-
-  return true;
+  return enforceEntitySiteAccess({ req, res, siteId, module: target.perm });
 };
 
 /**

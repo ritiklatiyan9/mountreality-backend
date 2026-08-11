@@ -12,6 +12,7 @@ import requirePermission from '../middlewares/permission.middleware.js';
 import upload from '../middlewares/multer.middleware.js';
 import multer from 'multer';
 import { cacheResponse, invalidateCacheOnSuccess } from '../middlewares/cache.middleware.js';
+import { requireEntitySiteAccess, requireBulkEntitySiteAccess, requireRequestSiteAccess } from '../middlewares/legacyEntitySiteAccess.middleware.js';
 
 const memberReadCache = cacheResponse({ ttlSeconds: 30, namespace: 'members' });
 // Autocomplete values (cities/occupations/companies/references) rarely change,
@@ -65,17 +66,19 @@ router.post('/kyc/extract', requireRole('admin', 'sub_admin'), requirePermission
 router.get('/', requireRole('admin', 'sub_admin'), requirePermission('clients', 'read'), memberReadCache, listMembers);
 
 // With file upload for documents
-router.post('/', requireRole('admin', 'sub_admin'), memberUpload, requirePermission('clients', 'write'), bustMemberCache, createMember);
-router.put('/:id', requireRole('admin', 'sub_admin'), memberUpload, requirePermission('clients', 'update'), bustMemberCache, updateMember);
-router.delete('/:id', requireRole('admin', 'sub_admin'), requirePermission('clients', 'delete'), bustMemberCache, deleteMember);
-router.post('/bulk-delete', requireRole('admin', 'sub_admin'), requirePermission('clients', 'delete'), bustMemberCache, bulkDeleteMembers);
-router.post('/:id/register-sites', requireRole('admin', 'sub_admin'), requirePermission('clients', 'write'), bustMemberCache, registerMemberInSites);
+router.post('/', requireRole('admin', 'sub_admin'), memberUpload, requireRequestSiteAccess({ source: 'body', key: 'site_id', module: 'clients' }), requirePermission('clients', 'write'), bustMemberCache, createMember);
+const memberById = requireEntitySiteAccess({ entity: 'member', module: 'clients' });
+const memberBulk = requireBulkEntitySiteAccess({ module: 'clients', getItems: (req) => (req.body.ids || []).map((id) => ({ entity: 'member', id })) });
+router.put('/:id', requireRole('admin', 'sub_admin'), memberById, memberUpload, requirePermission('clients', 'update'), bustMemberCache, updateMember);
+router.delete('/:id', requireRole('admin', 'sub_admin'), requirePermission('clients', 'delete'), memberById, bustMemberCache, deleteMember);
+router.post('/bulk-delete', requireRole('admin', 'sub_admin'), requirePermission('clients', 'delete'), memberBulk, bustMemberCache, bulkDeleteMembers);
+router.post('/:id/register-sites', requireRole('admin', 'sub_admin'), requirePermission('clients', 'write'), memberById, bustMemberCache, registerMemberInSites);
 
 // Member transactions
-router.get('/:id/transactions', requireRole('admin', 'sub_admin'), requirePermission('clients', 'read'), memberReadCache, getMemberTransactions);
-router.get('/:id/financial-info', requireRole('admin', 'sub_admin'), requirePermission('clients', 'read'), memberReadCache, getMemberFinancialInfo);
+router.get('/:id/transactions', requireRole('admin', 'sub_admin'), requirePermission('clients', 'read'), memberById, memberReadCache, getMemberTransactions);
+router.get('/:id/financial-info', requireRole('admin', 'sub_admin'), requirePermission('clients', 'read'), memberById, memberReadCache, getMemberFinancialInfo);
 
 // Dynamic param last
-router.get('/:id', requireRole('admin', 'sub_admin'), requirePermission('clients', 'read'), memberReadCache, getMember);
+router.get('/:id', requireRole('admin', 'sub_admin'), requirePermission('clients', 'read'), memberById, memberReadCache, getMember);
 
 export default router;

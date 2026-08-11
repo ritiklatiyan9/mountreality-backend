@@ -391,3 +391,8 @@ export function startComplianceScheduler() {
   setTimeout(tick, 30_000).unref?.();
   console.log('[compliance] hourly scheduler started');
 }
+
+export function stopComplianceScheduler() {
+  if (timer) clearInterval(timer);
+  timer = null;
+}

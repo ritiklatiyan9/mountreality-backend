@@ -10,8 +10,10 @@ import requireRole from '../middlewares/role.middleware.js';
 import requirePermission from '../middlewares/permission.middleware.js';
 import pool from '../config/db.js';
 import { enforceEntitySiteAccess, parseSiteId } from '../utils/siteAccessPolicy.js';
+import createRateLimiter from '../middlewares/rateLimit.middleware.js';
 
 const router = express.Router();
+const plotDocumentUploadLimiter = createRateLimiter({ windowMs: 15 * 60_000, max: 30, keyPrefix: 'plot-document-upload:' });
 const MIME_BY_EXTENSION = new Map([
   ['.jpg', new Set(['image/jpeg'])],
   ['.jpeg', new Set(['image/jpeg'])],
@@ -105,7 +107,7 @@ router.use(authMiddleware);
 router.get('/', requireRole('admin', 'sub_admin'), accessByQuerySite, requirePermission('plot_payments', 'read'), listPlotsWithDocs);                          // ?site_id=X
 router.get('/:plotId', requireRole('admin', 'sub_admin'), accessByPlot, requirePermission('plot_payments', 'read'), getPlotDocuments);
 // Resolve authorization before Multer buffers an uploaded file.
-router.post('/:plotId', requireRole('admin', 'sub_admin'), accessByPlot, requirePermission('plot_payments', 'write'), receivePlotDocument, uploadPlotDocument);
+router.post('/:plotId', requireRole('admin', 'sub_admin'), accessByPlot, requirePermission('plot_payments', 'write'), plotDocumentUploadLimiter, receivePlotDocument, uploadPlotDocument);
 router.delete('/doc/:docId', requireRole('admin', 'sub_admin'), accessByDocument, requirePermission('plot_payments', 'delete'), deletePlotDocument);
 
 export default router;

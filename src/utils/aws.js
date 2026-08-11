@@ -17,7 +17,7 @@ if (process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY) {
 
 const s3Client = new S3Client(s3Config);
 
-export const uploadToS3 = async (filePath, fileName, contentType, folderOverride = null) => {
+export const uploadToS3 = async (filePath, fileName, contentType, folderOverride = null, returnKey = false) => {
   const fileStream = fs.createReadStream(filePath);
   const bucket = process.env.AWS_S3_BUCKET_NAME || process.env.AWS_S3_BUCKET;
   const region = process.env.AWS_REGION || 'ap-south-1';
@@ -41,5 +41,5 @@ export const uploadToS3 = async (filePath, fileName, contentType, folderOverride
   });
 
   await upload.done();
-  return `https://${bucket}.s3.${region}.amazonaws.com/${uniqueKey}`;
+  return returnKey ? uniqueKey : `https://${bucket}.s3.${region}.amazonaws.com/${uniqueKey}`;
 };

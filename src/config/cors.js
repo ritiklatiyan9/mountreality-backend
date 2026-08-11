@@ -60,7 +60,7 @@ export function isOriginAllowed(origin) {
   // No Origin header at all: same-origin navigation, curl, server-to-server,
   // health checks. Not a cross-origin request, so there is nothing to refuse.
   if (!origin) return true;
-  if (!isRestricted) return true;
+  if (!isRestricted) return process.env.NODE_ENV !== 'production';
   const candidate = origin.toLowerCase();
   return matchers.some((match) => match(candidate));
 }

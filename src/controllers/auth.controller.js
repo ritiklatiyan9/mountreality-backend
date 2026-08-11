@@ -10,16 +10,34 @@ import { generateUniqueSubdomain } from '../utils/subdomain.js';
 import { loadKyc, presentKyc } from './orgKyc.controller.js';
 import { sendRegistrationEmail, sendOwnerNotificationEmail } from '../utils/mailer.js';
 
+// Valid bcrypt hash used only to keep unknown-email and wrong-password checks
+// on comparable work factors. It prevents a timing shortcut from becoming an
+// account-enumeration signal without creating a fresh expensive hash per call.
+const DUMMY_PASSWORD_HASH = '$2b$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2uheWG/igi.';
+
 /**
  * Everything a successful sign-in returns (tokens + sites + permissions + session).
  * Shared by password and Google login so both produce the exact same payload.
  */
 const buildLoginPayload = async (user, req) => {
   const version = user.token_version;
-  const accessToken = signAccessToken({ id: user.id, email: user.email, role: user.role, version });
-  const refreshToken = signRefreshToken({ id: user.id, version });
+  const ipAddress = req.ip || req.connection?.remoteAddress;
+  const sessionResult = await pool.query(
+    `INSERT INTO user_sessions (user_id, ip_address, user_agent, last_seen_at)
+     VALUES ($1, $2, $3, NOW()) RETURNING id`,
+    [user.id, ipAddress, String(req.get?.('user-agent') || '').slice(0, 1000) || null]
+  );
+  const sessionId = sessionResult.rows[0].id;
+  const accessToken = signAccessToken({ id: user.id, email: user.email, role: user.role, version, sid: sessionId });
+  const refreshToken = signRefreshToken({ id: user.id, version, sid: sessionId });
+  const refreshClaims = verifyToken(refreshToken, process.env.JWT_REFRESH_SECRET);
   const hashedRefresh = await hashRefreshToken(refreshToken);
-  await userModel.update(user.id, { refresh_token: hashedRefresh }, pool);
+  await pool.query(
+    `UPDATE user_sessions
+        SET refresh_token_hash=$1, refresh_expires_at=TO_TIMESTAMP($2)
+      WHERE id=$3 AND user_id=$4`,
+    [hashedRefresh, refreshClaims.exp, sessionId, user.id]
+  );
 
   let sites;
   if (user.role === 'admin' || user.role === 'super_admin') {
@@ -35,20 +53,20 @@ const buildLoginPayload = async (user, req) => {
     permissions = await permissionModel.getByUserId(user.id);
   }
 
-  // Record login session (skip for super_admin/owner to hide from activity)
-  let sessionId = null;
-  if (user.role !== 'super_admin' && user.role !== 'owner') {
-    const ipAddress = req.ip || req.connection?.remoteAddress;
-    const sessionResult = await pool.query(
-      'INSERT INTO user_sessions (user_id, ip_address) VALUES ($1, $2) RETURNING id',
-      [user.id, ipAddress]
-    );
-    sessionId = sessionResult.rows[0].id;
-  }
-
   const organization = await fetchOrganization(user.organization_id);
 
-  return { user: userModel.sanitize(user), organization, accessToken, refreshToken, sites, permissions, sessionId };
+  const portalMemberships = user.organization_id
+    ? (await pool.query(
+      `SELECT id,portal_type,site_id,rera_project_id,rera_project_phase_id,status
+         FROM portal_memberships
+        WHERE user_id=$1 AND organization_id=$2 AND status='ACTIVE'
+          AND effective_from<=NOW() AND (effective_to IS NULL OR effective_to>NOW())
+        ORDER BY portal_type,id`,
+      [user.id, user.organization_id],
+    )).rows
+    : [];
+
+  return { user: userModel.sanitize(user), organization, accessToken, refreshToken, sites, permissions, portalMemberships, sessionId };
 };
 
 const fetchOrganization = async (organizationId) => {
@@ -99,12 +117,7 @@ export const register = asyncHandler(async (req, res) => {
   };
 
   const user = await userModel.create(userData, pool);
-  const accessToken = signAccessToken({ id: user.id, email: user.email, role: user.role, version: 1 });
-  const refreshToken = signRefreshToken({ id: user.id, version: 1 });
-  const hashedRefresh = await hashRefreshToken(refreshToken);
-  await userModel.update(user.id, { refresh_token: hashedRefresh }, pool);
-
-  res.status(201).json({ user: userModel.sanitize(user), accessToken, refreshToken });
+  res.status(201).json(await buildLoginPayload(user, req));
 });
 
 /**
@@ -120,8 +133,8 @@ export const signup = asyncHandler(async (req, res) => {
   if (!company_name || !name || !email || !password) {
     return res.status(400).json({ message: 'Company name, your name, email and password are required' });
   }
-  if (String(password).length < 6) {
-    return res.status(400).json({ message: 'Password must be at least 6 characters long' });
+  if (String(password).length < 10) {
+    return res.status(400).json({ message: 'Password must be at least 10 characters long' });
   }
 
   const existing = await userModel.findByEmail(email, pool);
@@ -168,10 +181,23 @@ export const signup = asyncHandler(async (req, res) => {
  * POST /auth/login
  */
 export const login = asyncHandler(async (req, res) => {
-  const { email, password } = req.body;
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = typeof req.body.password === 'string' ? req.body.password : '';
+  if (!email || email.length > 320 || !password || password.length > 256) {
+    return res.status(401).json({ message: 'Invalid credentials' });
+  }
   const user = await userModel.findByEmail(email, pool);
 
-  if (!user || !(await comparePassword(password, user.password))) {
+  const passwordMatches = await comparePassword(password, user?.password || DUMMY_PASSWORD_HASH);
+  if (!user || !passwordMatches) {
+    if (user) {
+      await pool.query(
+        `UPDATE users SET failed_login_count=failed_login_count+1,
+          locked_until=CASE WHEN failed_login_count+1>=5 THEN NOW()+INTERVAL '15 minutes' ELSE NULL END
+          WHERE id=$1`,
+        [user.id],
+      );
+    }
     return res.status(401).json({ message: 'Invalid credentials' });
   }
 
@@ -179,7 +205,8 @@ export const login = asyncHandler(async (req, res) => {
     return res.status(403).json({ message: 'Account is deactivated. Contact your admin.' });
   }
 
-  res.json(await buildLoginPayload(user, req));
+  await pool.query('UPDATE users SET failed_login_count=0,locked_until=NULL,last_login_at=NOW() WHERE id=$1', [user.id]);
+  res.json(await buildLoginPayload({ ...user, failed_login_count: 0, locked_until: null }, req));
 });
 
 /** GET /auth/google/status — non-secret diagnostics for deploy debugging. */
@@ -230,14 +257,9 @@ export const googleLogin = asyncHandler(async (req, res) => {
 });
 
 /**
- * POST /auth/refresh — MULTI-SESSION SAFE (kept in sync with the booking backend).
- *
- * Any validly-signed, unexpired refresh token with the current token_version works.
- * Deliberately NO single-slot hash comparison and NO rotation: both apps share one
- * users row, so the old one-hash-per-user scheme made a second session's refresh
- * look like token theft — the handler then bumped token_version and logged the user
- * out of BOTH apps mid-click. Revocation still works: bump users.token_version to
- * kill every session at once; tokens self-expire in 49d / 7 weeks (config/jwt.js).
+ * POST /auth/refresh — session-bound, rotating refresh token.
+ * Each device has an independent session row. Rotation revokes only the token
+ * that was just used and leaves the user's other signed-in devices untouched.
  */
 export const refresh = asyncHandler(async (req, res) => {
   const { refreshToken } = req.body;
@@ -252,33 +274,75 @@ export const refresh = asyncHandler(async (req, res) => {
     return res.status(401).json({ message: 'Invalid refresh token' });
   }
 
-  const user = await userModel.findById(decoded.id, pool);
-  if (!user || user.is_active === false || user.token_version !== decoded.version) {
+  const sessionId = Number(decoded.sid);
+  if (!Number.isInteger(sessionId) || sessionId <= 0) {
     return res.status(401).json({ message: 'Invalid refresh token' });
   }
 
-  const version = user.token_version;
-  const accessToken = signAccessToken({ id: user.id, email: user.email, role: user.role, version });
-  const newRefreshToken = signRefreshToken({ id: user.id, version });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `SELECT us.id,us.logout_time,us.refresh_token_hash,us.refresh_expires_at,
+              u.id AS user_id,u.email,u.role,u.token_version,u.is_active,
+              o.is_active AS organization_active
+         FROM user_sessions us
+         JOIN users u ON u.id=us.user_id
+         LEFT JOIN organizations o ON o.id=u.organization_id
+        WHERE us.id=$1 AND us.user_id=$2
+        FOR UPDATE OF us`,
+      [sessionId, decoded.id]
+    );
+    const session = rows[0];
+    const valid = session
+      && session.is_active
+      && !session.logout_time
+      && session.refresh_expires_at
+      && new Date(session.refresh_expires_at).getTime() > Date.now()
+      && session.token_version === decoded.version
+      && (session.role === 'owner' || session.organization_active !== false)
+      && await comparePassword(refreshToken, session.refresh_token_hash);
+    if (!valid) {
+      await client.query('ROLLBACK');
+      return res.status(401).json({ message: 'Invalid refresh token' });
+    }
 
-  res.json({ accessToken, refreshToken: newRefreshToken });
+    const tokenPayload = {
+      id: session.user_id,
+      email: session.email,
+      role: session.role,
+      version: session.token_version,
+      sid: sessionId,
+    };
+    const accessToken = signAccessToken(tokenPayload);
+    const newRefreshToken = signRefreshToken(tokenPayload);
+    const newClaims = verifyToken(newRefreshToken, process.env.JWT_REFRESH_SECRET);
+    await client.query(
+      `UPDATE user_sessions
+          SET refresh_token_hash=$1,refresh_expires_at=TO_TIMESTAMP($2),last_seen_at=NOW()
+        WHERE id=$3`,
+      [await hashRefreshToken(newRefreshToken), newClaims.exp, sessionId]
+    );
+    await client.query('COMMIT');
+    return res.json({ accessToken, refreshToken: newRefreshToken, sessionId });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 });
 
 /**
  * POST /auth/logout
  */
 export const logout = asyncHandler(async (req, res) => {
-  const userId = req.user.id;
-  const { sessionId } = req.body; // Expect frontend to send the session ID
-
-  await userModel.update(userId, { refresh_token: null }, pool);
-
-  if (sessionId) {
-    await pool.query(
-      'UPDATE user_sessions SET logout_time = CURRENT_TIMESTAMP WHERE id = $1 AND user_id = $2',
-      [sessionId, userId]
-    );
-  }
+  await pool.query(
+    `UPDATE user_sessions
+        SET logout_time=CURRENT_TIMESTAMP,refresh_token_hash=NULL
+      WHERE id=$1 AND user_id=$2 AND logout_time IS NULL`,
+    [req.sessionId, req.user.id]
+  );
 
   res.json({ message: 'Logged out' });
 });
@@ -308,7 +372,18 @@ export const getMe = asyncHandler(async (req, res) => {
 
   const organization = await fetchOrganization(user.organization_id);
 
-  res.json({ user: userModel.sanitize(user), organization, sites, permissions });
+  const portalMemberships = user.organization_id
+    ? (await pool.query(
+      `SELECT id,portal_type,site_id,rera_project_id,rera_project_phase_id,status
+         FROM portal_memberships
+        WHERE user_id=$1 AND organization_id=$2 AND status='ACTIVE'
+          AND effective_from<=NOW() AND (effective_to IS NULL OR effective_to>NOW())
+        ORDER BY portal_type,id`,
+      [user.id, user.organization_id],
+    )).rows
+    : [];
+
+  res.json({ user: userModel.sanitize(user), organization, sites, permissions, portalMemberships });
 });
 
 /**
@@ -325,14 +400,24 @@ export const markDomainIntroSeen = asyncHandler(async (req, res) => {
  * PUT /auth/profile
  */
 export const updateProfile = asyncHandler(async (req, res) => {
-  const { name, email, password, phone } = req.body;
+  const { name, email, phone } = req.body;
   const userId = req.user.id;
   let updateData = {};
 
   if (name) updateData.name = name;
-  if (email) updateData.email = email;
+  if (email !== undefined) {
+    const currentUser = await userModel.findById(userId, pool);
+    const requestedEmail = String(email || '').trim().toLowerCase();
+    const currentEmail = String(currentUser?.email || '').trim().toLowerCase();
+    if (!currentUser) return res.status(404).json({ message: 'User not found' });
+    if (requestedEmail !== currentEmail) {
+      return res.status(400).json({
+        code: 'EMAIL_CHANGE_REQUIRES_VERIFICATION',
+        message: 'Email changes require re-authentication and email verification. Contact your administrator.',
+      });
+    }
+  }
   if (phone !== undefined) updateData.phone = phone;
-  if (password) updateData.password = await hashPassword(password);
   if (req.file) {
     const photoUrl = await uploadSingle(req.file, 's3', { folder: 'profile-photos' });
     updateData.photo = photoUrl;
@@ -356,8 +441,8 @@ export const changePassword = asyncHandler(async (req, res) => {
   }
 
   // Validate new password length
-  if (newPassword.length < 6) {
-    return res.status(400).json({ message: 'New password must be at least 6 characters long' });
+  if (newPassword.length < 10) {
+    return res.status(400).json({ message: 'New password must be at least 10 characters long' });
   }
 
   // Check passwords match
@@ -382,9 +467,28 @@ export const changePassword = asyncHandler(async (req, res) => {
     return res.status(400).json({ message: 'New password must be different from current password' });
   }
 
-  // Hash and update
+  // Revoke every session after a credential change. This request's access
+  // token also becomes invalid immediately through token_version.
   const hashedPassword = await hashPassword(newPassword);
-  await userModel.update(userId, { password: hashedPassword }, pool);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `UPDATE users SET password=$1,token_version=token_version+1,updated_at=NOW() WHERE id=$2`,
+      [hashedPassword, userId]
+    );
+    await client.query(
+      `UPDATE user_sessions SET logout_time=NOW(),refresh_token_hash=NULL
+        WHERE user_id=$1 AND logout_time IS NULL`,
+      [userId]
+    );
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
 
-  res.json({ message: 'Password updated successfully' });
+  res.json({ message: 'Password updated successfully. Please sign in again.', reauthenticate: true });
 });

@@ -8,6 +8,12 @@ import crypto from 'crypto';
 const PUBLIC_VERIFY_URL =
   process.env.PUBLIC_VERIFY_URL || 'http://localhost:5173/verify-receipt';
 
+const receiptSecret = () => {
+  const secret = String(process.env.RECEIPT_VERIFY_SECRET || '');
+  if (secret.length < 32) throw new Error('Receipt signing is not configured securely');
+  return secret;
+};
+
 /**
  * Receipt-type codes. Short strings keep the QR payload small.
  *   FRM  Farmer Payment
@@ -36,7 +42,7 @@ export const ReceiptType = {
  */
 export function signReceiptToken(payload) {
   const sig = crypto
-    .createHmac('sha256', process.env.RECEIPT_VERIFY_SECRET || '')
+    .createHmac('sha256', receiptSecret())
     .update(JSON.stringify(payload))
     .digest('hex');
   return Buffer.from(JSON.stringify({ p: payload, s: sig })).toString('base64url');
@@ -61,7 +67,7 @@ export function verifyReceiptToken(token) {
     if (!payload || !sig) return { valid: false, reason: 'Malformed token' };
 
     const expectedSig = crypto
-      .createHmac('sha256', process.env.RECEIPT_VERIFY_SECRET || '')
+      .createHmac('sha256', receiptSecret())
       .update(JSON.stringify(payload))
       .digest('hex');
 

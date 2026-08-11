@@ -27,6 +27,7 @@ export const createFolder = asyncHandler(async (req, res) => {
     if (!site_id) return res.status(400).json({ message: 'site_id is required' });
 
     const folder = await folderModel.createFolder(name.trim(), parentId || null, parseInt(site_id), req.user.id, pool);
+    if (!folder) return res.status(400).json({ message: 'Parent folder must belong to the selected site' });
     res.status(201).json({ folder });
 });
 
