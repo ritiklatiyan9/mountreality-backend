@@ -2,6 +2,7 @@ import pool from '../config/db.js';
 import asyncHandler from '../utils/asyncHandler.js';
 import { isOrgAdmin, parsePositiveId, writeComplianceAudit } from '../utils/complianceAccess.js';
 import { createPayment as createLegacyFarmerPayment } from './farmer.controller.js';
+import { buildVerifyUrl, ReceiptType } from '../utils/receiptToken.js';
 import {
   acquisitionCompletionChecklist,
   deriveAcquisitionLifecycle,
@@ -504,7 +505,18 @@ export const getLandAcquisition = asyncHandler(async (req, res) => {
           : item.due_date && new Date(item.due_date) < new Date(new Date().toISOString().slice(0, 10))
             ? 'OVERDUE' : 'PENDING',
     })),
-    transactions: payments.rows,
+    transactions: payments.rows.map((payment) => ({
+      ...payment,
+      verifyUrl: buildVerifyUrl({
+        t: ReceiptType.FARMER,
+        i: payment.id,
+        fn: acquisition.landowner_name || null,
+        a: payment.amount,
+        d: payment.date,
+        pm: payment.payment_mode || null,
+        sn: acquisition.site_name || null,
+      }),
+    })),
     activity: timeline,
   });
 });

@@ -374,7 +374,7 @@ test('DayBook ignores orphan specialized mirrors and V2 approval does not create
   assert.doesNotMatch(approveBody, /INSERT INTO day_book/);
 });
 
-test('person-ledger KPI includes mapped mirrors without adding them to site balance', async () => {
+test('personal-ledger KPIs include manual entries only and exclude automatic mirrors', async () => {
   const source = await readFile(
     new URL('../src/graphql/services/kpi.service.js', import.meta.url),
     'utf8'
@@ -384,8 +384,8 @@ test('person-ledger KPI includes mapped mirrors without adding them to site bala
   const personalCredit = source.match(/export async function getPersonalLedgerCredit[\s\S]*?export async function getRegistryPayments/)?.[0] || '';
 
   assert.match(siteCashflow, /NOT LIKE '%\\\\_person'/);
-  assert.doesNotMatch(outstanding, /NOT LIKE '%\\\\_person'/);
-  assert.doesNotMatch(personalCredit, /NOT LIKE '%\\\\_person'/);
+  assert.match(outstanding, /NOT LIKE '%\\\\_person'/);
+  assert.match(personalCredit, /NOT LIKE '%\\\\_person'/);
   assert.match(outstanding, /cfe\.date < \$2/);
   assert.match(outstanding, /\[siteId, end\]/);
   assert.match(outstanding, /'plot_registry_payments', 'plot_registry_payments_person'/);
@@ -396,7 +396,7 @@ test('person-ledger KPI includes mapped mirrors without adding them to site bala
   assert.match(personalCredit, /GREATEST\(-COALESCE\(cfe\.debit, 0\), 0\)/);
 });
 
-test('integrity verifier independently checks cumulative signed person outstanding', async () => {
+test('integrity verifier checks cumulative signed manual person-ledger outstanding', async () => {
   const source = await readFile(
     new URL('../src/graphql/services/consistency.service.js', import.meta.url),
     'utf8'
@@ -405,31 +405,21 @@ test('integrity verifier independently checks cumulative signed person outstandi
   const runB = source.match(/async function runFromCashFlowEntries[\s\S]*?function compareRuns/)?.[0] || '';
   const runBOutstanding = runB.match(/Outstanding Run B[\s\S]*?const outstanding/)?.[0] || '';
 
-  assert.match(runA, /WITH source_person_movements AS/);
-  assert.match(runA, /direct_person_movements AS/);
-  for (const table of [
-    'farmer_payments', 'plot_commission_payments', 'day_book',
-    'firm_transactions', 'plot_payments', 'expenses', 'vendor_payments',
-  ]) {
-    assert.match(runA, new RegExp(`FROM ${table}(?:\\s|$)`), `${table} mapped movement must be independently verified`);
-  }
-  assert.equal(
-    (runA.match(/mapped_member_id IS NOT NULL OR [a-z]+\.mapped_user_id IS NOT NULL/g) || []).length,
-    7,
-    'all seven person-mappable source tables must contribute to Run A'
-  );
-  assert.match(runA, /GREATEST\(-COALESCE\(credit, 0\), 0\)/);
-  assert.match(runA, /GREATEST\(-COALESCE\(debit, 0\), 0\)/);
+  assert.doesNotMatch(runA, /source_person_movements|mapped_member_id|mapped_user_id/);
+  assert.match(runA, /FROM cash_flow_entries cfe/);
+  assert.match(runA, /GREATEST\(-COALESCE\(cfe\.credit, 0\), 0\)/);
+  assert.match(runA, /GREATEST\(-COALESCE\(cfe\.debit, 0\), 0\)/);
+  assert.match(runA, /NOT LIKE '%\\\\_person'/);
   assert.match(runA, /'plot_registry_payments', 'plot_registry_payments_person'/);
   assert.match(runA, /\[siteId, end\]/);
 
   assert.match(runBOutstanding, /cfe\.date < \$2/);
   assert.match(runBOutstanding, /GREATEST\(-COALESCE\(cfe\.credit, 0\), 0\)/);
   assert.match(runBOutstanding, /GREATEST\(-COALESCE\(cfe\.debit, 0\), 0\)/);
+  assert.match(runBOutstanding, /NOT LIKE '%\\\\_person'/);
   assert.match(runBOutstanding, /'plot_registry_payments', 'plot_registry_payments_person'/);
   assert.match(runBOutstanding, /LOWER\(COALESCE\(cfe\.status, 'approved'\)\) = 'approved'/);
   assert.match(runBOutstanding, /NOT IN \('BOUNCED','RETURNED'\)/);
-  assert.doesNotMatch(runBOutstanding, /NOT LIKE '%\\\\_person'/);
   assert.match(runBOutstanding, /\[siteId, end\]/);
 });
 

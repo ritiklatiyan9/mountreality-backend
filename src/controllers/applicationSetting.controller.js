@@ -2,6 +2,10 @@ import asyncHandler from '../utils/asyncHandler.js';
 import pool from '../config/db.js';
 import applicationSettingModel, { FEATURE_KEYS } from '../models/ApplicationSetting.model.js';
 import { getConfig as getSmsConfig, saveConfig as saveSmsConfig } from '../services/smsReminder.service.js';
+import {
+  getReceiptConfiguration as getSiteReceiptConfiguration,
+  saveReceiptConfiguration,
+} from '../services/receiptConfiguration.service.js';
 import { isSmsQueueConfigured } from '../utils/sqs.js';
 
 const getAccessibleSiteId = async (req, res, rawSiteId) => {
@@ -90,5 +94,33 @@ export const updateSmsReminderSettings = asyncHandler(async (req, res) => {
     message: settings.enabled
       ? `Automatic SMS reminders on — ${settings.days_before.join(', ')} day(s) around the due date at ${String(settings.send_hour).padStart(2, '0')}:00 IST`
       : 'Automatic SMS reminders turned off',
+  });
+});
+
+/** GET /settings/receipt?site_id=123 — readable by anyone assigned to the Site. */
+export const getReceiptConfiguration = asyncHandler(async (req, res) => {
+  const siteId = await getAccessibleSiteId(req, res, req.query.site_id);
+  if (!siteId) return;
+
+  res.json({
+    site_id: siteId,
+    configuration: await getSiteReceiptConfiguration(siteId),
+  });
+});
+
+/** PUT /settings/receipt — admin only, enforced by the route. */
+export const updateReceiptConfiguration = asyncHandler(async (req, res) => {
+  const siteId = await getAccessibleSiteId(req, res, req.body.site_id);
+  if (!siteId) return;
+
+  const configuration = await saveReceiptConfiguration(
+    siteId,
+    req.body.configuration,
+    req.user.id,
+  );
+  res.json({
+    site_id: siteId,
+    configuration,
+    message: 'Receipt design saved for this Site',
   });
 });
