@@ -47,6 +47,7 @@ import forecastAssistantRoutes from './forecastAssistant.routes.js';
 import complianceRoutes from './compliance.routes.js';
 import complianceDocumentRoutes from './complianceDocument.routes.js';
 import operatingProfileRoutes from './operatingProfile.routes.js';
+import googleCalendarRoutes from './googleCalendar.routes.js';
 import reraFoundationRoutes from './reraFoundation.routes.js';
 import landAcquisitionRoutes from './landAcquisition.routes.js';
 import propertyLifecycleRoutes from './propertyLifecycle.routes.js';
@@ -93,6 +94,10 @@ router.use('/bank-accounts', bankAccountRoutes);
 router.use('/appearance', appearanceRoutes);
 router.use('/signatures', signatureRoutes);
 router.use('/balance-sheet', balanceSheetRoutes);
+// First of the three /settings routers: operatingProfileRoutes applies
+// authMiddleware to its whole prefix, which would 401 the public Google
+// OAuth callback before it is ever reached.
+router.use('/settings', googleCalendarRoutes);
 router.use('/settings', applicationSettingRoutes);
 router.use('/settings', operatingProfileRoutes);
 router.use('/construction', constructionRoutes);
