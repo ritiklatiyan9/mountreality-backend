@@ -101,22 +101,29 @@ export const oauthCallback = asyncHandler(async (req, res) => {
   const email = emailFromIdToken(tokens.id_token);
   if (!email) return fail('no_account_email');
 
-  await pool.query(
-    `INSERT INTO google_calendar_connections
-       (organization_id, google_account_email, access_token_enc, refresh_token_enc, token_expiry, scope, connected_by, status)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,'active')
-     ON CONFLICT (organization_id) DO UPDATE SET
-       google_account_email=EXCLUDED.google_account_email,
-       access_token_enc=EXCLUDED.access_token_enc,
-       refresh_token_enc=EXCLUDED.refresh_token_enc,
-       token_expiry=EXCLUDED.token_expiry,
-       scope=EXCLUDED.scope,
-       connected_by=EXCLUDED.connected_by,
-       status='active',
-       updated_at=NOW()`,
-    [state.orgId, email, encrypt(tokens.access_token), encrypt(tokens.refresh_token),
-      tokens.expiry_date ? new Date(tokens.expiry_date) : null, tokens.scope || SCOPES.join(' '), state.userId],
-  );
+  try {
+    await pool.query(
+      `INSERT INTO google_calendar_connections
+         (organization_id, google_account_email, access_token_enc, refresh_token_enc, token_expiry, scope, connected_by, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'active')
+       ON CONFLICT (organization_id) DO UPDATE SET
+         google_account_email=EXCLUDED.google_account_email,
+         access_token_enc=EXCLUDED.access_token_enc,
+         refresh_token_enc=EXCLUDED.refresh_token_enc,
+         token_expiry=EXCLUDED.token_expiry,
+         scope=EXCLUDED.scope,
+         connected_by=EXCLUDED.connected_by,
+         status='active',
+         updated_at=NOW()`,
+      [state.orgId, email, encrypt(tokens.access_token), encrypt(tokens.refresh_token),
+        tokens.expiry_date ? new Date(tokens.expiry_date) : null, tokens.scope || SCOPES.join(' '), state.userId],
+    );
+  } catch (err) {
+    // A user on Google's redirect should land back in Settings with a toast,
+    // not on a raw JSON error page (e.g. a malformed CALENDAR_TOKEN_ENC_KEY).
+    console.error('[gcal] failed to store connection:', err.message);
+    return fail('server_error');
+  }
   res.redirect(`${settingsPage(origin)}&google=connected`);
 });
 
