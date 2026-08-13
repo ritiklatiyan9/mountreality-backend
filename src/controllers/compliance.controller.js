@@ -9,6 +9,12 @@ import {
 import {
   buildOccurrences, COMPLIANCE_STATUSES, DEFAULT_TRANSITIONS, isTransitionAllowed, parseDate,
 } from '../services/complianceEngine.service.js';
+import { queueCalendarSync } from '../services/googleCalendarSync.service.js';
+
+// Best-effort Google Calendar push per entity; keys match ENTITY_CONFIG.
+const CALENDAR_EVENT_TYPES = Object.freeze({
+  licence: 'LICENCE_EXPIRY', case: 'LEGAL_HEARING', notice: 'NOTICE_REPLY', inspection: 'INSPECTION',
+});
 
 const RISK_LEVELS = new Set(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']);
 const PRIORITIES = new Set(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']);
@@ -496,6 +502,7 @@ export const createComplianceItem = asyncHandler(async (req, res) => {
     );
     await writeComplianceAudit(client, req, { action: 'CREATE', entityType: 'COMPLIANCE', entityId: item.id, siteId, newValue: item });
     await client.query('COMMIT');
+    queueCalendarSync(orgId, 'COMPLIANCE', item.id);
     res.status(201).json({ item });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -548,6 +555,7 @@ export const updateComplianceItem = asyncHandler(async (req, res) => {
     [...update.values, id, req.user.organization_id]
   );
   await writeComplianceAudit(pool, req, { action: 'UPDATE', entityType: 'COMPLIANCE', entityId: id, siteId, previousValue: existing, newValue: rows[0], reason: req.body.reason });
+  queueCalendarSync(req.user.organization_id, 'COMPLIANCE', id);
   res.json({ item: rows[0] });
 });
 
@@ -558,6 +566,7 @@ export const deleteComplianceItem = asyncHandler(async (req, res) => {
   const reason = requireReason(req.body.reason);
   await pool.query(`UPDATE compliance_items SET deleted_at=NOW(),updated_by=$1,updated_at=NOW() WHERE id=$2 AND organization_id=$3`, [req.user.id, id, req.user.organization_id]);
   await writeComplianceAudit(pool, req, { action: 'DELETE', entityType: 'COMPLIANCE', entityId: id, siteId: existing.site_id, previousValue: existing, reason });
+  queueCalendarSync(req.user.organization_id, 'COMPLIANCE', id);
   res.json({ success: true });
 });
 
@@ -676,6 +685,7 @@ export const updateComplianceStatus = asyncHandler(async (req, res) => {
     );
     await writeComplianceAudit(client, req, { action: 'STATUS_CHANGE', entityType: 'COMPLIANCE', entityId: id, siteId: existing.site_id, previousValue: { status: existing.status }, newValue: { status: target }, reason: comment || req.body.override_reason });
     await client.query('COMMIT');
+    queueCalendarSync(req.user.organization_id, 'COMPLIANCE', id);
     res.json({ item: rows[0] });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -714,6 +724,7 @@ export const rescheduleComplianceItem = asyncHandler(async (req, res) => {
   );
   await pool.query(`UPDATE compliance_items SET current_due_date=$1,updated_by=$2,updated_at=NOW() WHERE id=$3 AND organization_id=$4`, [newDate, req.user.id, id, req.user.organization_id]);
   await writeComplianceAudit(pool, req, { action: 'RESCHEDULE_APPROVED', entityType: 'COMPLIANCE', entityId: id, siteId: existing.site_id, previousValue: { current_due_date: existing.current_due_date }, newValue: { current_due_date: newDate }, reason });
+  queueCalendarSync(req.user.organization_id, 'COMPLIANCE', id);
   res.json({ due_date_change: rows[0], pending_approval: false });
 });
 
@@ -743,6 +754,7 @@ export const reviewDueDateChange = asyncHandler(async (req, res) => {
     }
     await writeComplianceAudit(client, req, { action: `RESCHEDULE_${decision}`, entityType: 'COMPLIANCE', entityId: change.compliance_item_id, siteId: change.site_id, previousValue: { current_due_date: change.old_due_date }, newValue: { current_due_date: decision === 'APPROVED' ? change.new_due_date : change.old_due_date }, reason: req.body.comment || change.reason });
     await client.query('COMMIT');
+    if (decision === 'APPROVED') queueCalendarSync(req.user.organization_id, 'COMPLIANCE', change.compliance_item_id);
     res.json({ success: true, decision });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -1557,6 +1569,7 @@ export const createComplianceEntity = (entity) => asyncHandler(async (req, res) 
       action: 'CREATE', entityType: config.label, entityId: rows[0].id,
       siteId: rows[0].site_id, newValue: rows[0],
     });
+    if (CALENDAR_EVENT_TYPES[entity]) queueCalendarSync(req.user.organization_id, CALENDAR_EVENT_TYPES[entity], rows[0].id);
     res.status(201).json({ [entity]: rows[0] });
   } catch (error) {
     if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
@@ -1599,6 +1612,7 @@ export const updateComplianceEntity = (entity) => asyncHandler(async (req, res) 
       action: 'UPDATE', entityType: config.label, entityId: id, siteId: existing.site_id,
       previousValue: existing, newValue: rows[0], reason: req.body.reason,
     });
+    if (CALENDAR_EVENT_TYPES[entity]) queueCalendarSync(req.user.organization_id, CALENDAR_EVENT_TYPES[entity], id);
     res.json({ [entity]: rows[0] });
   } catch (error) {
     if (error.statusCode) return res.status(error.statusCode).json({ message: error.message });
@@ -1614,6 +1628,7 @@ export const deleteComplianceEntity = (entity) => asyncHandler(async (req, res) 
   const reason = requireReason(req.body.reason);
   await pool.query(`UPDATE ${config.table} SET deleted_at=NOW(),updated_by=$1,updated_at=NOW() WHERE id=$2 AND organization_id=$3`, [req.user.id, id, req.user.organization_id]);
   await writeComplianceAudit(pool, req, { action: 'DELETE', entityType: config.label, entityId: id, siteId: existing.site_id, previousValue: existing, reason });
+  if (CALENDAR_EVENT_TYPES[entity]) queueCalendarSync(req.user.organization_id, CALENDAR_EVENT_TYPES[entity], id);
   res.json({ success: true });
 });
 
@@ -1673,6 +1688,7 @@ export const updateLegalNoticeStatus = asyncHandler(async (req, res) => {
       newValue: { status: target }, reason: req.body.comment,
     });
     await client.query('COMMIT');
+    queueCalendarSync(req.user.organization_id, 'NOTICE_REPLY', noticeId);
     res.json({ notice: rows[0] });
   } catch (error) {
     await client.query('ROLLBACK');
