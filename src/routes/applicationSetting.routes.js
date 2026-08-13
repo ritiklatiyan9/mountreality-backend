@@ -6,6 +6,8 @@ import {
   updatePlotRegistryWorkflow,
   getSmsReminderSettings,
   updateSmsReminderSettings,
+  getReceiptConfiguration,
+  updateReceiptConfiguration,
 } from '../controllers/applicationSetting.controller.js';
 import { invalidateCacheOnSuccess } from '../middlewares/cache.middleware.js';
 
@@ -26,5 +28,10 @@ router.put(
 // Payment-reminder SMS config — admin only, per site.
 router.get('/sms-reminders', authMiddleware, requireRole('admin'), getSmsReminderSettings);
 router.put('/sms-reminders', authMiddleware, requireRole('admin'), updateSmsReminderSettings);
+
+// The configured design is shared by every receipt printer on the Site.
+// Site users may read it; only admins may customize it.
+router.get('/receipt', authMiddleware, getReceiptConfiguration);
+router.put('/receipt', authMiddleware, requireRole('admin'), updateReceiptConfiguration);
 
 export default router;

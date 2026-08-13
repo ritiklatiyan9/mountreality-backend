@@ -1,7 +1,7 @@
 import express from 'express';
 import authMiddleware from '../middlewares/auth.middleware.js';
 import {
-  getStats, getAnalytics, listOrganizations, getOrganizationDetail,
+  getStats, getOperations, getOwnerAudit, getAnalytics, listOrganizations, getOrganizationDetail,
   registerOrganization, updateOrganization, extendSubscription, deleteOrganization,
   listPlansAdmin, createPlan, updatePlan,
 } from '../controllers/owner.controller.js';
@@ -20,6 +20,8 @@ const requireOwner = (req, res, next) => {
 router.use(authMiddleware, requireOwner);
 
 router.get('/stats', getStats);
+router.get('/operations', getOperations);
+router.get('/audit', getOwnerAudit);
 router.get('/analytics', getAnalytics);
 router.get('/organizations', listOrganizations);
 router.post('/organizations', registerOrganization);

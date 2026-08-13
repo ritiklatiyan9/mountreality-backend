@@ -29,97 +29,28 @@ async function runFromSourceTables(siteId, start, end) {
   ]);
   const totalExpense = expData.total;
 
-  // Outstanding Run A: direct person-ledger entries are already their own
-  // source of truth, while mapped person movements are independently rebuilt
-  // from the seven module tables that should have produced `%_person` mirrors.
-  // This makes the verifier capable of detecting a missing/stale mirror instead
-  // of comparing the same cash_flow_entries query with itself.
+  // Personal Ledgers are manual-only. Their own entries are therefore the
+  // authoritative source for outstanding balances; no other module is rebuilt
+  // into a person's ledger or expected to create a mirror row.
   const outResult = await pool.query(
-    `WITH source_person_movements AS (
-       SELECT fp.date::date AS entry_date, fp.amount::numeric AS debit, 0::numeric AS credit
-       FROM farmer_payments fp
-       JOIN farmers f ON f.id = fp.farmer_id
-       WHERE f.site_id = $1 AND fp.date < $2
-         AND (fp.mapped_member_id IS NOT NULL OR fp.mapped_user_id IS NOT NULL)
-         AND LOWER(COALESCE(fp.status, 'approved')) = 'approved'
-         AND UPPER(COALESCE(fp.cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
-
-       UNION ALL
-       SELECT pcp.date::date, pcp.amount::numeric, 0::numeric
-       FROM plot_commission_payments pcp
-       WHERE pcp.site_id = $1 AND pcp.date < $2
-         AND (pcp.mapped_member_id IS NOT NULL OR pcp.mapped_user_id IS NOT NULL)
-         AND LOWER(COALESCE(pcp.status, 'approved')) = 'approved'
-         AND UPPER(COALESCE(pcp.cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
-
-       UNION ALL
-       SELECT db.date::date, db.debit::numeric, db.credit::numeric
-       FROM day_book db
-       WHERE db.site_id = $1 AND db.date < $2
-         AND (db.mapped_member_id IS NOT NULL OR db.mapped_user_id IS NOT NULL)
-         AND UPPER(COALESCE(db.entry_type, 'GENERAL')) NOT IN
-           ('CASH FLOW', 'FARMER PAYMENT', 'PLOT COMMISSION',
-            'FIRM TRANSACTION', 'PLOT PAYMENT', 'VENDOR PAYMENT')
-         AND LOWER(COALESCE(db.status, 'approved')) = 'approved'
-         AND UPPER(COALESCE(db.cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
-
-       UNION ALL
-       SELECT ft.date::date, ft.debit::numeric, ft.credit::numeric
-       FROM firm_transactions ft
-       WHERE ft.site_id = $1 AND ft.date < $2
-         AND (ft.mapped_member_id IS NOT NULL OR ft.mapped_user_id IS NOT NULL)
-         AND LOWER(COALESCE(ft.status, 'approved')) = 'approved'
-         AND UPPER(COALESCE(ft.cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
-
-       UNION ALL
-       SELECT pp.date::date, 0::numeric, pp.amount::numeric
-       FROM plot_payments pp
-       WHERE pp.site_id = $1 AND pp.date < $2
-         AND (pp.mapped_member_id IS NOT NULL OR pp.mapped_user_id IS NOT NULL)
-         AND LOWER(COALESCE(pp.status, 'approved')) = 'approved'
-         AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
-
-       UNION ALL
-       SELECT ex.date::date, ex.debit::numeric, ex.credit::numeric
-       FROM expenses ex
-       WHERE ex.site_id = $1 AND ex.date < $2
-         AND (ex.mapped_member_id IS NOT NULL OR ex.mapped_user_id IS NOT NULL)
-         AND LOWER(COALESCE(ex.status, 'approved')) = 'approved'
-         AND UPPER(COALESCE(ex.cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
-
-       UNION ALL
-       SELECT vp.payment_date::date, vp.amount::numeric, 0::numeric
-       FROM vendor_payments vp
-       WHERE vp.site_id = $1 AND vp.payment_date < $2
-         AND (vp.mapped_member_id IS NOT NULL OR vp.mapped_user_id IS NOT NULL)
-         AND LOWER(COALESCE(vp.status, 'approved')) = 'approved'
-         AND UPPER(COALESCE(vp.cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
-     ), direct_person_movements AS (
-       SELECT cfe.date::date AS entry_date, cfe.debit::numeric, cfe.credit::numeric
-       FROM cash_flow_entries cfe
-       JOIN cash_flow_months cfm ON cfm.id = cfe.cash_flow_month_id
-       WHERE cfe.site_id = $1 AND cfe.date < $2
-         AND LOWER(cfm.ledger_type) = 'person'
-         AND COALESCE(cfe.source_module, '') NOT LIKE '%\\_person'
-         AND COALESCE(cfe.source_module, '') NOT IN
-           ('plot_registry_payments', 'plot_registry_payments_person')
-         AND LOWER(COALESCE(cfe.status, 'approved')) = 'approved'
-         AND UPPER(COALESCE(cfe.cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
-     ), person_movements AS (
-       SELECT debit, credit FROM source_person_movements
-       UNION ALL
-       SELECT debit, credit FROM direct_person_movements
-     )
-     SELECT
+    `SELECT
        COALESCE(SUM(
-         GREATEST(COALESCE(debit, 0), 0)
-         + GREATEST(-COALESCE(credit, 0), 0)
+         GREATEST(COALESCE(cfe.debit, 0), 0)
+         + GREATEST(-COALESCE(cfe.credit, 0), 0)
        ), 0)::numeric AS given,
        COALESCE(SUM(
-         GREATEST(COALESCE(credit, 0), 0)
-         + GREATEST(-COALESCE(debit, 0), 0)
+         GREATEST(COALESCE(cfe.credit, 0), 0)
+         + GREATEST(-COALESCE(cfe.debit, 0), 0)
        ), 0)::numeric AS returned
-     FROM person_movements`,
+     FROM cash_flow_entries cfe
+     JOIN cash_flow_months cfm ON cfm.id = cfe.cash_flow_month_id
+     WHERE cfe.site_id = $1 AND cfe.date < $2
+       AND LOWER(cfm.ledger_type) = 'person'
+       AND COALESCE(cfe.source_module, '') NOT LIKE '%\\_person'
+       AND COALESCE(cfe.source_module, '') NOT IN
+         ('plot_registry_payments', 'plot_registry_payments_person')
+       AND LOWER(COALESCE(cfe.status, 'approved')) = 'approved'
+       AND UPPER(COALESCE(cfe.cheque_status, '')) NOT IN ('BOUNCED','RETURNED')`,
     [siteId, end]
   );
   const outstanding = (parseFloat(outResult.rows[0].given) || 0) - (parseFloat(outResult.rows[0].returned) || 0);
@@ -200,8 +131,7 @@ async function runFromCashFlowEntries(siteId, start, end) {
   const adjExpense = totalExpense + orphanExpense;
   const netProfit = getProfit(totalRevenue, adjExpense);
 
-  // Outstanding Run B: actual person-ledger rows, including module `_person`
-  // mirrors. Registry mappings remain informational and never form a balance.
+  // Outstanding Run B: actual manual Personal Ledger entries only.
   const outResult = await pool.query(
     `SELECT
        COALESCE(SUM(
@@ -216,6 +146,7 @@ async function runFromCashFlowEntries(siteId, start, end) {
      JOIN cash_flow_months cfm ON cfm.id = cfe.cash_flow_month_id
      WHERE cfe.site_id = $1 AND cfe.date < $2
        AND LOWER(cfm.ledger_type) = 'person'
+       AND COALESCE(cfe.source_module, '') NOT LIKE '%\\_person'
        AND COALESCE(cfe.source_module, '') NOT IN
          ('plot_registry_payments', 'plot_registry_payments_person')
        AND UPPER(COALESCE(cfe.cheque_status, '')) NOT IN ('BOUNCED','RETURNED')

@@ -5,6 +5,193 @@ import userModel from '../models/User.model.js';
 import { generateUniqueSubdomain, isValidSubdomain } from '../utils/subdomain.js';
 import { sendRegistrationEmail, sendPlanPurchaseEmail, sendOwnerNotificationEmail } from '../utils/mailer.js';
 
+const OWNER_ORGANIZATION_SNAPSHOT_QUERY = `
+  SELECT
+    o.id, o.name, o.subdomain, o.is_active, o.created_at,
+    sa.name AS super_admin_name, sa.email AS super_admin_email,
+    (SELECT COUNT(*)::int FROM users u WHERE u.organization_id = o.id) AS user_count,
+    (SELECT COUNT(*)::int FROM sites s WHERE s.organization_id = o.id) AS site_count,
+    (SELECT ok.status FROM organization_kyc ok WHERE ok.organization_id = o.id LIMIT 1) AS kyc_status,
+    current_sub.id AS subscription_id,
+    current_sub.plan_id, current_sub.plan_name, current_sub.price_inr,
+    current_sub.site_limit, current_sub.max_users,
+    current_sub.current_period_start, current_sub.current_period_end,
+    latest_sub.status AS latest_subscription_status,
+    latest_sub.current_period_end AS latest_subscription_end,
+    latest_sub.created_at AS latest_subscription_created_at
+  FROM organizations o
+  LEFT JOIN LATERAL (
+    SELECT u.name, u.email
+      FROM users u
+     WHERE u.organization_id = o.id AND u.role = 'super_admin'
+     ORDER BY u.created_at ASC
+     LIMIT 1
+  ) sa ON true
+  LEFT JOIN LATERAL (
+    SELECT s.id, s.plan_id, p.name AS plan_name, p.price_inr, p.site_limit, p.max_users,
+           s.current_period_start, s.current_period_end
+      FROM subscriptions s
+      JOIN plans p ON p.id = s.plan_id
+     WHERE s.organization_id = o.id
+       AND s.status = 'active'
+       AND s.current_period_end > NOW()
+     ORDER BY s.current_period_end DESC
+     LIMIT 1
+  ) current_sub ON true
+  LEFT JOIN LATERAL (
+    SELECT s.status, s.current_period_end, s.created_at
+      FROM subscriptions s
+     WHERE s.organization_id = o.id
+     ORDER BY s.created_at DESC
+     LIMIT 1
+  ) latest_sub ON true
+  ORDER BY o.created_at DESC
+`;
+
+const writeOwnerAudit = async (executor, req, {
+  action,
+  summary,
+  organizationId = null,
+  organizationName = null,
+  metadata = {},
+}) => {
+  await executor.query(
+    `INSERT INTO platform_owner_audit_log
+       (actor_user_id, organization_id, organization_name, action, summary, metadata,
+        request_id, ip_address, user_agent)
+     VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9)`,
+    [
+      req.user?.id ?? null,
+      organizationId,
+      organizationName,
+      action,
+      summary,
+      JSON.stringify(metadata),
+      req.requestId || null,
+      req.ip || null,
+      req.get?.('user-agent') || null,
+    ],
+  );
+};
+
+const loadOwnerOrganizationSnapshots = async () => {
+  const { rows } = await pool.query(OWNER_ORGANIZATION_SNAPSHOT_QUERY);
+  return rows;
+};
+
+const classifyOrganizationHealth = (org) => {
+  const end = org.current_period_end ? new Date(org.current_period_end) : null;
+  const daysLeft = end ? Math.ceil((end.getTime() - Date.now()) / 86400000) : 0;
+  const siteLimit = Number(org.site_limit || 0);
+  const userLimit = org.max_users == null ? null : Number(org.max_users);
+  const siteCapacityRisk = siteLimit > 0 && siteLimit < 999999 && Number(org.site_count) >= Math.max(1, Math.floor(siteLimit * 0.8));
+  const userCapacityRisk = userLimit != null && userLimit > 0 && Number(org.user_count) >= Math.max(1, Math.floor(userLimit * 0.8));
+
+  if (!org.is_active) return { status: 'disabled', label: 'Disabled', reasons: ['Organization is disabled'], daysLeft };
+  if (!org.subscription_id && org.latest_subscription_status === 'pending') {
+    return { status: 'payment_pending', label: 'Payment pending', reasons: ['Payment order has not been activated'], daysLeft };
+  }
+  if (!org.subscription_id) {
+    return { status: 'expired', label: 'Subscription expired', reasons: ['No active subscription'], daysLeft };
+  }
+  if (daysLeft <= 7) return { status: 'renewal_urgent', label: 'Renewal due soon', reasons: [`Subscription ends in ${Math.max(0, daysLeft)} day${daysLeft === 1 ? '' : 's'}`], daysLeft };
+  if (daysLeft <= 30) return { status: 'renewal', label: 'Renewal this month', reasons: [`Subscription ends in ${daysLeft} days`], daysLeft };
+  if (org.kyc_status !== 'verified') {
+    return { status: 'onboarding', label: 'Onboarding incomplete', reasons: [`Company KYC is ${org.kyc_status || 'pending'}`], daysLeft };
+  }
+  if (siteCapacityRisk || userCapacityRisk) {
+    const reasons = [];
+    if (siteCapacityRisk) reasons.push(`Sites at ${org.site_count}/${siteLimit}`);
+    if (userCapacityRisk) reasons.push(`Users at ${org.user_count}/${userLimit}`);
+    return { status: 'capacity', label: 'Near plan limit', reasons, daysLeft };
+  }
+  return { status: 'healthy', label: 'Healthy', reasons: [], daysLeft };
+};
+
+/** GET /owner/operations — launch operations view: tenant health, billing risk and audit activity. */
+export const getOperations = asyncHandler(async (req, res) => {
+  const [organizations, activityResult] = await Promise.all([
+    loadOwnerOrganizationSnapshots(),
+    pool.query(`
+      SELECT a.id, a.action, a.summary, a.organization_id, a.organization_name,
+             a.metadata, a.created_at, u.name AS actor_name
+        FROM platform_owner_audit_log a
+        LEFT JOIN users u ON u.id = a.actor_user_id
+       ORDER BY a.created_at DESC
+       LIMIT 12
+    `),
+  ]);
+
+  const enriched = organizations.map((org) => ({
+    ...org,
+    health: classifyOrganizationHealth(org),
+  }));
+  const attentionPriority = {
+    disabled: 0, expired: 1, payment_pending: 2, renewal_urgent: 3,
+    renewal: 4, onboarding: 5, capacity: 6, healthy: 99,
+  };
+  const attention = enriched
+    .filter((org) => org.health.status !== 'healthy')
+    .sort((a, b) => (attentionPriority[a.health.status] - attentionPriority[b.health.status]) || (a.health.daysLeft - b.health.daysLeft))
+    .slice(0, 12);
+
+  const active = enriched.filter((org) => org.subscription_id);
+  const expiring7d = active.filter((org) => org.health.daysLeft <= 7).length;
+  const expiring30d = active.filter((org) => org.health.daysLeft <= 30).length;
+  const expired = enriched.filter((org) => !org.subscription_id && org.latest_subscription_status === 'active').length;
+  const pendingPayments = enriched.filter((org) => !org.subscription_id && org.latest_subscription_status === 'pending').length;
+  const capacityRisks = enriched.filter((org) => org.health.status === 'capacity').length;
+  const kycPending = enriched.filter((org) => org.kyc_status !== 'verified').length;
+  const recentSignups = enriched.slice(0, 6);
+
+  res.json({
+    stats: {
+      total_organizations: enriched.length,
+      active_organizations: enriched.filter((org) => org.is_active).length,
+      total_users: enriched.reduce((sum, org) => sum + Number(org.user_count || 0), 0),
+      total_sites: enriched.reduce((sum, org) => sum + Number(org.site_count || 0), 0),
+      subscribed_organizations: active.length,
+      mrr_inr: active.reduce((sum, org) => sum + Number(org.price_inr || 0), 0),
+      signups_last_30d: enriched.filter((org) => new Date(org.created_at) > new Date(Date.now() - 30 * 86400000)).length,
+      disabled_organizations: enriched.filter((org) => !org.is_active).length,
+      expiring_7d: expiring7d,
+      expiring_30d: expiring30d,
+      expired_subscriptions: expired,
+      pending_payments: pendingPayments,
+      capacity_risks: capacityRisks,
+      kyc_pending: kycPending,
+    },
+    attention,
+    recent_signups: recentSignups,
+    activity: activityResult.rows,
+  });
+});
+
+/** GET /owner/audit — paginated owner mutations, optionally for one organization. */
+export const getOwnerAudit = asyncHandler(async (req, res) => {
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 25));
+  const organizationId = parseInt(req.query.organization_id, 10);
+  const values = [];
+  const where = [];
+  if (Number.isInteger(organizationId) && organizationId > 0) {
+    values.push(organizationId);
+    where.push(`a.organization_id = $${values.length}`);
+  }
+  values.push(limit);
+  const { rows } = await pool.query(
+    `SELECT a.id, a.action, a.summary, a.organization_id, a.organization_name,
+            a.metadata, a.request_id, a.ip_address, a.created_at,
+            u.name AS actor_name, u.email AS actor_email
+       FROM platform_owner_audit_log a
+       LEFT JOIN users u ON u.id = a.actor_user_id
+      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+      ORDER BY a.created_at DESC
+      LIMIT $${values.length}`,
+    values,
+  );
+  res.json({ audit: rows });
+});
+
 /**
  * GET /owner/stats — platform KPIs for the Owner Panel dashboard.
  */
@@ -112,6 +299,13 @@ export const registerOrganization = asyncHandler(async (req, res) => {
        VALUES ($1, $2, 'active', NOW(), NOW() + ($3 || ' days')::interval) RETURNING *`,
       [org.rows[0].id, plan.id, days]
     );
+    await writeOwnerAudit(client, req, {
+      action: 'organization.registered',
+      summary: `Registered ${company_name} on the ${plan.name} plan for ${days} days`,
+      organizationId: org.rows[0].id,
+      organizationName: company_name,
+      metadata: { plan_id: plan.id, plan_name: plan.name, days, admin_email: email },
+    });
     await client.query('COMMIT');
 
     sendRegistrationEmail({ to: email, name, companyName: company_name, orgSubdomain: subdomain })
@@ -149,7 +343,7 @@ export const getOrganizationDetail = asyncHandler(async (req, res) => {
   const { rows: orgRows } = await pool.query('SELECT * FROM organizations WHERE id = $1', [orgId]);
   if (!orgRows[0]) return res.status(404).json({ message: 'Organization not found' });
 
-  const [subscriptions, users, sites] = await Promise.all([
+  const [subscriptions, users, sites, ownerAudit] = await Promise.all([
     pool.query(
       `SELECT s.*, p.code AS plan_code, p.name AS plan_name, p.price_inr, p.site_limit
        FROM subscriptions s JOIN plans p ON p.id = s.plan_id
@@ -166,6 +360,15 @@ export const getOrganizationDetail = asyncHandler(async (req, res) => {
        FROM sites WHERE organization_id = $1 ORDER BY created_at DESC`,
       [orgId]
     ),
+    pool.query(
+      `SELECT a.id, a.action, a.summary, a.metadata, a.created_at, u.name AS actor_name
+         FROM platform_owner_audit_log a
+         LEFT JOIN users u ON u.id = a.actor_user_id
+        WHERE a.organization_id = $1
+        ORDER BY a.created_at DESC
+        LIMIT 25`,
+      [orgId]
+    ),
   ]);
 
   const current = subscriptions.rows.find((s) => s.status === 'active' && new Date(s.current_period_end) > new Date()) || null;
@@ -176,6 +379,7 @@ export const getOrganizationDetail = asyncHandler(async (req, res) => {
     subscription_history: subscriptions.rows,
     users: users.rows,
     sites: sites.rows,
+    owner_audit: ownerAudit.rows,
   });
 });
 
@@ -254,6 +458,16 @@ export const updateOrganization = asyncHandler(async (req, res) => {
   }
   if (!rows[0]) return res.status(404).json({ message: 'Organization not found' });
 
+  await writeOwnerAudit(pool, req, {
+    action: is_active !== undefined ? 'organization.status_changed' : 'organization.domain_changed',
+    summary: is_active !== undefined
+      ? `${rows[0].name} ${is_active ? 'enabled' : 'disabled'}`
+      : `Changed ${rows[0].name} subdomain to ${rows[0].subdomain}`,
+    organizationId: orgId,
+    organizationName: rows[0].name,
+    metadata: { is_active, subdomain: slug },
+  });
+
   res.json({ organization: rows[0], message: 'Organization updated' });
 });
 
@@ -283,6 +497,13 @@ export const deleteOrganization = asyncHandler(async (req, res) => {
     });
   }
 
+  await writeOwnerAudit(pool, req, {
+    action: 'organization.deleted',
+    summary: `Deleted empty organization ${org[0].name}`,
+    organizationId: orgId,
+    organizationName: org[0].name,
+    metadata: { user_count: usage.user_count, site_count: usage.site_count },
+  });
   await pool.query('DELETE FROM organizations WHERE id = $1', [orgId]);
   res.json({ message: `${org[0].name} deleted` });
 });
@@ -294,12 +515,14 @@ export const deleteOrganization = asyncHandler(async (req, res) => {
 export const extendSubscription = asyncHandler(async (req, res) => {
   const orgId = parseInt(req.params.id, 10);
   const days = parseInt(req.body.days, 10);
+  const reason = String(req.body.reason || '').trim();
   if (!Number.isInteger(orgId)) return res.status(400).json({ message: 'Invalid organization id' });
   if (!Number.isInteger(days) || days <= 0 || days > 3660) {
     return res.status(400).json({ message: 'days must be between 1 and 3660' });
   }
+  if (reason.length < 5) return res.status(400).json({ message: 'A reason of at least 5 characters is required' });
 
-  const { rows: org } = await pool.query('SELECT id FROM organizations WHERE id = $1', [orgId]);
+  const { rows: org } = await pool.query('SELECT id, name FROM organizations WHERE id = $1', [orgId]);
   if (!org[0]) return res.status(404).json({ message: 'Organization not found' });
 
   let planId = parseInt(req.body.plan_id, 10);
@@ -325,6 +548,14 @@ export const extendSubscription = asyncHandler(async (req, res) => {
      RETURNING *`,
     [orgId, planId, days]
   );
+
+  await writeOwnerAudit(pool, req, {
+    action: 'subscription.extended',
+    summary: `Extended ${org[0].name} subscription by ${days} days`,
+    organizationId: orgId,
+    organizationName: org[0].name,
+    metadata: { days, plan_id: planId, reason },
+  });
 
   res.json({ message: `Subscription extended by ${days} days`, subscription: sub[0] });
 });
@@ -374,6 +605,17 @@ export const createPlan = asyncHandler(async (req, res) => {
     ]
   );
 
+  await writeOwnerAudit(pool, req, {
+    action: 'plan.created',
+    summary: `Created ${name} plan`,
+    metadata: {
+      plan_id: rows[0].id,
+      price_inr: parseInt(price_inr, 10),
+      site_limit: parseInt(site_limit, 10),
+      max_users: Number.isFinite(Number(max_users)) ? parseInt(max_users, 10) : null,
+    },
+  });
+
   res.status(201).json({ plan: rows[0], message: `${name} plan created` });
 });
 
@@ -406,6 +648,12 @@ export const updatePlan = asyncHandler(async (req, res) => {
     values
   );
   if (!rows[0]) return res.status(404).json({ message: 'Plan not found' });
+
+  await writeOwnerAudit(pool, req, {
+    action: 'plan.updated',
+    summary: `Updated ${rows[0].name} plan`,
+    metadata: { plan_id: planId, changes: req.body },
+  });
 
   res.json({ plan: rows[0], message: 'Plan updated' });
 });

@@ -30,14 +30,6 @@ class CashFlowMonthModel extends MasterModel {
   async findBySiteId(siteId, pool) {
     const query = `
       SELECT cfm.*,
-        lu.name AS linked_user_name,
-        lu.email AS linked_user_email,
-        lu.phone AS linked_user_phone,
-        lu.role AS linked_user_role,
-        lm.full_name AS linked_member_name,
-        lm.phone AS linked_member_phone,
-        lm.email AS linked_member_email,
-        lm.member_type AS linked_member_type,
         COALESCE(agg.total_debit,    0) AS total_debit,
         COALESCE(agg.total_credit,   0) AS total_credit,
         COALESCE(agg.cash_given,     0) AS cash_given,
@@ -46,8 +38,6 @@ class CashFlowMonthModel extends MasterModel {
         COALESCE(agg.bank_received,  0) AS bank_received,
         COALESCE(agg.entry_count,    0) AS entry_count
       FROM cash_flow_months cfm
-      LEFT JOIN users lu ON lu.id = cfm.linked_user_id
-      LEFT JOIN members lm ON lm.id = cfm.linked_member_id
       LEFT JOIN LATERAL (
         SELECT
           SUM(${normalizedDebitSql('cfe')}) FILTER (
@@ -146,20 +136,10 @@ class CashFlowMonthModel extends MasterModel {
   async findByIdWithTotals(id, pool) {
     const query = `
       SELECT cfm.*,
-        lu.name AS linked_user_name,
-        lu.email AS linked_user_email,
-        lu.phone AS linked_user_phone,
-        lu.role AS linked_user_role,
-        lm.full_name AS linked_member_name,
-        lm.phone AS linked_member_phone,
-        lm.email AS linked_member_email,
-        lm.member_type AS linked_member_type,
         COALESCE(agg.total_debit,  0) AS total_debit,
         COALESCE(agg.total_credit, 0) AS total_credit,
         COALESCE(agg.entry_count,  0) AS entry_count
       FROM cash_flow_months cfm
-      LEFT JOIN users lu ON lu.id = cfm.linked_user_id
-      LEFT JOIN members lm ON lm.id = cfm.linked_member_id
       LEFT JOIN LATERAL (
         SELECT
           SUM(${normalizedDebitSql('cfe')}) FILTER (

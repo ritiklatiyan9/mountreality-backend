@@ -194,6 +194,7 @@ export async function getOutstanding(siteId, _start, end) {
      WHERE cfe.site_id = $1
        AND cfe.date < $2
        AND LOWER(cfm.ledger_type) = 'person'
+       AND COALESCE(cfe.source_module, '') NOT LIKE '%\\_person'
        AND COALESCE(cfe.source_module, '') NOT IN
          ('plot_registry_payments', 'plot_registry_payments_person')
        AND UPPER(COALESCE(cfe.cheque_status, '')) NOT IN ('BOUNCED','RETURNED')
@@ -216,6 +217,7 @@ export async function getPersonalLedgerCredit(siteId, start, end) {
      JOIN cash_flow_months cfm ON cfm.id = cfe.cash_flow_month_id
      WHERE cfe.site_id = $1 ${dateFilter('cfe.date', 2)}
        AND LOWER(cfm.ledger_type) = 'person'
+       AND COALESCE(cfe.source_module, '') NOT LIKE '%\\_person'
        AND COALESCE(cfe.source_module, '') NOT IN
          ('plot_registry_payments', 'plot_registry_payments_person')
        AND (
