@@ -6,15 +6,15 @@ import { cacheResponse, invalidateCacheOnSuccess } from '../middlewares/cache.mi
 import {
   addLegalCaseTimeline, applyTemplate, complianceAuditLog, complianceCalendar,
   complianceDashboard, complianceNotifications, complianceReports, createAuthority,
-  createChecklistItem, createComplianceEntity, createComplianceItem, createTemplate,
-  deleteAuthority, deleteComplianceEntity, deleteComplianceItem, deleteTemplate, duplicateTemplate,
+  createChecklistItem, createComplianceCategory, createComplianceEntity, createComplianceItem, createTemplate,
+  deleteAuthority, deleteComplianceCategory, deleteComplianceEntity, deleteComplianceItem, deleteTemplate, duplicateTemplate,
   exportTemplates, importTemplates,
   getComplianceEntity, getComplianceItem, getComplianceSettings, getLegalConfiguration, getMyComplianceTasks,
-  listAuthorities, listComplianceEntity, listComplianceItems, listComplianceUsers,
+  listAuthorities, listComplianceCategories, listComplianceEntity, listComplianceItems, listComplianceUsers,
   linkComplianceExpense, listTemplates, markAllComplianceNotificationsRead, markComplianceNotificationRead,
   rescheduleComplianceItem, reviewComplianceApproval, reviewDueDateChange,
   unlinkComplianceExpense,
-  updateAuthority, updateChecklistItem, updateComplianceEntity, updateComplianceItem,
+  updateAuthority, updateChecklistItem, updateComplianceCategory, updateComplianceEntity, updateComplianceItem,
   updateComplianceSettings, updateComplianceStatus, updateLegalNoticeStatus, updateTemplate,
 } from '../controllers/compliance.controller.js';
 
@@ -55,6 +55,11 @@ router.delete('/items/:id/finance-links/:linkId', requirePermission('compliance'
 router.post('/due-date-changes/:changeId/review', requirePermission('compliance_settings', 'update'), bust, reviewDueDateChange);
 router.post('/approvals/:approvalId/review', requirePermission('compliance_settings', 'update'), bust, reviewComplianceApproval);
 router.post('/legal-approvals/:approvalId/review', requirePermission('legal', 'update'), bust, reviewComplianceApproval);
+
+router.get('/categories', requirePermission('compliance', 'read'), listComplianceCategories);
+router.post('/categories', requirePermission('compliance_settings', 'write'), bust, createComplianceCategory);
+router.patch('/categories/:id', requirePermission('compliance_settings', 'update'), bust, updateComplianceCategory);
+router.delete('/categories/:id', requirePermission('compliance_settings', 'delete'), bust, deleteComplianceCategory);
 
 router.get('/authorities', requirePermission('compliance', 'read'), listAuthorities);
 router.get('/legal-authorities', requirePermission('legal', 'read'), listAuthorities);

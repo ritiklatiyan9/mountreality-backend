@@ -5,7 +5,7 @@ import pool from '../config/db.js';
 import applicationSettingModel, { FEATURE_KEYS } from '../models/ApplicationSetting.model.js';
 import { uploadPlotDoc, getPlotDocUrl, deletePlotDoc } from '../utils/plotDocStorage.js';
 
-const REGISTRY_CATEGORIES = ['REGISTRY', 'NOC'];
+const REGISTRY_CATEGORIES = ['REGISTRY', 'REGISTRY_SUPPORT', 'NOC'];
 
 const parsePositiveId = (value) => {
   const id = Number.parseInt(value, 10);
@@ -40,7 +40,7 @@ const attachSignedUrls = async (documents) => {
 };
 
 /** GET /registries/documents/plots?site_id=X
- * Registry-owned folder listing. Counts only deed and NOC documents, so a
+ * Registry-owned folder listing. Counts deed, supporting evidence and NOC documents, so a
  * plot-registry user never needs access to the broader plot-payments module. */
 export const listRegistryDocumentPlots = asyncHandler(async (req, res) => {
   const siteId = parsePositiveId(req.query.site_id);
@@ -108,7 +108,10 @@ export const getRegistryDocuments = asyncHandler(async (req, res) => {
       [plotId, REGISTRY_CATEGORIES]
     ),
     pool.query(
-      `SELECT id, noc_generated_at, noc_approved_at
+      `SELECT id, lifecycle_status, noc_generated_at, noc_approved_at,
+              deed_number, registration_number, sub_registrar_office,
+              registrar_district, deed_execution_date, registration_date,
+              stamp_duty_amount, registration_fee_amount
          FROM plot_registries
         WHERE plot_id = $1
            OR (site_id = $2 AND UPPER(plot_no) = UPPER($3))
@@ -123,9 +126,11 @@ export const getRegistryDocuments = asyncHandler(async (req, res) => {
   const registry = registryResult.rows[0] || null;
   res.json({
     plot,
+    registry,
     documents,
     workflow: {
       registry_id: registry?.id || null,
+      lifecycle_status: registry?.lifecycle_status || null,
       noc_generated: Boolean(registry?.noc_generated_at),
       noc_approved: Boolean(registry?.noc_approved_at),
       workflow_unlocked: workflowUnlocked,
@@ -135,7 +140,7 @@ export const getRegistryDocuments = asyncHandler(async (req, res) => {
 });
 
 /** POST /registries/documents/plot/:plotId
- * Accepts REGISTRY or NOC only. In sequential mode, a registry deed follows a
+ * Accepts registry deed, registry support, or NOC files. In sequential mode, a registry deed follows a
  * generated NOC. The site-level workflow override deliberately bypasses that
  * business sequence while retaining file validation and module permission. */
 export const uploadRegistryDocument = asyncHandler(async (req, res) => {
@@ -145,7 +150,7 @@ export const uploadRegistryDocument = asyncHandler(async (req, res) => {
 
   const category = String(req.body.category || '').trim().toUpperCase();
   if (!REGISTRY_CATEGORIES.includes(category)) {
-    return res.status(400).json({ message: 'Category must be Registry deed or NOC' });
+    return res.status(400).json({ message: 'Category must be Registry deed, registry support, or NOC' });
   }
 
   const { rows: plotRows } = await pool.query(
@@ -304,14 +309,25 @@ export const deleteRegistryDocument = asyncHandler(async (req, res) => {
   }
   if (!await ensureSiteAccess(req, res, existing.site_id)) return;
 
-  const { rows } = await pool.query(
-    `DELETE FROM documents
-      WHERE id = $1
-        AND uploaded_source = 'PLOT_REGISTRY'
-        AND UPPER(COALESCE(category, '')) = ANY($2::text[])
-      RETURNING id, file_path`,
-    [documentId, REGISTRY_CATEGORIES]
-  );
+  let rows;
+  try {
+    ({ rows } = await pool.query(
+      `DELETE FROM documents
+        WHERE id = $1
+          AND uploaded_source = 'PLOT_REGISTRY'
+          AND UPPER(COALESCE(category, '')) = ANY($2::text[])
+        RETURNING id, file_path`,
+      [documentId, REGISTRY_CATEGORIES]
+    ));
+  } catch (error) {
+    if (error.constraint === 'executed_rera_registry_deed_retention') {
+      return res.status(409).json({
+        code: 'RERA_EXECUTED_DEED_RETENTION',
+        message: 'Upload the replacement deed before removing the final controlled deed from an executed RERA registry',
+      });
+    }
+    throw error;
+  }
   const document = rows[0];
   if (!document) return res.status(404).json({ message: 'Registry document not found' });
 

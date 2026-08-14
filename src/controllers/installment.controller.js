@@ -6,6 +6,8 @@ import { notifyPlotPaymentRecorded } from '../utils/notify.js';
 import { normalizeCashType } from '../utils/paymentMode.js';
 import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
 import { positiveId } from '../services/propertyLifecycle.service.js';
+import { resolveCollectionGuard } from '../services/collectionGuard.service.js';
+import { assertFinancePaymentModeAllowed } from '../services/sitePolicy.service.js';
 
 let hasGracePeriodColumnCache = null;
 const hasGracePeriodColumn = async () => {
@@ -641,57 +643,105 @@ export const recordInstallmentPayment = asyncHandler(async (req, res) => {
 
   if (!amount || parseFloat(amount) <= 0)
     return res.status(400).json({ message: 'A positive payment amount is required' });
-
-  const plot = await plotModel.findById(parseInt(id), pool);
-  if (!plot) return res.status(404).json({ message: 'Plot not found' });
-
-  await installmentModel.refreshStatuses(parseInt(id), pool);
-
-  let remaining = parseFloat(amount);
+  const plotId = positiveId(id, 'plot_id');
   const normalizedPaymentMode = normalizeCashType(payment_mode);
-  const selectedBankAccountId = await resolveBankAccountSelection({
-    siteId: plot.site_id,
-    paymentMode: normalizedPaymentMode,
-    bankAccountId: bank_account_id,
-  });
-  const payments = [];
+  const client = await pool.connect();
+  let result;
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock(96096,$1)', [plotId]);
+    const { rows: plotRows } = await client.query(
+      `SELECT p.id,p.site_id,p.current_booking_id,p.buyer_name
+         FROM plots p
+         JOIN sites s ON s.id=p.site_id AND s.organization_id=$2
+        WHERE p.id=$1
+        FOR UPDATE OF p`,
+      [plotId, req.user.organization_id],
+    );
+    const plot = plotRows[0];
+    if (!plot) {
+      const error = new Error('Plot not found');
+      error.statusCode = 404;
+      throw error;
+    }
+    await assertFinancePaymentModeAllowed({
+      organizationId: req.user.organization_id,
+      siteId: plot.site_id,
+      paymentMode: normalizedPaymentMode,
+      db: client,
+    });
+    const selectedBankAccountId = await resolveBankAccountSelection({
+      siteId: plot.site_id,
+      paymentMode: normalizedPaymentMode,
+      bankAccountId: bank_account_id,
+      db: client,
+    });
+    const params = [plotId];
+    let targetFilter = '';
+    if (installment_id) {
+      params.push(positiveId(installment_id, 'installment_id'));
+      targetFilter = ' AND id=$2';
+    }
+    const { rows: paymentTargets } = await client.query(
+      `SELECT * FROM plot_installments
+        WHERE plot_id=$1${targetFilter} AND superseded_at IS NULL
+          AND paid_amount<amount
+        ORDER BY sort_order,due_date,id
+        FOR UPDATE`,
+      params,
+    );
+    if (installment_id && !paymentTargets[0]) {
+      const error = new Error('Installment not found for this plot or it is already fully paid');
+      error.statusCode = 404;
+      throw error;
+    }
+    const requestedAmount = Number(amount);
+    const applicableAmount = Math.min(
+      requestedAmount,
+      paymentTargets.reduce(
+        (total, installment) => total + Math.max(Number(installment.amount) - Number(installment.paid_amount), 0),
+        0,
+      ),
+    );
+    if (applicableAmount <= 0) {
+      const error = new Error('The selected installment schedule is already fully paid');
+      error.statusCode = 400;
+      throw error;
+    }
+    const collectionDecision = await resolveCollectionGuard({
+      organizationId: req.user.organization_id,
+      siteId: plot.site_id,
+      bookingId: plot.current_booking_id,
+      proposedAmount: applicableAmount,
+      db: client,
+    });
+    if (collectionDecision.decision === 'BLOCKED') {
+      const error = new Error(collectionDecision.message || 'Payment is blocked by the active collection control');
+      error.statusCode = 409;
+      error.code = collectionDecision.code || 'COLLECTION_BLOCKED';
+      error.details = collectionDecision;
+      throw error;
+    }
+    if (collectionDecision.decision === 'REQUIRES_APPROVAL') {
+      const error = new Error('Use Project Payments to submit this receipt for the required approval before allocating it');
+      error.statusCode = 409;
+      error.code = 'COLLECTION_APPROVAL_REQUIRED';
+      error.details = collectionDecision;
+      throw error;
+    }
 
-  if (installment_id) {
-    // Pay specific installment
-    const inst = await installmentModel.findById(parseInt(installment_id), pool);
-    if (!inst || inst.plot_id !== parseInt(id))
-      return res.status(404).json({ message: 'Installment not found for this plot' });
-
-    const canPay = Math.min(remaining, inst.amount - inst.paid_amount);
-    if (canPay <= 0) return res.status(400).json({ message: 'This installment is already fully paid' });
-
-    const paymentRow = await installmentPaymentModel.create({
-      installment_id: inst.id,
-      plot_id: parseInt(id),
-      amount: canPay,
-      payment_date: payment_date || new Date().toISOString().split('T')[0],
-      payment_mode: normalizedPaymentMode,
-      reference: reference || null,
-      notes: notes || null,
-      bank_account_id: selectedBankAccountId,
-      created_by: req.user.id,
-    }, pool);
-    payments.push(paymentRow);
-
-    await installmentModel.update(inst.id, { paid_amount: parseFloat(inst.paid_amount) + canPay }, pool);
-    remaining -= canPay;
-  } else {
-    // Auto-apply to earliest unpaid installments
-    const installments = await installmentModel.findByPlotId(parseInt(id), pool);
-    const unpaid = installments.filter(i => i.paid_amount < i.amount);
-
-    for (const inst of unpaid) {
+    let remaining = requestedAmount;
+    const payments = [];
+    for (const installment of paymentTargets) {
       if (remaining <= 0) break;
-      const canPay = Math.min(remaining, inst.amount - inst.paid_amount);
-
+      const canPay = Math.min(
+        remaining,
+        Number(installment.amount) - Number(installment.paid_amount),
+      );
+      if (canPay <= 0) continue;
       const paymentRow = await installmentPaymentModel.create({
-        installment_id: inst.id,
-        plot_id: parseInt(id),
+        installment_id: installment.id,
+        plot_id: plotId,
         amount: canPay,
         payment_date: payment_date || new Date().toISOString().split('T')[0],
         payment_mode: normalizedPaymentMode,
@@ -699,33 +749,42 @@ export const recordInstallmentPayment = asyncHandler(async (req, res) => {
         notes: notes || null,
         bank_account_id: selectedBankAccountId,
         created_by: req.user.id,
-      }, pool);
+      }, client);
       payments.push(paymentRow);
-
-      await installmentModel.update(inst.id, { paid_amount: parseFloat(inst.paid_amount) + canPay }, pool);
       remaining -= canPay;
     }
+    await installmentModel.refreshStatuses(plotId, client);
+    result = {
+      plot,
+      payments,
+      applied: requestedAmount - remaining,
+      unapplied: remaining,
+      collectionDecision,
+    };
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
   }
 
-  // Refresh statuses after payment
-  await installmentModel.refreshStatuses(parseInt(id), pool);
-
-  const applied = parseFloat(amount) - remaining;
   res.status(201).json({
-    payments,
-    applied,
-    unapplied: remaining,
+    payments: result.payments,
+    applied: result.applied,
+    unapplied: result.unapplied,
+    collection_decision: result.collectionDecision,
   });
 
   // Fire-and-forget: WhatsApp the plot owner with the installment payment details.
-  if (applied > 0) {
+  if (result.applied > 0) {
     notifyPlotPaymentRecorded({
-      id: payments?.[0]?.id,
-      plot_id: parseInt(id),
-      amount: applied,
+      id: result.payments?.[0]?.id,
+      plot_id: plotId,
+      amount: result.applied,
       payment_from: normalizedPaymentMode,
       date: payment_date || new Date().toISOString().split('T')[0],
-      buyer_name: plot.buyer_name,
+      buyer_name: result.plot.buyer_name,
     }).catch((e) => console.error('[notify] error', e?.message || e));
   }
 });

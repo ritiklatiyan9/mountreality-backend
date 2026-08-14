@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import pool from '../config/db.js';
 import asyncHandler from '../utils/asyncHandler.js';
 import { encrypt, decrypt } from '../utils/tokenCrypto.js';
-import { buildOAuthClient } from '../services/googleCalendarSync.service.js';
+import { buildOAuthClient, backfillOrgEvents } from '../services/googleCalendarSync.service.js';
 import { isOriginAllowed } from '../config/cors.js';
 
 const FRONTEND_URL = (process.env.FRONTEND_URL || 'http://localhost:5173').replace(/\/$/, '');
@@ -124,6 +124,11 @@ export const oauthCallback = asyncHandler(async (req, res) => {
     console.error('[gcal] failed to store connection:', err.message);
     return fail('server_error');
   }
+  // Existing future-dated events appear on the calendar without waiting to be
+  // edited. Fire-and-forget: the admin's redirect must not wait on N API calls.
+  backfillOrgEvents(state.orgId).catch((err) => {
+    console.error(`[gcal] backfill (org ${state.orgId}) failed:`, err.message);
+  });
   res.redirect(`${settingsPage(origin)}&google=connected`);
 });
 
@@ -147,6 +152,20 @@ export const disconnect = asyncHandler(async (req, res) => {
   // Stale without the account — future connections start with a clean slate.
   await pool.query('DELETE FROM google_calendar_event_links WHERE organization_id=$1', [orgId]);
   res.json({ success: true });
+});
+
+// Rewrites linked future events in place. This lets admins apply presentation
+// changes such as an updated summary without disconnecting their account.
+export const syncFutureEvents = asyncHandler(async (req, res) => {
+  if (!isConfigured()) return res.status(503).json({ message: 'Google Calendar integration is not configured on this server' });
+  const { rowCount } = await pool.query(
+    `SELECT 1 FROM google_calendar_connections
+      WHERE organization_id=$1 AND status='active' LIMIT 1`,
+    [req.user.organization_id],
+  );
+  if (!rowCount) return res.status(404).json({ message: 'No active Google Calendar connection found' });
+  const synced = await backfillOrgEvents(req.user.organization_id);
+  res.json({ success: true, synced });
 });
 
 export const getStatus = asyncHandler(async (req, res) => {

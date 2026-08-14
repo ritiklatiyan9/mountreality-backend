@@ -9,6 +9,7 @@ import {
   previewOperatingProfile,
   publishOperatingProfile,
   reviewOperatingProfile,
+  saveOperatingProfile,
   submitOperatingProfileReview,
   updateOperatingProfileDraft,
   validateOperatingProfileRevision,
@@ -23,6 +24,7 @@ router.use(authMiddleware, requireRole('admin', 'sub_admin'));
 router.get('/site-policy', getEffectiveSitePolicy);
 
 router.get('/operating-profile', requirePermission('operating_profile', 'read'), getOperatingProfile);
+router.put('/operating-profile', requireRole('admin'), requirePermission('operating_profile', 'update'), saveOperatingProfile);
 router.post('/operating-profile/drafts', requirePermission('operating_profile', 'write'), createOperatingProfileDraft);
 router.patch('/operating-profile/drafts/:id', requirePermission('operating_profile', 'update'), updateOperatingProfileDraft);
 router.get('/operating-profile/:id/preview', requirePermission('operating_profile', 'read'), previewOperatingProfile);
@@ -32,4 +34,3 @@ router.post('/operating-profile/:id/review', requireRole('admin'), requirePermis
 router.post('/operating-profile/:id/publish', requireRole('admin'), requirePermission('operating_profile', 'update'), publishOperatingProfile);
 
 export default router;
-

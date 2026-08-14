@@ -133,6 +133,63 @@ const isPlainObject = (value) => (
 
 const upper = (value) => String(value || '').trim().toUpperCase();
 
+export const FINANCE_PAYMENT_MODES = Object.freeze({
+  ALL_MODES: 'ALL_MODES',
+  BANK_ONLY: 'BANK_ONLY',
+});
+
+export const INVENTORY_PROPERTY_TYPES = Object.freeze([
+  'PLOT',
+  'APARTMENT',
+  'SHOP',
+  'OFFICE',
+  'VILLA',
+  'OTHER',
+]);
+
+const PROPERTY_TYPES_BY_PROJECT_SHAPE = Object.freeze({
+  PLOTTED_DEVELOPMENT: Object.freeze(['PLOT']),
+  APARTMENT: Object.freeze(['APARTMENT']),
+  COMMERCIAL: Object.freeze(['SHOP', 'OFFICE']),
+  MIXED_USE: INVENTORY_PROPERTY_TYPES,
+});
+
+export const inventoryPropertyTypesForShape = (projectShape) => (
+  PROPERTY_TYPES_BY_PROJECT_SHAPE[upper(projectShape)] || PROPERTY_TYPES_BY_PROJECT_SHAPE.PLOTTED_DEVELOPMENT
+);
+
+export const normalizeInventoryPropertyType = ({ value, projectShape } = {}) => {
+  const allowed = inventoryPropertyTypesForShape(projectShape);
+  const fallback = upper(projectShape) === 'APARTMENT'
+    ? 'APARTMENT'
+    : upper(projectShape) === 'COMMERCIAL'
+      ? 'SHOP'
+      : 'PLOT';
+  const normalized = upper(value) || fallback;
+  if (!allowed.includes(normalized)) {
+    const error = new Error(`Property type ${normalized} is not available for this Site's operating profile`);
+    error.statusCode = 422;
+    error.code = 'PROPERTY_TYPE_NOT_ALLOWED';
+    error.details = { requested_property_type: normalized, allowed_property_types: allowed };
+    throw error;
+  }
+  return normalized;
+};
+
+export const normalizeFinancePaymentMode = (value) => (
+  upper(value) === FINANCE_PAYMENT_MODES.BANK_ONLY
+    ? FINANCE_PAYMENT_MODES.BANK_ONLY
+    : FINANCE_PAYMENT_MODES.ALL_MODES
+);
+
+const financePolicy = (value) => {
+  const paymentMode = normalizeFinancePaymentMode(value);
+  return {
+    payment_mode: paymentMode,
+    cash_allowed: paymentMode !== FINANCE_PAYMENT_MODES.BANK_ONLY,
+  };
+};
+
 const positiveId = (value) => {
   const parsed = Number.parseInt(value, 10);
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
@@ -628,10 +685,12 @@ const profileDefaults = (profile) => {
   capabilities.filing_preparation = reraWorkspace;
   capabilities.project_change_control = reraWorkspace;
 
-  if (['PLOTTED_DEVELOPMENT', 'MIXED_USE'].includes(projectShape)) {
+  if (projectShape === 'PLOTTED_DEVELOPMENT') {
     capabilities.plotted_inventory = true;
-    capabilities.mixed_use_inventory = projectShape === 'MIXED_USE';
     terminology.inventory_unit = 'Plot';
+    terminology.collections_module = 'Plot Payments';
+    terminology.conveyance_module = 'Plot Registries';
+    terminology.commission_module = 'Plot Commissions';
     fields = mergeFields(fields, {
       plots: {
         plot_no: { label: 'Approved Plot Number' },
@@ -641,10 +700,29 @@ const profileDefaults = (profile) => {
     });
   }
 
+  if (projectShape === 'MIXED_USE') {
+    capabilities.plotted_inventory = true;
+    capabilities.mixed_use_inventory = true;
+    terminology.inventory_unit = 'Property';
+    terminology.collections_module = 'Property Payments';
+    terminology.conveyance_module = 'Property Registries';
+    terminology.commission_module = 'Property Commissions';
+    fields = mergeFields(fields, {
+      plots: {
+        plot_no: { label: 'Property Number' },
+        block: { label: 'Block / Tower / Section' },
+        plot_size: { label: 'Property Area' },
+      },
+    });
+  }
+
   if (['APARTMENT', 'COMMERCIAL'].includes(projectShape)) {
     capabilities.group_housing_inventory = projectShape === 'APARTMENT';
     capabilities.commercial_inventory = projectShape === 'COMMERCIAL';
     terminology.inventory_unit = projectShape === 'APARTMENT' ? 'Unit' : 'Commercial Unit';
+    terminology.collections_module = projectShape === 'APARTMENT' ? 'Unit Payments' : 'Commercial Payments';
+    terminology.conveyance_module = projectShape === 'APARTMENT' ? 'Unit Registries' : 'Commercial Registries';
+    terminology.commission_module = projectShape === 'APARTMENT' ? 'Unit Commissions' : 'Commercial Commissions';
 
     // Phase 1 intentionally has no tower/unit sales hierarchy. Hide legacy
     // plot-specific workflows for an explicitly published non-plotted profile;
@@ -698,6 +776,7 @@ const profileSummary = (profile) => ({
   project_shape: configuredValue(profile, 'project_shape'),
   regulatory_status: configuredValue(profile, 'regulatory_status'),
   project_structure: configuredValue(profile, 'project_structure'),
+  finance_payment_mode: normalizeFinancePaymentMode(configuredValue(profile, 'finance_payment_mode')),
   ruleset_version_id: profile.ruleset_version_id ?? null,
   effective_from: profile.effective_from ?? null,
 });
@@ -772,6 +851,7 @@ export function resolvePolicyFromProfile({
       mode: 'LEGACY',
       policy_revision: null,
       profile: null,
+      finance: financePolicy(),
       modules,
       capabilities,
       terminology,
@@ -840,6 +920,7 @@ export function resolvePolicyFromProfile({
     mode: published ? 'PROFILE' : 'PREVIEW',
     policy_revision: profile.revision_number ?? profile.revision ?? profile.id ?? null,
     profile: profileSummary(profile),
+    finance: financePolicy(configuredValue(profile, 'finance_payment_mode')),
     modules,
     capabilities,
     terminology,
@@ -874,11 +955,12 @@ const loadPolicyHeader = async (db, organizationId, siteId) => {
     `SELECT s.id AS site_id,
             p.id AS profile_revision_id,
             p.revision_number AS profile_revision,
+            p.finance_payment_mode,
             p.ruleset_version_id,
             rv.version AS ruleset_version
        FROM sites s
        LEFT JOIN LATERAL (
-         SELECT spr.id,spr.revision_number,spr.ruleset_version_id
+         SELECT spr.id,spr.revision_number,spr.finance_payment_mode,spr.ruleset_version_id
            FROM site_operating_profile_revisions spr
           WHERE spr.organization_id=$1
             AND spr.site_id=s.id
@@ -950,6 +1032,39 @@ const notFoundError = () => {
   error.statusCode = 404;
   return error;
 };
+
+/**
+ * Resolve only the finance-mode slice for write-path validation. This uses the
+ * existing tenant/status/revision index and skips ruleset and field-policy JSON.
+ */
+export async function resolveFinancePaymentPolicy({
+  organizationId, siteId, db = pool,
+} = {}) {
+  const orgId = positiveId(organizationId);
+  const resolvedSiteId = positiveId(siteId);
+  if (!orgId || !resolvedSiteId) {
+    const error = new Error('Valid organizationId and siteId are required');
+    error.statusCode = 400;
+    throw error;
+  }
+  if (!db || typeof db.query !== 'function') throw new TypeError('db.query is required');
+  const header = await loadPolicyHeader(db, orgId, resolvedSiteId);
+  if (!header) throw notFoundError();
+  return financePolicy(header.finance_payment_mode);
+}
+
+export async function assertFinancePaymentModeAllowed({
+  organizationId, siteId, paymentMode, db = pool,
+} = {}) {
+  if (upper(paymentMode) !== 'CASH') return;
+  const policy = await resolveFinancePaymentPolicy({ organizationId, siteId, db });
+  if (!policy.cash_allowed) {
+    const error = new Error("Cash is disabled by this Site's published finance profile. Select Bank or Cheque.");
+    error.statusCode = 422;
+    error.code = 'CASH_DISABLED_BY_FINANCE_PROFILE';
+    throw error;
+  }
+}
 
 /** Resolve the published effective policy after validating site ownership. */
 export async function resolveSitePolicy({ organizationId, siteId, db = pool } = {}) {

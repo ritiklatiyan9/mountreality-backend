@@ -1,4 +1,8 @@
 const DECISIONS = new Set(['ALLOWED', 'WARNING', 'REQUIRES_APPROVAL', 'BLOCKED']);
+const RERA_OPERATING_MODELS = new Set([
+  'RERA_PROJECT_PROMOTER',
+  'RERA_ONGOING_PROJECT_REGULARISATION',
+]);
 
 export const COLLECTION_DECISIONS = Object.freeze([...DECISIONS]);
 
@@ -241,14 +245,18 @@ const normalizeDecision = (value, fallback = 'WARNING') => {
 const moneyNumber = (value) => Number.parseFloat(value) || 0;
 
 /**
- * Evaluate reviewed, explicitly configured collection controls. The caller is
- * responsible for loading the booking/ruleset. Unreviewed configuration can
- * explain a warning but can never block money or assert a legal requirement.
+ * Evaluate the published operating-profile baseline plus reviewed, explicitly
+ * configured collection controls. Unreviewed ruleset JSON can explain a
+ * warning but cannot create an additional block.
  */
 export function evaluateCollectionPolicy({
   workflowPolicy = {},
   ruleset = null,
+  operatingModel = null,
   agreementStatus = 'NOT_STARTED',
+  agreementRegistrationStatus = 'NOT_REGISTERED',
+  agreementRegistrationNumber = null,
+  agreementRegistrationDate = null,
   currentQualifyingCollection = 0,
   proposedAmount = 0,
   finalConsideration = 0,
@@ -256,6 +264,15 @@ export function evaluateCollectionPolicy({
   const collectionPolicy = workflowPolicy?.collections;
   const after = moneyNumber(currentQualifyingCollection) + moneyNumber(proposedAmount);
   const reviewed = ruleset?.source_review_status === 'REVIEWED';
+  const normalizedOperatingModel = String(operatingModel || '').trim().toUpperCase();
+  const normalizedAgreementStatus = String(agreementStatus || '').trim().toUpperCase();
+  const normalizedRegistrationStatus = String(agreementRegistrationStatus || '').trim().toUpperCase();
+  const reraMode = RERA_OPERATING_MODELS.has(normalizedOperatingModel);
+  let centralLimit = null;
+  const registeredAgreement = normalizedAgreementStatus === 'EXECUTED'
+    && normalizedRegistrationStatus === 'REGISTERED'
+    && Boolean(String(agreementRegistrationNumber || '').trim())
+    && Boolean(agreementRegistrationDate);
   const base = {
     decision: 'ALLOWED',
     code: 'NO_REVIEWED_COLLECTION_CONTROL',
@@ -268,12 +285,58 @@ export function evaluateCollectionPolicy({
       label: ruleset.version_label,
       source_review_status: ruleset.source_review_status,
     } : null,
+    operating_model: normalizedOperatingModel || null,
     agreement_status: agreementStatus,
+    agreement_registration_status: normalizedRegistrationStatus || 'NOT_REGISTERED',
+    agreement_registered: registeredAgreement,
     current_qualifying_collection: moneyNumber(currentQualifyingCollection).toFixed(2),
     proposed_amount: moneyNumber(proposedAmount).toFixed(2),
     after_receipt: after.toFixed(2),
   };
-  if (!collectionPolicy || typeof collectionPolicy !== 'object') return base;
+
+  // Central RERA baseline: before a written agreement for sale is both
+  // executed and registered, aggregate collections may not exceed ten per
+  // cent of the immutable booking consideration. Reviewed state/tenant rules
+  // are evaluated below as an additional layer, so they may impose a stricter
+  // control without being able to weaken this baseline.
+  if (reraMode && !registeredAgreement) {
+    const consideration = moneyNumber(finalConsideration);
+    if (consideration <= 0) {
+      return {
+        ...base,
+        decision: 'BLOCKED',
+        code: 'RERA_CONSIDERATION_REQUIRED',
+        message: 'A confirmed booking consideration is required before recording a RERA customer collection',
+        rule: 'RERA_2016_SECTION_13',
+      };
+    }
+    const centralLimitPaise = Math.floor(Math.round(consideration * 100) / 10);
+    centralLimit = centralLimitPaise / 100;
+    if (Math.round(after * 100) > centralLimitPaise) {
+      return {
+        ...base,
+        decision: 'BLOCKED',
+        code: 'RERA_PRE_AGREEMENT_COLLECTION_LIMIT',
+        message: 'This receipt would take pre-registration collections above 10% of the booking consideration',
+        rule: 'RERA_2016_SECTION_13',
+        configured_limit: centralLimit.toFixed(2),
+      };
+    }
+  }
+
+  if (!collectionPolicy || typeof collectionPolicy !== 'object') {
+    return reraMode ? {
+      ...base,
+      code: registeredAgreement
+        ? 'RERA_REGISTERED_AGREEMENT_COLLECTION_ALLOWED'
+        : 'RERA_PRE_AGREEMENT_COLLECTION_LIMIT_PASSED',
+      message: registeredAgreement
+        ? 'The registered agreement unlocks the central pre-agreement collection limit'
+        : 'The proposed collection remains within 10% of the booking consideration',
+      rule: 'RERA_2016_SECTION_13',
+      configured_limit: registeredAgreement ? null : centralLimit.toFixed(2),
+    } : base;
+  }
 
   if (!reviewed) {
     return {
@@ -289,7 +352,8 @@ export function evaluateCollectionPolicy({
     const accepted = Array.isArray(agreementGuard.accepted_statuses)
       ? agreementGuard.accepted_statuses.map((status) => String(status).toUpperCase())
       : ['EXECUTED'];
-    if (!accepted.includes(String(agreementStatus || '').toUpperCase())) {
+    if (!accepted.includes(normalizedAgreementStatus)
+        && !accepted.includes(normalizedRegistrationStatus)) {
       return {
         ...base,
         decision: normalizeDecision(agreementGuard.decision, 'REQUIRES_APPROVAL'),
@@ -302,7 +366,10 @@ export function evaluateCollectionPolicy({
   }
 
   const threshold = collectionPolicy.pre_agreement_threshold;
-  if (threshold?.enabled === true && String(agreementStatus).toUpperCase() !== 'EXECUTED') {
+  const configuredThresholdSatisfied = reraMode
+    ? registeredAgreement
+    : normalizedAgreementStatus === 'EXECUTED';
+  if (threshold?.enabled === true && !configuredThresholdSatisfied) {
     const configuredAmount = moneyNumber(threshold.amount);
     const configuredPercent = moneyNumber(threshold.percentage);
     const limit = configuredAmount > 0
@@ -345,4 +412,3 @@ export function collectionSummary({ consideration = 0, scheduled = 0, received =
     percentage: value > 0 ? Math.min(Math.round((effectiveReceived / value) * 10000) / 100, 100) : 0,
   };
 }
-

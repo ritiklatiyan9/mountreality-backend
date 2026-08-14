@@ -78,9 +78,30 @@ export async function getPlotsWithTotals(siteId) {
     LEFT JOIN direct_rollup pp_agg ON pp_agg.plot_id = p.id
     LEFT JOIN installment_rollup ip_agg ON ip_agg.plot_id = p.id
     WHERE p.site_id = $1
+    ORDER BY
+      REGEXP_REPLACE(UPPER(p.plot_no), '[0-9].*$', ''),
+      NULLIF(REGEXP_REPLACE(p.plot_no, '[^0-9]', '', 'g'), '')::bigint,
+      UPPER(p.plot_no),
+      p.id
   `;
   const { rows } = await pool.query(query, [siteId]);
-  return rows;
+  // PostgreSQL numeric columns can represent NaN, but GraphQLFloat cannot.
+  // A single malformed legacy value must not make Apollo discard the whole
+  // inventory response and render an empty page.
+  const floatFields = [
+    'plot_size', 'plot_size_mtr', 'plot_rate', 'sale_price', 'registry_area',
+    'circle_rate', 'to_receive_bank', 'first_installment', 'plot_commission',
+    'commission_value', 'commission_rate', 'original_plot_rate',
+    'discount_rate', 'plc_charges', 'interest_rate', 'total_received',
+    'received_bank', 'received_cash',
+  ];
+  return rows.map((row) => {
+    const safe = { ...row };
+    floatFields.forEach((field) => {
+      if (safe[field] != null && !Number.isFinite(Number(safe[field]))) safe[field] = null;
+    });
+    return safe;
+  });
 }
 
 /**

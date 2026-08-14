@@ -8,6 +8,11 @@ import { resolveCollectionGuard } from '../services/collectionGuard.service.js';
 import { money, positiveId } from '../services/propertyLifecycle.service.js';
 import { writeComplianceAudit } from '../utils/complianceAccess.js';
 import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
+import {
+  assertFinancePaymentModeAllowed,
+  normalizeInventoryPropertyType,
+  resolveSitePolicy,
+} from '../services/sitePolicy.service.js';
 
 const normalizePlotPaymentType = (paymentType) => {
   // payment_type is the accounting settlement field. payment_from describes
@@ -268,11 +273,22 @@ const maybeAutoCreatePlotCommission = async ({ plot, createdBy, fallbackAssigned
 
 /** POST /plots — Create a new plot */
 export const createPlot = asyncHandler(async (req, res) => {
-  const { site_id, plot_no, block, buyer_name, plot_size, plot_size_mtr, plot_rate, sale_price, registry_area, circle_rate, to_receive_bank, first_installment, booking_by, booking_date, status, notes, plc_charges, team, assigned_admin_id, commission_enabled, commission_type, commission_value, commission_rate, plot_commission, force_duplicate } = req.body;
+  const { site_id, property_type, plot_no, block, buyer_name, plot_size, plot_size_mtr, plot_rate, sale_price, registry_area, circle_rate, to_receive_bank, first_installment, booking_by, booking_date, status, notes, plc_charges, team, assigned_admin_id, commission_enabled, commission_type, commission_value, commission_rate, plot_commission, force_duplicate } = req.body;
 
   if (!site_id) return res.status(400).json({ message: 'Site is required' });
-  if (!plot_no || !plot_no.trim()) return res.status(400).json({ message: 'Plot number is required' });
-  if (!plot_size && plot_size !== 0) return res.status(400).json({ message: 'Plot size is required' });
+  const sitePolicy = await resolveSitePolicy({
+    organizationId: req.user.organization_id,
+    siteId: site_id,
+  });
+  const normalizedPropertyType = normalizeInventoryPropertyType({
+    value: property_type,
+    projectShape: sitePolicy.profile?.project_shape,
+  });
+  const propertyLabel = normalizedPropertyType === 'OTHER'
+    ? 'Property'
+    : normalizedPropertyType.charAt(0) + normalizedPropertyType.slice(1).toLowerCase();
+  if (!plot_no || !plot_no.trim()) return res.status(400).json({ message: `${propertyLabel} number is required` });
+  if (!plot_size && plot_size !== 0) return res.status(400).json({ message: `${propertyLabel} area is required` });
 
   const normalizedStatus = String(status || 'BOOKED').trim().toUpperCase();
   if (normalizedStatus === 'REGISTRY') {
@@ -283,9 +299,16 @@ export const createPlot = asyncHandler(async (req, res) => {
   }
 
   const trimmedPlotNo = plot_no.trim().toUpperCase();
+  const normalizedBlock = block ? String(block).trim().toUpperCase() : null;
 
   // Duplicate check — returns all existing plots with same plot_no
-  const existingPlots = await plotModel.findAllByPlotNo(parseInt(site_id), trimmedPlotNo, pool);
+  const existingPlots = await plotModel.findAllByPlotNo(
+    parseInt(site_id),
+    trimmedPlotNo,
+    pool,
+    normalizedPropertyType,
+    normalizedBlock,
+  );
 
   var newPlotTag = undefined;
   if (existingPlots.length > 0) {
@@ -296,7 +319,7 @@ export const createPlot = asyncHandler(async (req, res) => {
     if (!allResale) {
       // Active plot exists — hard block
       return res.status(409).json({
-        message: `Plot "${trimmedPlotNo}" already exists for this site`,
+        message: `${propertyLabel} "${trimmedPlotNo}" already exists in this section`,
         duplicates: dupInfo,
         canOverride: false,
       });
@@ -305,7 +328,7 @@ export const createPlot = asyncHandler(async (req, res) => {
     if (!force_duplicate) {
       // All are RESALE but user hasn't confirmed yet — soft block with override option
       return res.status(409).json({
-        message: `Plot "${trimmedPlotNo}" exists but is marked RESALE. You can create a new one.`,
+        message: `${propertyLabel} "${trimmedPlotNo}" exists but is marked RESALE. You can create a new one.`,
         duplicates: dupInfo,
         canOverride: true,
       });
@@ -318,8 +341,9 @@ export const createPlot = asyncHandler(async (req, res) => {
 
   const data = {
     site_id: parseInt(site_id),
+    property_type: normalizedPropertyType,
     plot_no: trimmedPlotNo,
-    block: block ? block.trim().toUpperCase() : null,
+    block: normalizedBlock,
     buyer_name: buyer_name ? buyer_name.trim().toUpperCase() : null,
     plot_size: parseFloat(plot_size) || null,
     plot_size_mtr: parseFloat(plot_size_mtr) || null,
@@ -431,27 +455,42 @@ export const getPlot = asyncHandler(async (req, res) => {
 /** PUT /plots/:id — Update plot details */
 export const updatePlot = asyncHandler(async (req, res) => {
   const { id } = req.params;
-  const { plot_no, block, buyer_name, plot_size, plot_size_mtr, plot_rate, sale_price, registry_area, circle_rate, to_receive_bank, first_installment, booking_by, booking_date, status, notes, plc_charges, team, assigned_admin_id, commission_enabled, commission_type, commission_value, commission_rate, plot_commission, original_plot_rate, discount_rate } = req.body;
+  const { property_type, plot_no, block, buyer_name, plot_size, plot_size_mtr, plot_rate, sale_price, registry_area, circle_rate, to_receive_bank, first_installment, booking_by, booking_date, status, notes, plc_charges, team, assigned_admin_id, commission_enabled, commission_type, commission_value, commission_rate, plot_commission, original_plot_rate, discount_rate } = req.body;
 
   const existing = await plotModel.findById(parseInt(id), pool);
   if (!existing) return res.status(404).json({ message: 'Plot not found' });
 
   const updateData = {};
-  if (plot_no !== undefined) {
-    const trimmed = String(plot_no || '').trim().toUpperCase();
-    if (!trimmed) return res.status(400).json({ message: 'Plot number is required' });
-    if (trimmed !== existing.plot_no) {
-      const { rows } = await pool.query(
-        `SELECT id FROM plots
-          WHERE site_id = $1 AND UPPER(plot_no) = $2 AND id <> $3
-          LIMIT 1`,
-        [existing.site_id, trimmed, parseInt(id)]
-      );
-      if (rows[0]) return res.status(409).json({ message: `Plot "${trimmed}" already exists` });
-    }
-    updateData.plot_no = trimmed;
+  let normalizedPropertyType = existing.property_type || 'PLOT';
+  if (property_type !== undefined) {
+    const sitePolicy = await resolveSitePolicy({
+      organizationId: req.user.organization_id,
+      siteId: existing.site_id,
+    });
+    normalizedPropertyType = normalizeInventoryPropertyType({
+      value: property_type,
+      projectShape: sitePolicy.profile?.project_shape,
+    });
+    updateData.property_type = normalizedPropertyType;
   }
-  if (block !== undefined) updateData.block = block ? block.trim().toUpperCase() : null;
+  if (plot_no !== undefined || block !== undefined || property_type !== undefined) {
+    const normalizedPlotNo = String(plot_no !== undefined ? plot_no : existing.plot_no || '').trim().toUpperCase();
+    const normalizedBlock = String(block !== undefined ? block : existing.block || '').trim().toUpperCase();
+    if (!normalizedPlotNo) return res.status(400).json({ message: 'Property number is required' });
+    const { rows } = await pool.query(
+      `SELECT id FROM plots
+        WHERE site_id = $1
+          AND UPPER(plot_no) = $2
+          AND property_type = $3
+          AND COALESCE(UPPER(block), '') = $4
+          AND id <> $5
+        LIMIT 1`,
+      [existing.site_id, normalizedPlotNo, normalizedPropertyType, normalizedBlock, parseInt(id)]
+    );
+    if (rows[0]) return res.status(409).json({ message: `Property "${normalizedPlotNo}" already exists in this section` });
+    if (plot_no !== undefined) updateData.plot_no = normalizedPlotNo;
+    if (block !== undefined) updateData.block = normalizedBlock || null;
+  }
   if (buyer_name !== undefined) updateData.buyer_name = buyer_name ? buyer_name.trim().toUpperCase() : null;
   if (plot_size !== undefined) updateData.plot_size = parseFloat(plot_size) || null;
   if (plot_size_mtr !== undefined) updateData.plot_size_mtr = parseFloat(plot_size_mtr) || null;
@@ -671,6 +710,12 @@ export const createPayment = asyncHandler(async (req, res) => {
       }
     }
     if (!payment) {
+      await assertFinancePaymentModeAllowed({
+        organizationId: req.user.organization_id,
+        siteId: plot.site_id,
+        paymentMode: normalizedPaymentType,
+        db: client,
+      });
       if (requestedFirmId) {
         const { rows: firms } = await client.query(`SELECT 1 FROM firms WHERE id=$1 AND site_id=$2`, [requestedFirmId, plot.site_id]);
         if (!firms[0]) throw Object.assign(new Error('Selected bank account is outside this Site'), { statusCode: 409, code: 'FIRM_SCOPE_MISMATCH' });
@@ -943,12 +988,23 @@ export const updatePayment = asyncHandler(async (req, res) => {
   if (amount !== undefined && (!Number.isFinite(Number(amount)) || Number(amount) <= 0)) {
     return res.status(400).json({ message: 'Payment amount must be greater than 0' });
   }
+  const normalizedUpdatedAmount = amount === undefined
+    ? null
+    : money(amount, 'Amount', { required: true, allowZero: false });
 
   const updateData = {};
   const normalizedPaymentType = payment_type !== undefined
     ? normalizePlotPaymentType(payment_type)
     : undefined;
   const effectivePaymentType = normalizedPaymentType ?? normalizePlotPaymentType(existing.payment_type);
+  if (normalizedPaymentType === 'CASH'
+      && normalizePlotPaymentType(existing.payment_type) !== 'CASH') {
+    await assertFinancePaymentModeAllowed({
+      organizationId: req.user.organization_id,
+      siteId: existing.site_id,
+      paymentMode: normalizedPaymentType,
+    });
+  }
   if (bank_account_id !== undefined || normalizedPaymentType !== undefined) {
     updateData.bank_account_id = await resolveBankAccountSelection({
       siteId: existing.site_id,
@@ -972,7 +1028,23 @@ export const updatePayment = asyncHandler(async (req, res) => {
   if (bank_name !== undefined) updateData.bank_name = bank_name ? bank_name.trim().toUpperCase() : null;
   if (branch !== undefined) updateData.branch = branch ? branch.trim().toUpperCase() : null;
   if (narration !== undefined) updateData.narration = narration ? narration.trim().toUpperCase() : null;
-  if (amount !== undefined) updateData.amount = Number(amount);
+  if (normalizedUpdatedAmount !== null) {
+    const collectionDecision = await resolveCollectionGuard({
+      organizationId: req.user.organization_id,
+      siteId: existing.site_id,
+      bookingId: existing.booking_id,
+      proposedAmount: normalizedUpdatedAmount,
+      excludePlotPaymentId: paymentId,
+    });
+    if (collectionDecision.decision === 'BLOCKED') {
+      throw Object.assign(
+        new Error(collectionDecision.message || 'Payment is blocked by the active collection control'),
+        { statusCode: 409, code: collectionDecision.code || 'COLLECTION_BLOCKED', details: collectionDecision },
+      );
+    }
+    updateData.amount = normalizedUpdatedAmount;
+    updateData.ruleset_decision = collectionDecision;
+  }
   if (voucher_url !== undefined) updateData.voucher_url = voucher_url || null;
   if (assigned_admin_id !== undefined) updateData.assigned_admin_id = assigned_admin_id ? parseInt(assigned_admin_id) : null;
   if (buyer_name !== undefined) updateData.buyer_name = buyer_name ? buyer_name.trim().toUpperCase() : null;

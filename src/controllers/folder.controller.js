@@ -12,8 +12,11 @@ export const listFolders = asyncHandler(async (req, res) => {
     const siteId = req.query.site_id ? parseInt(req.query.site_id) : null;
     if (!siteId) return res.status(400).json({ message: 'site_id is required' });
 
-    const folders = await folderModel.listByParent(parentId, siteId, pool);
-    const breadcrumb = await folderModel.getBreadcrumb(parentId, pool);
+    // Independent queries — no reason to pay for them back to back.
+    const [folders, breadcrumb] = await Promise.all([
+        folderModel.listByParent(parentId, siteId, pool),
+        folderModel.getBreadcrumb(parentId, pool),
+    ]);
     res.json({ folders, breadcrumb });
 });
 

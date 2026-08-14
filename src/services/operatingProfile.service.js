@@ -4,6 +4,10 @@ import {
   SITE_POLICY_CAPABILITY_KEYS,
   validateFieldPolicyPayload,
 } from './sitePolicy.service.js';
+import {
+  INDIA_RERA_CENTRAL_RULESET_CODE,
+  rulesetMatchesIndiaJurisdiction,
+} from './jurisdiction.service.js';
 
 export const OPERATING_PROFILE_OPTIONS = Object.freeze({
   operating_models: [
@@ -37,6 +41,10 @@ export const OPERATING_PROFILE_OPTIONS = Object.freeze({
     { value: 'PHASE_WISE', label: 'Phase-wise' },
     { value: 'MULTIPLE_RERA_PROJECTS', label: 'Multiple RERA Projects' },
   ],
+  finance_payment_modes: [
+    { value: 'ALL_MODES', label: 'All payment modes' },
+    { value: 'BANK_ONLY', label: 'Bank only' },
+  ],
 });
 
 const allowed = Object.freeze({
@@ -45,6 +53,7 @@ const allowed = Object.freeze({
   project_shape: new Set(OPERATING_PROFILE_OPTIONS.project_shapes.map((row) => row.value)),
   regulatory_status: new Set(OPERATING_PROFILE_OPTIONS.regulatory_statuses.map((row) => row.value)),
   project_structure: new Set(OPERATING_PROFILE_OPTIONS.project_structures.map((row) => row.value)),
+  finance_payment_mode: new Set(OPERATING_PROFILE_OPTIONS.finance_payment_modes.map((row) => row.value)),
 });
 
 const text = (value, max = 255) => {
@@ -174,6 +183,7 @@ export function normalizeOperatingProfileInput(input = {}, fallback = {}) {
     project_shape: text(pick('project_shape', 'PLOTTED_DEVELOPMENT'), 80),
     regulatory_status: text(pick('regulatory_status', 'APPLICABILITY_UNDER_REVIEW'), 80),
     project_structure: text(pick('project_structure', 'SINGLE_PROJECT'), 80),
+    finance_payment_mode: text(pick('finance_payment_mode', 'ALL_MODES'), 20),
     fund_control_modes: list(pick('fund_control_modes', [])),
     ruleset_version_id: Number.isSafeInteger(Number(pick('ruleset_version_id')))
       && Number(pick('ruleset_version_id')) > 0 ? Number(pick('ruleset_version_id')) : null,
@@ -197,6 +207,10 @@ export function normalizeOperatingProfileInput(input = {}, fallback = {}) {
 }
 
 const issue = (field, code, message) => ({ field, code, message });
+const RULESET_OPERATING_MODELS = new Set([
+  'RERA_PROJECT_PROMOTER',
+  'RERA_ONGOING_PROJECT_REGULARISATION',
+]);
 
 /**
  * Domain validation deliberately checks configuration completeness only. It
@@ -209,6 +223,7 @@ export async function validateOperatingProfile(profile, { db, organizationId, si
   if (!profile.development_basis) errors.push(issue('development_basis', 'REQUIRED', 'Select a development basis.'));
   if (!profile.project_shape) errors.push(issue('project_shape', 'REQUIRED', 'Select a project shape.'));
   if (!profile.project_structure) errors.push(issue('project_structure', 'REQUIRED', 'Select a project structure.'));
+  if (!profile.finance_payment_mode) errors.push(issue('finance_payment_mode', 'REQUIRED', 'Select a finance payment mode.'));
 
   const regulatoryWorkflow = !['DRAFT', 'APPLICABILITY_UNDER_REVIEW', 'EXEMPTION_UNDER_REVIEW'].includes(profile.regulatory_status);
   if (regulatoryWorkflow && !profile.jurisdiction_state) {
@@ -221,25 +236,40 @@ export async function validateOperatingProfile(profile, { db, organizationId, si
   if (profile.ruleset_version_id) {
     const { rows } = await db.query(
       `SELECT rv.id,rv.lifecycle_status,rv.source_review_status,
-              rv.effective_from,rv.effective_to,r.organization_id
+              rv.effective_from,rv.effective_to,r.organization_id,r.code,
+              r.jurisdiction_country_code,r.jurisdiction_state_code
          FROM rera_ruleset_versions rv
          JOIN rera_rulesets r ON r.id=rv.ruleset_id
         WHERE rv.id=$1 AND (r.organization_id IS NULL OR r.organization_id=$2)
           AND rv.deleted_at IS NULL AND r.deleted_at IS NULL AND r.is_active=TRUE LIMIT 1`,
       [profile.ruleset_version_id, organizationId]
     );
-    if (!rows[0]) errors.push(issue('ruleset_version_id', 'RULESET_NOT_AVAILABLE', 'The selected ruleset version is not available to this organization.'));
-    else if (rows[0].lifecycle_status !== 'PUBLISHED') {
+    const selectedRuleset = rows[0];
+    if (!selectedRuleset) errors.push(issue('ruleset_version_id', 'RULESET_NOT_AVAILABLE', 'The selected ruleset version is not available to this organization.'));
+    else if (selectedRuleset.lifecycle_status !== 'PUBLISHED') {
       errors.push(issue('ruleset_version_id', 'RULESET_NOT_PUBLISHED', 'Select a published ruleset version before this profile advances.'));
-    } else if (rows[0].effective_from && new Date(rows[0].effective_from) > new Date()) {
+    } else if (selectedRuleset.effective_from && new Date(selectedRuleset.effective_from) > new Date()) {
       errors.push(issue('ruleset_version_id', 'RULESET_NOT_EFFECTIVE', 'The selected ruleset version is not effective yet.'));
-    } else if (rows[0].effective_to && new Date(rows[0].effective_to) <= new Date()) {
+    } else if (selectedRuleset.effective_to && new Date(selectedRuleset.effective_to) <= new Date()) {
       errors.push(issue('ruleset_version_id', 'RULESET_EXPIRED', 'The selected ruleset version is no longer effective.'));
-    } else if (!['REVIEWED', 'NOT_APPLICABLE'].includes(rows[0].source_review_status)) {
+    } else if (RULESET_OPERATING_MODELS.has(profile.operating_model)
+        && !rulesetMatchesIndiaJurisdiction({
+          profileCountry: profile.jurisdiction_country,
+          profileState: profile.jurisdiction_state,
+          rulesetCountry: selectedRuleset.jurisdiction_country_code,
+          rulesetState: selectedRuleset.jurisdiction_state_code,
+          allowCentral: selectedRuleset.code === INDIA_RERA_CENTRAL_RULESET_CODE,
+        })) {
+      errors.push(issue(
+        'ruleset_version_id',
+        'RULESET_JURISDICTION_MISMATCH',
+        'The selected regulatory controls do not match this Site jurisdiction.',
+      ));
+    } else if (!['REVIEWED', 'NOT_APPLICABLE'].includes(selectedRuleset.source_review_status)) {
       warnings.push(issue('ruleset_version_id', 'RULESET_REVIEW_PENDING', 'The selected ruleset is configuration-only or awaiting legal/content review.'));
     }
-  } else {
-    errors.push(issue('ruleset_version_id', 'RULESET_REQUIRED', 'Select a versioned operating ruleset before this profile advances.'));
+  } else if (RULESET_OPERATING_MODELS.has(profile.operating_model)) {
+    errors.push(issue('ruleset_version_id', 'RERA_CENTRAL_RULESET_UNAVAILABLE', 'The central India RERA control profile is not available. Contact support.'));
   }
 
   if (profile.regulatory_status === 'REGISTERED') {
@@ -325,6 +355,12 @@ export function buildOperatingProfilePreview({ currentProfile, proposedProfile, 
       id: proposedProfile.id,
       revision: proposedProfile.revision_number ?? proposedProfile.revision,
       operating_model: proposedProfile.operating_model,
+    },
+    finance_mode_change: {
+      from: currentProfile?.finance_payment_mode || 'ALL_MODES',
+      to: proposedProfile.finance_payment_mode || 'ALL_MODES',
+      changed: (currentProfile?.finance_payment_mode || 'ALL_MODES')
+        !== (proposedProfile.finance_payment_mode || 'ALL_MODES'),
     },
     modules_added: modulesAdded,
     modules_hidden: modulesHidden,

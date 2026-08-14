@@ -356,8 +356,38 @@ export const getOrganizationDetail = asyncHandler(async (req, res) => {
       [orgId]
     ),
     pool.query(
-      `SELECT id, name, code, city, state, status, created_at
-       FROM sites WHERE organization_id = $1 ORDER BY created_at DESC`,
+      `SELECT s.id, s.name, s.code, s.city, s.state, s.status, s.created_at,
+              profile.revision_number AS operating_profile_revision,
+              profile.lifecycle_status AS operating_profile_status,
+              profile.operating_model,
+              profile.project_shape,
+              profile.project_structure,
+              profile.development_basis,
+              profile.jurisdiction_country,
+              profile.jurisdiction_state,
+              profile.regulatory_status,
+              profile.finance_payment_mode
+         FROM sites s
+         LEFT JOIN LATERAL (
+           SELECT spr.revision_number, spr.lifecycle_status, spr.operating_model,
+                  spr.project_shape, spr.project_structure, spr.development_basis,
+                  spr.jurisdiction_country, spr.jurisdiction_state,
+                  spr.regulatory_status, spr.finance_payment_mode
+             FROM site_operating_profile_revisions spr
+            WHERE spr.organization_id = $1
+              AND spr.site_id = s.id
+              AND spr.deleted_at IS NULL
+            ORDER BY CASE
+                       WHEN spr.lifecycle_status = 'PUBLISHED' AND spr.effective_to IS NULL THEN 0
+                       WHEN spr.lifecycle_status IN ('DRAFT', 'VALIDATION', 'REVIEW') THEN 1
+                       ELSE 2
+                     END,
+                     spr.revision_number DESC,
+                     spr.id DESC
+            LIMIT 1
+         ) profile ON TRUE
+        WHERE s.organization_id = $1
+        ORDER BY s.created_at DESC`,
       [orgId]
     ),
     pool.query(
