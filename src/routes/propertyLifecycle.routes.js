@@ -28,6 +28,14 @@ import {
   transitionPossession,
   transitionRegistryLifecycle,
 } from '../controllers/propertyLifecycle.controller.js';
+import {
+  createReraCollectionDeposit,
+  createReraFundWithdrawal,
+  getReraProjectFinanceCompliance,
+  postReraFundWithdrawal,
+  reviewReraCollectionDeposit,
+  reviewReraFundWithdrawal,
+} from '../controllers/reraProjectFinance.controller.js';
 
 const router = express.Router();
 router.use(authMiddleware, requireRole('admin', 'sub_admin'));
@@ -40,6 +48,12 @@ router.get('/project-finance', paymentSite('site', 'query', 'site_id'), requireP
 router.post('/project-finance/accounts', paymentSite('site', 'body', 'site_id'), requirePermission('plot_payments', 'update'), createProjectAccountMapping);
 router.patch('/project-finance/accounts/:mappingId/review', paymentSite('projectAccount', 'params', 'mappingId'), requirePermission('plot_payments', 'update'), reviewProjectAccountMapping);
 router.post('/project-finance/allocations', paymentSite('site', 'body', 'site_id'), requirePermission('plot_payments', 'update'), createProjectTransactionAllocation);
+router.get('/project-finance/rera-compliance', paymentSite('site', 'query', 'site_id'), requirePermission('plot_payments', 'read'), getReraProjectFinanceCompliance);
+router.post('/project-finance/rera/deposits', paymentSite('site', 'body', 'site_id'), requirePermission('plot_payments', 'update'), createReraCollectionDeposit);
+router.patch('/project-finance/rera/deposits/:depositId/review', paymentSite('site', 'body', 'site_id'), requirePermission('plot_payments', 'update'), reviewReraCollectionDeposit);
+router.post('/project-finance/rera/withdrawals', paymentSite('site', 'body', 'site_id'), requirePermission('plot_payments', 'update'), createReraFundWithdrawal);
+router.patch('/project-finance/rera/withdrawals/:withdrawalId/review', paymentSite('site', 'body', 'site_id'), requirePermission('plot_payments', 'update'), reviewReraFundWithdrawal);
+router.post('/project-finance/rera/withdrawals/:withdrawalId/post', paymentSite('site', 'body', 'site_id'), requirePermission('plot_payments', 'update'), postReraFundWithdrawal);
 
 router.post('/bookings', paymentSite('plot', 'body', 'plot_id'), requirePermission('plot_payments', 'write'), createBooking);
 router.get('/bookings/:bookingId', paymentSite('booking', 'params', 'bookingId'), requirePermission('plot_payments', 'read'), getBookingLifecycle);

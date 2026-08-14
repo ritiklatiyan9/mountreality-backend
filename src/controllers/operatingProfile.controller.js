@@ -9,11 +9,17 @@ import {
   validateOperatingProfile,
 } from '../services/operatingProfile.service.js';
 import { invalidateSitePolicy, resolveSitePolicy } from '../services/sitePolicy.service.js';
+import { INDIA_RERA_CENTRAL_RULESET_CODE } from '../services/jurisdiction.service.js';
+
+const RERA_OPERATING_MODELS = new Set([
+  'RERA_PROJECT_PROMOTER',
+  'RERA_ONGOING_PROJECT_REGULARISATION',
+]);
 
 const PROFILE_COLUMNS = [
   'operating_model', 'jurisdiction_country', 'jurisdiction_state', 'authority_code',
   'authority_name', 'district', 'development_basis', 'development_basis_notes',
-  'project_shape', 'regulatory_status', 'project_structure', 'fund_control_modes',
+  'project_shape', 'regulatory_status', 'project_structure', 'finance_payment_mode', 'fund_control_modes',
   'ruleset_version_id', 'module_overrides', 'terminology_overrides',
   'field_policy_overrides', 'capability_overrides', 'workflow_policy_overrides', 'change_reason',
 ];
@@ -83,6 +89,31 @@ async function getRulesetVersion(id, organizationId, db = pool) {
     [id, organizationId]
   );
   return rows[0] || null;
+}
+
+async function applyCentralReraRuleset(profile, db = pool) {
+  if (!RERA_OPERATING_MODELS.has(String(profile?.operating_model || '').toUpperCase())
+      || profile.ruleset_version_id) return profile;
+  const { rows } = await db.query(
+    `SELECT rv.id
+       FROM rera_rulesets r
+       JOIN rera_ruleset_versions rv ON rv.ruleset_id=r.id
+      WHERE r.organization_id IS NULL AND UPPER(r.code)=$1
+        AND r.is_active=TRUE AND r.deleted_at IS NULL
+        AND rv.lifecycle_status='PUBLISHED' AND rv.deleted_at IS NULL
+        AND (rv.effective_from IS NULL OR rv.effective_from<=CURRENT_DATE)
+        AND (rv.effective_to IS NULL OR rv.effective_to>CURRENT_DATE)
+      ORDER BY rv.version DESC LIMIT 1`,
+    [INDIA_RERA_CENTRAL_RULESET_CODE],
+  );
+  if (!rows[0]) {
+    const error = new Error('The central India RERA control profile is unavailable');
+    error.statusCode = 503;
+    error.code = 'RERA_CENTRAL_RULESET_UNAVAILABLE';
+    throw error;
+  }
+  profile.ruleset_version_id = Number(rows[0].id);
+  return profile;
 }
 
 function parseInput(req, res, fallback = {}) {
@@ -212,6 +243,7 @@ export const getOperatingProfile = asyncHandler(async (req, res) => {
     pool.query(
       `SELECT r.id AS ruleset_id,r.code,r.name,r.jurisdiction_country_code,
               r.jurisdiction_state_code,r.authority_label,
+              (UPPER(r.code)=$2) AS is_central_rera,
               rv.id AS version_id,rv.version,rv.lifecycle_status AS status,
               rv.source_review_status AS review_status,
               rv.content_classification AS configuration_scope,
@@ -228,7 +260,7 @@ export const getOperatingProfile = asyncHandler(async (req, res) => {
           AND (rv.effective_from IS NULL OR rv.effective_from <= NOW())
           AND (rv.effective_to IS NULL OR rv.effective_to > NOW())
         ORDER BY (r.organization_id IS NULL) DESC,r.name,rv.created_at DESC`,
-      [req.user.organization_id]
+      [req.user.organization_id, INDIA_RERA_CENTRAL_RULESET_CODE]
     ),
   ]);
   res.json({
@@ -239,6 +271,164 @@ export const getOperatingProfile = asyncHandler(async (req, res) => {
     rulesets: rulesetResult.rows,
     options: OPERATING_PROFILE_OPTIONS,
   });
+});
+
+/**
+ * PUT /settings/operating-profile
+ *
+ * Admin-facing settings use one immediate save. Revision history remains
+ * immutable: the current effective row is superseded and a validated revision
+ * is published in the same transaction. An older unfinished revision is reused
+ * instead of leaving a draft behind.
+ */
+export const saveOperatingProfile = asyncHandler(async (req, res) => {
+  const site = await getReraSite(req, res, req.body.site_id);
+  if (!site) return;
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      'SELECT id FROM sites WHERE id=$1 AND organization_id=$2 FOR UPDATE',
+      [site.id, req.user.organization_id],
+    );
+
+    const [{ rows: publishedRows }, { rows: openRows }] = await Promise.all([
+      client.query(
+        `SELECT * FROM site_operating_profile_revisions
+          WHERE organization_id=$1 AND site_id=$2 AND lifecycle_status='PUBLISHED'
+            AND effective_to IS NULL AND deleted_at IS NULL
+          ORDER BY revision_number DESC LIMIT 1 FOR UPDATE`,
+        [req.user.organization_id, site.id],
+      ),
+      client.query(
+        `SELECT * FROM site_operating_profile_revisions
+          WHERE organization_id=$1 AND site_id=$2 AND lifecycle_status=ANY($3::text[])
+            AND deleted_at IS NULL
+          ORDER BY revision_number DESC LIMIT 1 FOR UPDATE`,
+        [req.user.organization_id, site.id, openStatuses],
+      ),
+    ]);
+
+    const previous = publishedRows[0] || null;
+    const unfinished = openRows[0] || null;
+    const input = parseInput(req, res, unfinished || previous || {});
+    if (!input) {
+      await client.query('ROLLBACK');
+      return;
+    }
+    await applyCentralReraRuleset(input, client);
+    if (input.ruleset_version_id
+        && !await getRulesetVersion(input.ruleset_version_id, req.user.organization_id, client)) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Selected ruleset version is not available' });
+    }
+
+    const validation = await validateOperatingProfile(input, {
+      db: client,
+      organizationId: req.user.organization_id,
+      siteId: site.id,
+    });
+    if (!validation.valid) {
+      await client.query('ROLLBACK');
+      return res.status(422).json({
+        message: 'Review the highlighted settings before saving',
+        validation,
+      });
+    }
+
+    if (previous) {
+      const { rowCount } = await client.query(
+        `UPDATE site_operating_profile_revisions
+            SET lifecycle_status='SUPERSEDED',effective_to=NOW(),updated_by=$1,updated_at=NOW()
+          WHERE id=$2 AND organization_id=$3 AND site_id=$4
+            AND lifecycle_status='PUBLISHED' AND effective_to IS NULL`,
+        [req.user.id, previous.id, req.user.organization_id, site.id],
+      );
+      if (rowCount !== 1) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({ message: 'The operating profile changed before it could be saved. Reload and try again.' });
+      }
+    }
+
+    const values = PROFILE_COLUMNS.map((column) => input[column]);
+    let savedRow;
+    if (unfinished) {
+      const assignments = PROFILE_COLUMNS.map((column, index) => `${column}=$${index + 1}`).join(',');
+      const { rows } = await client.query(
+        `UPDATE site_operating_profile_revisions
+            SET ${assignments},lifecycle_status='PUBLISHED',review_decision='APPROVED',
+                previous_revision_id=$${values.length + 1},validation_results=$${values.length + 2},
+                effective_from=NOW(),effective_to=NULL,review_notes=NULL,
+                reviewed_by=$${values.length + 3},reviewed_at=NOW(),
+                published_by=$${values.length + 3},published_at=NOW(),
+                updated_by=$${values.length + 3},updated_at=NOW()
+          WHERE id=$${values.length + 4} AND organization_id=$${values.length + 5}
+            AND site_id=$${values.length + 6} AND lifecycle_status=ANY($${values.length + 7}::text[])
+          RETURNING *`,
+        [
+          ...values,
+          previous?.id || null,
+          validation,
+          req.user.id,
+          unfinished.id,
+          req.user.organization_id,
+          site.id,
+          openStatuses,
+        ],
+      );
+      savedRow = rows[0];
+    } else {
+      const { rows } = await client.query(
+        `INSERT INTO site_operating_profile_revisions (
+           organization_id,site_id,revision_number,previous_revision_id,
+           lifecycle_status,review_decision,${PROFILE_COLUMNS.join(',')},validation_results,
+           effective_from,reviewed_by,reviewed_at,published_by,published_at,created_by,updated_by
+         ) VALUES (
+           $1,$2,(SELECT COALESCE(MAX(revision_number),0)+1 FROM site_operating_profile_revisions WHERE organization_id=$1 AND site_id=$2),$3,
+           'PUBLISHED','APPROVED',${PROFILE_COLUMNS.map((_, index) => `$${index + 4}`).join(',')},$${PROFILE_COLUMNS.length + 4},
+           NOW(),$${PROFILE_COLUMNS.length + 5},NOW(),$${PROFILE_COLUMNS.length + 5},NOW(),$${PROFILE_COLUMNS.length + 5},$${PROFILE_COLUMNS.length + 5}
+         ) RETURNING *`,
+        [
+          req.user.organization_id,
+          site.id,
+          previous?.id || null,
+          ...values,
+          validation,
+          req.user.id,
+        ],
+      );
+      savedRow = rows[0];
+    }
+
+    if (!savedRow) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ message: 'The operating profile changed before it could be saved. Reload and try again.' });
+    }
+
+    await writeComplianceAudit(client, req, {
+      action: 'OPERATING_PROFILE_SAVED',
+      entityType: 'OPERATING_PROFILE',
+      entityId: savedRow.id,
+      siteId: site.id,
+      previousValue: previous,
+      newValue: savedRow,
+      reason: input.change_reason || 'Operating profile settings updated',
+    });
+    const profile = await hydratedProfile(savedRow.id, req.user.organization_id, client);
+    await client.query('COMMIT');
+    invalidateSitePolicy(site.id);
+    return res.json({
+      message: 'Operating profile saved and applied',
+      profile,
+      validation,
+    });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 });
 
 /** POST /settings/operating-profile/drafts */
@@ -275,6 +465,7 @@ export const createOperatingProfileDraft = asyncHandler(async (req, res) => {
       await client.query('ROLLBACK');
       return;
     }
+    await applyCentralReraRuleset(input, client);
     if (input.ruleset_version_id && !await getRulesetVersion(input.ruleset_version_id, req.user.organization_id, client)) {
       await client.query('ROLLBACK');
       return res.status(400).json({ message: 'Selected ruleset version is not available' });
@@ -325,6 +516,7 @@ export const updateOperatingProfileDraft = asyncHandler(async (req, res) => {
       await client.query('ROLLBACK');
       return;
     }
+    await applyCentralReraRuleset(input, client);
     if (input.ruleset_version_id
         && !await getRulesetVersion(input.ruleset_version_id, req.user.organization_id, client)) {
       await client.query('ROLLBACK');
@@ -398,6 +590,17 @@ export const validateOperatingProfileRevision = asyncHandler(async (req, res) =>
     if (context.profile.lifecycle_status !== 'DRAFT') {
       await client.query('ROLLBACK');
       return res.status(409).json({ message: 'Only a draft can enter validation' });
+    }
+    const previousRulesetId = context.profile.ruleset_version_id;
+    await applyCentralReraRuleset(context.profile, client);
+    if (!previousRulesetId && context.profile.ruleset_version_id) {
+      await client.query(
+        `UPDATE site_operating_profile_revisions
+            SET ruleset_version_id=$1,updated_by=$2,updated_at=NOW()
+          WHERE id=$3 AND organization_id=$4 AND site_id=$5 AND lifecycle_status='DRAFT'`,
+        [context.profile.ruleset_version_id, req.user.id, context.profile.id,
+          req.user.organization_id, context.site.id],
+      );
     }
     const validation = await validateOperatingProfile(context.profile, {
       db: client, organizationId: req.user.organization_id, siteId: context.site.id,
@@ -567,6 +770,18 @@ export const publishOperatingProfile = asyncHandler(async (req, res) => {
       return res.status(409).json({ message: 'The revision must be reviewed and approved before publication' });
     }
     await client.query('SELECT id FROM sites WHERE id=$1 AND organization_id=$2 FOR UPDATE', [context.site.id, req.user.organization_id]);
+    const previousRulesetId = context.profile.ruleset_version_id;
+    await applyCentralReraRuleset(context.profile, client);
+    if (!previousRulesetId && context.profile.ruleset_version_id) {
+      await client.query(
+        `UPDATE site_operating_profile_revisions
+            SET ruleset_version_id=$1,updated_by=$2,updated_at=NOW()
+          WHERE id=$3 AND organization_id=$4 AND site_id=$5
+            AND lifecycle_status='REVIEW' AND review_decision='APPROVED'`,
+        [context.profile.ruleset_version_id, req.user.id, context.profile.id,
+          req.user.organization_id, context.site.id],
+      );
+    }
     const validation = await validateOperatingProfile(context.profile, {
       db: client, organizationId: req.user.organization_id, siteId: context.site.id,
     });

@@ -111,3 +111,20 @@ test('global compliance notifications are recipient-scoped and track unread stat
   assert.match(migration, /ADD COLUMN IF NOT EXISTS read_at TIMESTAMPTZ/);
   assert.match(migration, /idx_compliance_notifications_recipient_unread/);
 });
+
+test('compliance categories are tenant-managed, permission-gated and seeded without state assumptions', async () => {
+  const [routes, controller, migration] = await Promise.all([
+    source('src/routes/compliance.routes.js'),
+    source('src/controllers/compliance.controller.js'),
+    source('src/migrations/115_compliance_categories.js'),
+  ]);
+  assert.match(routes, /router\.get\('\/categories', requirePermission\('compliance', 'read'\)/);
+  assert.match(routes, /router\.post\('\/categories', requirePermission\('compliance_settings', 'write'\)/);
+  assert.match(routes, /router\.patch\('\/categories\/:id', requirePermission\('compliance_settings', 'update'\)/);
+  assert.match(controller, /WHERE c\.organization_id=\$1 AND c\.deleted_at IS NULL/);
+  assert.match(controller, /UPDATE compliance_items SET category=\$1/);
+  assert.match(controller, /UPDATE compliance_templates SET category=\$1/);
+  assert.match(migration, /AFTER INSERT ON organizations/);
+  assert.match(migration, /RERA_REAL_ESTATE/);
+  assert.doesNotMatch(migration, /HARYANA|HRERA/i);
+});

@@ -3,6 +3,11 @@ import asyncHandler from '../utils/asyncHandler.js';
 import { writeComplianceAudit } from '../utils/complianceAccess.js';
 import { resolveCollectionGuard } from '../services/collectionGuard.service.js';
 import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
+import { assertFinancePaymentModeAllowed } from '../services/sitePolicy.service.js';
+import {
+  isRegistryProjectContextComplete,
+  resolveRegistryOperatingPolicy,
+} from '../services/registryPolicy.service.js';
 import {
   AGREEMENT_TRANSITIONS,
   POSSESSION_TRANSITIONS,
@@ -16,7 +21,13 @@ import {
 } from '../services/propertyLifecycle.service.js';
 
 const isAdmin = (req) => ['admin', 'super_admin'].includes(req.user?.role);
-const siteIdFrom = (req) => positiveId(req.siteContextId || req.propertyLifecycleSiteId, 'site_id');
+// Registry lifecycle actions are exposed from both the property workspace and
+// the registry resource. Both routes resolve the same Site, but their access
+// middleware stores it under a route-specific key.
+const siteIdFrom = (req) => positiveId(
+  req.propertyLifecycleSiteId || req.registrySiteId || req.siteContextId,
+  'site_id',
+);
 
 const businessError = (message, code, statusCode = 409, details = null) => {
   const error = new Error(message);
@@ -24,6 +35,40 @@ const businessError = (message, code, statusCode = 409, details = null) => {
   error.statusCode = statusCode;
   if (details) error.details = details;
   return error;
+};
+
+const RERA_REGISTRY_EXECUTION_CONSTRAINTS = new Set([
+  'rera_registry_context_required',
+  'rera_registry_registered_agreement_required',
+  'rera_registry_canonical_receipt_required',
+  'rera_registry_professional_metadata_required',
+  'rera_registry_controlled_deed_required',
+]);
+
+const normalizeRegistryLifecycleConstraint = (error) => {
+  if (error?.constraint === 'executed_rera_registry_lifecycle_immutable') {
+    return businessError(
+      'An executed RERA registry cannot be reopened or downgraded without a controlled reopen workflow',
+      'RERA_EXECUTED_REGISTRY_IMMUTABLE',
+      409,
+    );
+  }
+  if (!RERA_REGISTRY_EXECUTION_CONSTRAINTS.has(error?.constraint)) return error;
+  return businessError(
+    'Registry readiness changed while the action was being completed. Refresh the RERA checklist and try again.',
+    'RERA_REGISTRY_EXECUTION_NOT_READY',
+    409,
+    { constraint: error.constraint },
+  );
+};
+
+const normalizeExecutedAgreementConstraint = (error) => {
+  if (error?.constraint !== 'executed_rera_registry_agreement_immutable') return error;
+  return businessError(
+    'Agreement execution and registration details are immutable after the linked RERA registry is executed',
+    'RERA_EXECUTED_AGREEMENT_IMMUTABLE',
+    409,
+  );
 };
 
 const requireAdmin = (req) => {
@@ -114,6 +159,7 @@ const deepMerge = (base, override) => {
 
 const workspaceBaseSql = `
   SELECT p.id AS plot_id,p.plot_no,p.block,p.plot_size,p.plot_size_mtr,p.plot_rate,p.sale_price,
+         p.circle_rate,p.to_receive_bank,
          p.status AS legacy_plot_status,p.lifecycle_status,p.project_mapping_status,p.current_booking_id,
          p.rera_project_id,p.rera_project_phase_id,p.agreement_status AS property_agreement_status,
          p.registry_status AS property_registry_status,p.possession_status AS property_possession_status,
@@ -122,7 +168,8 @@ const workspaceBaseSql = `
          b.id AS booking_id,b.booking_no,b.booking_date,b.lifecycle_status AS booking_status,
          b.final_consideration,b.agreement_status,b.client_member_id,
          m.full_name AS customer_name,m.phone AS customer_phone,m.photo AS customer_photo,
-         COALESCE(pay.received,0) AS received,COALESCE(ref.refunded,0) AS refunded,
+         COALESCE(pay.received,0) AS received,COALESCE(pay.received_bank,0) AS received_bank,
+         COALESCE(pay.received_cash,0) AS received_cash,COALESCE(ref.refunded,0) AS refunded,
          COALESCE(sch.scheduled,0) AS scheduled,COALESCE(sch.overdue,0) AS overdue,
          GREATEST(COALESCE(b.final_consideration,p.sale_price,0)-COALESCE(pay.received,0)+COALESCE(ref.refunded,0),0) AS outstanding,
          a.id AS agreement_id,a.status AS latest_agreement_status,a.execution_date,
@@ -141,13 +188,23 @@ const workspaceBaseSql = `
     LEFT JOIN rera_projects rp ON rp.id=p.rera_project_id AND rp.site_id=p.site_id AND rp.deleted_at IS NULL
     LEFT JOIN rera_project_phases rpp ON rpp.id=p.rera_project_phase_id AND rpp.site_id=p.site_id AND rpp.deleted_at IS NULL
     LEFT JOIN LATERAL (
-      SELECT COALESCE(SUM(x.amount),0) AS received FROM (
-        SELECT pp.amount FROM plot_payments pp
+      SELECT COALESCE(SUM(x.amount),0) AS received,
+             COALESCE(SUM(x.amount) FILTER (WHERE x.bucket<>'cash'),0) AS received_bank,
+             COALESCE(SUM(x.amount) FILTER (WHERE x.bucket='cash'),0) AS received_cash
+        FROM (
+        SELECT pp.amount,ledger_bucket(pp.payment_type) AS bucket FROM plot_payments pp
          WHERE pp.plot_id=p.id AND LOWER(COALESCE(pp.status,'approved'))='approved'
            AND UPPER(COALESCE(pp.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+           AND pp.reversal_of_payment_id IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM plot_payments reversal
+              WHERE reversal.reversal_of_payment_id=pp.id
+                AND LOWER(COALESCE(reversal.status,'approved'))='approved'
+                AND UPPER(COALESCE(reversal.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+           )
            AND ((b.id IS NOT NULL AND pp.booking_id=b.id) OR (b.id IS NULL AND pp.booking_id IS NULL))
         UNION ALL
-        SELECT pip.amount FROM plot_installment_payments pip
+        SELECT pip.amount,ledger_bucket(pip.payment_mode) AS bucket FROM plot_installment_payments pip
          WHERE pip.plot_id=p.id AND UPPER(COALESCE(pip.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
            AND b.id IS NULL
       ) x
@@ -187,18 +244,24 @@ const workspaceBaseSql = `
 export const listPropertyWorkspace = asyncHandler(async (req, res) => {
   const siteId = siteIdFrom(req);
   const page = Math.max(Number.parseInt(req.query.page, 10) || 1, 1);
-  const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 30, 1), 100);
+  const limit = Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 200, 1), 250);
   const search = String(req.query.q || '').trim();
   const status = String(req.query.status || '').trim().toUpperCase();
-  const sortBy = String(req.query.sort_by || 'updated_at').trim().toLowerCase();
-  const sortDirection = String(req.query.sort_order || 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+  const sortBy = String(req.query.sort_by || 'property').trim().toLowerCase();
+  const sortDirection = String(req.query.sort_order || 'asc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
   const sortColumns = {
     updated_at: 'p.updated_at', property: 'p.plot_no', customer: 'm.full_name',
     consideration: 'COALESCE(b.final_consideration,p.sale_price,0)',
     agreement: 'COALESCE(a.status,b.agreement_status)', registry: 'pr.lifecycle_status',
   };
-  const sortExpression = sortColumns[sortBy] || sortColumns.updated_at;
+  const sortExpression = sortColumns[sortBy] || sortColumns.property;
+  const orderExpression = sortBy === 'property'
+    ? `REGEXP_REPLACE(UPPER(p.plot_no), '[0-9].*$', '') ${sortDirection},
+       NULLIF(REGEXP_REPLACE(p.plot_no, '[^0-9]', '', 'g'), '')::bigint ${sortDirection},
+       UPPER(p.plot_no) ${sortDirection}`
+    : `${sortExpression} ${sortDirection} NULLS LAST`;
   const projectId = req.query.project_id ? positiveId(req.query.project_id, 'project_id') : null;
+  const plotId = req.query.plot_id ? positiveId(req.query.plot_id, 'plot_id') : null;
   const params = [siteId, req.user.organization_id];
   let filters = ' WHERE p.site_id=$1 AND EXISTS (SELECT 1 FROM sites s WHERE s.id=p.site_id AND s.organization_id=$2)';
   if (search) {
@@ -213,10 +276,14 @@ export const listPropertyWorkspace = asyncHandler(async (req, res) => {
     params.push(projectId);
     filters += ` AND p.rera_project_id=$${params.length}`;
   }
+  if (plotId) {
+    params.push(plotId);
+    filters += ` AND p.id=$${params.length}`;
+  }
   const countParams = [...params];
   params.push(limit, (page - 1) * limit);
   const [rowsResult, countResult, attentionResult, metricsResult] = await Promise.all([
-    pool.query(`${workspaceBaseSql} ${filters} ORDER BY ${sortExpression} ${sortDirection} NULLS LAST,p.id DESC LIMIT $${params.length - 1} OFFSET $${params.length}`, params),
+    pool.query(`${workspaceBaseSql} ${filters} ORDER BY ${orderExpression},p.id DESC LIMIT $${params.length - 1} OFFSET $${params.length}`, params),
     pool.query(`SELECT COUNT(*)::int AS total FROM (${workspaceBaseSql} ${filters}) workspace`, countParams),
     pool.query(
       `SELECT
@@ -281,7 +348,7 @@ export const getBookingLifecycle = asyncHandler(async (req, res) => {
     pool.query(`${workspaceBaseSql} WHERE p.site_id=$1 AND b.id=$2 AND EXISTS (SELECT 1 FROM sites s WHERE s.id=p.site_id AND s.organization_id=$3) LIMIT 1`, [siteId, bookingId, req.user.organization_id]),
     pool.query(`SELECT ba.*,m.full_name,m.phone,m.email,m.photo FROM booking_allottees ba JOIN members m ON m.id=ba.member_id WHERE ba.booking_id=$1 ORDER BY (ba.allottee_role='PRIMARY') DESC,ba.created_at`, [bookingId]),
     pool.query(`SELECT pi.*,COALESCE(pa.allocated,0) AS allocated_amount,GREATEST(pi.amount-COALESCE(pa.allocated,0),0) AS due_amount FROM plot_installments pi LEFT JOIN LATERAL (SELECT SUM(ppa.allocated_amount) AS allocated FROM plot_payment_allocations ppa JOIN plot_payments allocated_payment ON allocated_payment.id=ppa.plot_payment_id WHERE ppa.installment_id=pi.id AND LOWER(COALESCE(allocated_payment.status,'approved'))='approved' AND UPPER(COALESCE(allocated_payment.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')) pa ON TRUE WHERE pi.booking_id=$1 AND pi.superseded_at IS NULL ORDER BY pi.sort_order,pi.due_date,pi.id`, [bookingId]),
-    pool.query(`SELECT pp.*,COALESCE(pa.allocations,'[]'::jsonb) AS allocations FROM plot_payments pp LEFT JOIN LATERAL (SELECT jsonb_agg(jsonb_build_object('id',x.id,'installment_id',x.installment_id,'amount',x.allocated_amount)) AS allocations FROM plot_payment_allocations x WHERE x.plot_payment_id=pp.id) pa ON TRUE WHERE pp.booking_id=$1 ORDER BY pp.date DESC,pp.id DESC`, [bookingId]),
+    pool.query(`SELECT pp.*,prp.id AS mapped_registry_payment_id,prp.registry_id AS mapped_registry_id,COALESCE(pa.allocations,'[]'::jsonb) AS allocations FROM plot_payments pp LEFT JOIN plot_registry_payments prp ON prp.source_plot_payment_id=pp.id LEFT JOIN LATERAL (SELECT jsonb_agg(jsonb_build_object('id',x.id,'installment_id',x.installment_id,'amount',x.allocated_amount)) AS allocations FROM plot_payment_allocations x WHERE x.plot_payment_id=pp.id) pa ON TRUE WHERE pp.booking_id=$1 ORDER BY pp.date DESC,pp.id DESC`, [bookingId]),
     pool.query(`SELECT ba.*,COALESCE(d.documents,'[]'::jsonb) AS documents FROM booking_agreements ba LEFT JOIN LATERAL (SELECT jsonb_agg(jsonb_build_object('id',x.id,'title',x.title,'category',x.category,'original_name',x.original_name)) AS documents FROM documents x WHERE x.agreement_id=ba.id) d ON TRUE WHERE ba.booking_id=$1 ORDER BY ba.version_number DESC`, [bookingId]),
     pool.query(`SELECT pr.*,pos.id AS possession_id,pos.status AS possession_lifecycle_status,pos.scheduled_at AS possession_scheduled_at,pos.possession_date,pos.checklist,pos.acknowledgement FROM plot_registries pr LEFT JOIN plot_possessions pos ON pos.registry_id=pr.id WHERE pr.booking_id=$1 ORDER BY pr.id DESC LIMIT 1`, [bookingId]),
     pool.query(`SELECT * FROM booking_cancellations WHERE booking_id=$1 ORDER BY created_at DESC`, [bookingId]),
@@ -455,6 +522,8 @@ export const createAgreementRevision = asyncHandler(async (req, res) => {
     await db.query(`UPDATE plots SET agreement_status=$1,lifecycle_version=lifecycle_version+1,updated_at=NOW() WHERE id=$2`, [status, booking.plot_id]);
     await writeComplianceAudit(db, req, { action: 'AGREEMENT_REVISION_CREATED', entityType: 'BOOKING_AGREEMENT', entityId: rows[0].id, siteId: booking.site_id, previousValue: previous, newValue: { ...rows[0], booking_id: booking.id }, reason: changeReason });
     return rows[0];
+  }).catch((error) => {
+    throw normalizeExecutedAgreementConstraint(error);
   });
   res.status(201).json({ agreement });
 });
@@ -467,20 +536,142 @@ export const transitionAgreement = asyncHandler(async (req, res) => {
     const { rows } = await db.query(`SELECT ba.*,b.agreement_required FROM booking_agreements ba JOIN bookings b ON b.id=ba.booking_id WHERE ba.id=$1 AND ba.site_id=$2 AND ba.organization_id=$3 FOR UPDATE OF ba,b`, [agreementId, siteId, req.user.organization_id]);
     const previous = rows[0];
     if (!previous) throw businessError('Agreement not found', 'AGREEMENT_NOT_FOUND', 404);
-    const next = assertTransition(AGREEMENT_TRANSITIONS, previous.status, req.body.status, 'Agreement');
+    const hasRegistrationPatch = [
+      'registration_status', 'registration_number', 'registration_date', 'registration_office',
+    ].some((field) => Object.prototype.hasOwnProperty.call(req.body || {}, field));
+    const requestedStatus = String(
+      req.body.status || (previous.status === 'EXECUTED' && hasRegistrationPatch ? 'EXECUTED' : ''),
+    ).trim().toUpperCase();
+    const registrationOnlyUpdate = previous.status === 'EXECUTED' && requestedStatus === 'EXECUTED';
+    const next = registrationOnlyUpdate
+      ? 'EXECUTED'
+      : assertTransition(AGREEMENT_TRANSITIONS, previous.status, requestedStatus, 'Agreement');
     if (['APPROVED_FOR_EXECUTION', 'EXECUTED'].includes(next)) requireAdmin(req);
     if (next === 'SUPERSEDED') throw businessError('Create a new revision to supersede an executed agreement', 'AGREEMENT_REVISION_REQUIRED');
-    const executionDate = next === 'EXECUTED' ? isoDate(req.body.execution_date, 'Execution date', { required: true }) : previous.execution_date;
+    const executionDate = next === 'EXECUTED'
+      ? isoDate(req.body.execution_date || previous.execution_date, 'Execution date', { required: true })
+      : previous.execution_date;
+    const registrationStatus = String(
+      req.body.registration_status || previous.registration_status || 'NOT_REGISTERED',
+    ).trim().toUpperCase();
+    if (!['NOT_REGISTERED', 'PENDING', 'REGISTERED'].includes(registrationStatus)) {
+      throw businessError('Registration status must be NOT_REGISTERED, PENDING or REGISTERED', 'INVALID_AGREEMENT_REGISTRATION_STATUS', 400);
+    }
+    if (registrationStatus === 'REGISTERED' && next !== 'EXECUTED') {
+      throw businessError('An agreement must be executed before it can be marked registered', 'AGREEMENT_EXECUTION_REQUIRED', 409);
+    }
+    const registrationNumber = cleanText(
+      req.body.registration_number ?? previous.registration_number,
+      'Agreement registration number',
+      160,
+      { required: registrationStatus === 'REGISTERED' },
+    );
+    const registrationDate = isoDate(
+      req.body.registration_date ?? previous.registration_date,
+      'Agreement registration date',
+      { required: registrationStatus === 'REGISTERED' },
+    );
+    const registrationOffice = cleanText(
+      req.body.registration_office ?? previous.registration_office,
+      'Registration office',
+      240,
+    );
+    const dateKey = (value) => value == null
+      ? null
+      : new Date(value).toISOString().slice(0, 10);
+    const legalStateChanging = next !== previous.status
+      || dateKey(executionDate) !== dateKey(previous.execution_date)
+      || registrationStatus !== (previous.registration_status || 'NOT_REGISTERED')
+      || registrationNumber !== (previous.registration_number || null)
+      || dateKey(registrationDate) !== dateKey(previous.registration_date)
+      || registrationOffice !== (previous.registration_office || null);
+    if (legalStateChanging) {
+      const { rows: protectedRegistries } = await db.query(
+        `SELECT registry.id
+           FROM plot_registries registry
+           JOIN sites site ON site.id=registry.site_id
+          WHERE registry.agreement_id=$1
+            AND registry.site_id=$2
+            AND registry.lifecycle_status IN ('EXECUTED','COMPLETE')
+            AND EXISTS (
+              SELECT 1 FROM site_operating_profile_revisions profile
+               WHERE profile.organization_id=site.organization_id
+                 AND profile.site_id=site.id
+                 AND profile.lifecycle_status='PUBLISHED'
+                 AND profile.effective_to IS NULL
+                 AND profile.deleted_at IS NULL
+                 AND profile.operating_model IN (
+                   'RERA_PROJECT_PROMOTER','RERA_ONGOING_PROJECT_REGULARISATION'
+                 )
+            )
+          LIMIT 1`,
+        [agreementId, siteId],
+      );
+      if (protectedRegistries[0]) {
+        throw businessError(
+          'Agreement execution and registration details are immutable after the linked RERA registry is executed',
+          'RERA_EXECUTED_AGREEMENT_IMMUTABLE',
+          409,
+          { registry_id: protectedRegistries[0].id },
+        );
+      }
+    }
     const { rows: changed } = await db.query(
       `UPDATE booking_agreements SET status=$1,execution_date=$2,review_notes=COALESCE($3,review_notes),
-         reviewed_by=CASE WHEN $4 THEN $5 ELSE reviewed_by END,reviewed_at=CASE WHEN $4 THEN NOW() ELSE reviewed_at END,updated_at=NOW()
-       WHERE id=$6 RETURNING *`,
-      [next, executionDate, cleanText(req.body.review_notes, 'Review notes', 4000), ['APPROVED_FOR_EXECUTION', 'EXECUTED'].includes(next), req.user.id, agreementId],
+         registration_status=$4,registration_number=$5,registration_date=$6,registration_office=$7,
+         registration_recorded_by=CASE WHEN $4='REGISTERED' THEN $8 ELSE NULL END,
+         registration_recorded_at=CASE WHEN $4='REGISTERED' THEN NOW() ELSE NULL END,
+         reviewed_by=CASE WHEN $9 THEN $8 ELSE reviewed_by END,
+         reviewed_at=CASE WHEN $9 THEN NOW() ELSE reviewed_at END,updated_at=NOW()
+       WHERE id=$10 RETURNING *`,
+      [next, executionDate, cleanText(req.body.review_notes, 'Review notes', 4000),
+        registrationStatus, registrationNumber, registrationDate, registrationOffice, req.user.id,
+        ['APPROVED_FOR_EXECUTION', 'EXECUTED'].includes(next), agreementId],
     );
-    await db.query(`UPDATE bookings SET agreement_status=$1,lifecycle_status=CASE WHEN $1='EXECUTED' THEN 'AGREEMENT_EXECUTED' ELSE lifecycle_status END,workflow_version=workflow_version+1,updated_at=NOW() WHERE id=$2`, [next, previous.booking_id]);
-    await db.query(`UPDATE plots SET agreement_status=$1,lifecycle_status=CASE WHEN $1='EXECUTED' THEN 'AGREEMENT_EXECUTED' ELSE lifecycle_status END,lifecycle_version=lifecycle_version+1,updated_at=NOW() WHERE id=$2`, [next, previous.plot_id]);
-    await writeComplianceAudit(db, req, { action: 'AGREEMENT_STATUS_CHANGED', entityType: 'BOOKING_AGREEMENT', entityId: agreementId, siteId, previousValue: { status: previous.status }, newValue: { status: next, execution_date: executionDate, booking_id: previous.booking_id }, reason: req.body.reason || req.body.review_notes });
+    const isExecuted = next === 'EXECUTED';
+    await db.query(
+      `UPDATE bookings
+          SET agreement_status=$1,
+              lifecycle_status=CASE WHEN $3 THEN 'AGREEMENT_EXECUTED' ELSE lifecycle_status END,
+              workflow_version=workflow_version+1,
+              updated_at=NOW()
+        WHERE id=$2`,
+      [next, previous.booking_id, isExecuted],
+    );
+    await db.query(
+      `UPDATE plots
+          SET agreement_status=$1,
+              lifecycle_status=CASE WHEN $3 THEN 'AGREEMENT_EXECUTED' ELSE lifecycle_status END,
+              lifecycle_version=lifecycle_version+1,
+              updated_at=NOW()
+        WHERE id=$2`,
+      [next, previous.plot_id, isExecuted],
+    );
+    await writeComplianceAudit(db, req, {
+      action: registrationOnlyUpdate ? 'AGREEMENT_REGISTRATION_UPDATED' : 'AGREEMENT_STATUS_CHANGED',
+      entityType: 'BOOKING_AGREEMENT',
+      entityId: agreementId,
+      siteId,
+      previousValue: {
+        status: previous.status,
+        registration_status: previous.registration_status,
+        registration_number: previous.registration_number,
+        registration_date: previous.registration_date,
+      },
+      newValue: {
+        status: next,
+        execution_date: executionDate,
+        registration_status: registrationStatus,
+        registration_number: registrationNumber,
+        registration_date: registrationDate,
+        registration_office: registrationOffice,
+        booking_id: previous.booking_id,
+      },
+      reason: req.body.reason || req.body.review_notes,
+    });
     return changed[0];
+  }).catch((error) => {
+    throw normalizeExecutedAgreementConstraint(error);
   });
   res.json({ agreement: result });
 });
@@ -596,6 +787,12 @@ export const createRefund = asyncHandler(async (req, res) => {
     if (Math.round((Number(totals[0].prepared) + Number(amount)) * 100) > Math.round(Number(cancellation.refund_due) * 100)) throw businessError('Refund total exceeds the approved refund due', 'REFUND_EXCEEDS_APPROVAL');
     const mode = String(req.body.payment_mode || '').toUpperCase();
     if (!['CASH', 'BANK', 'CHEQUE'].includes(mode)) throw businessError('A valid refund payment mode is required', 'INVALID_PAYMENT_MODE', 400);
+    await assertFinancePaymentModeAllowed({
+      organizationId: req.user.organization_id,
+      siteId,
+      paymentMode: mode,
+      db,
+    });
     const firmId = positiveId(req.body.firm_id, 'firm_id', { optional: true });
     const bankAccountId = await resolveBankAccountSelection({
       siteId,
@@ -715,32 +912,183 @@ export const executeTransfer = asyncHandler(async (req, res) => {
 });
 
 async function computeRegistryReadiness(db, req, registry) {
-  const policyRow = await loadWorkflowPolicy(db, req, registry.site_id, registry.booking_id);
+  const [policyRow, operatingPolicy] = await Promise.all([
+    loadWorkflowPolicy(db, req, registry.site_id, registry.booking_id),
+    resolveRegistryOperatingPolicy({
+      db,
+      siteId: registry.site_id,
+      organizationId: req.user.organization_id,
+    }),
+  ]);
   const workflow = deepMerge(policyRow?.workflow_policy, policyRow?.workflow_policy_overrides);
   const configured = workflow?.registry_readiness?.checks;
   const { rows } = await db.query(
     `SELECT b.agreement_status,b.final_consideration,
-            COALESCE((SELECT SUM(amount) FROM plot_payments WHERE booking_id=b.id AND LOWER(COALESCE(status,'approved'))='approved' AND UPPER(COALESCE(cheque_status,'')) NOT IN ('BOUNCED','RETURNED')),0) AS received,
-            (SELECT COUNT(*)::int FROM documents WHERE booking_id=b.id OR plot_id=b.plot_id) AS customer_documents,
-            (SELECT COUNT(*)::int FROM documents WHERE plot_id=b.plot_id AND category='REGISTRY') AS registry_documents
-       FROM bookings b WHERE b.id=$1`,
-    [registry.booking_id],
+            agreement.id AS registry_agreement_id,
+            agreement.status AS registry_agreement_status,
+            agreement.execution_date AS registry_agreement_execution_date,
+            agreement.registration_status AS agreement_registration_status,
+            agreement.registration_number AS agreement_registration_number,
+            agreement.registration_date AS agreement_registration_date,
+            COALESCE((
+              SELECT SUM(receipt.amount)
+                FROM plot_payments receipt
+               WHERE receipt.booking_id=b.id
+                 AND receipt.plot_id=b.plot_id
+                 AND receipt.site_id=b.site_id
+                 AND LOWER(COALESCE(receipt.status,'approved'))='approved'
+                 AND UPPER(COALESCE(receipt.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+                 AND receipt.reversal_of_payment_id IS NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM plot_payments reversal
+                    WHERE reversal.reversal_of_payment_id=receipt.id
+                      AND LOWER(COALESCE(reversal.status,'approved'))='approved'
+                      AND UPPER(COALESCE(reversal.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+                 )
+            ),0) AS received,
+            COALESCE((
+              SELECT SUM(receipt.amount)
+                FROM plot_registry_payments mapping
+                JOIN plot_payments receipt ON receipt.id=mapping.source_plot_payment_id
+               WHERE mapping.registry_id=$2
+                 AND receipt.plot_id=b.plot_id
+                 AND receipt.site_id=b.site_id
+                 AND receipt.booking_id=b.id
+                 AND receipt.amount>0
+                 AND LOWER(COALESCE(receipt.status,'approved'))='approved'
+                 AND UPPER(COALESCE(receipt.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+                 AND receipt.reversal_of_payment_id IS NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM plot_payments reversal
+                    WHERE reversal.reversal_of_payment_id=receipt.id
+                      AND LOWER(COALESCE(reversal.status,'approved'))='approved'
+                      AND UPPER(COALESCE(reversal.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+                 )
+            ),0) AS canonical_registry_received,
+            (SELECT COUNT(*)::int
+               FROM plot_registry_payments mapping
+               JOIN plot_payments receipt ON receipt.id=mapping.source_plot_payment_id
+              WHERE mapping.registry_id=$2
+                AND receipt.plot_id=b.plot_id
+                AND receipt.site_id=b.site_id
+                AND receipt.booking_id=b.id
+                AND receipt.amount>0
+                AND LOWER(COALESCE(receipt.status,'approved'))='approved'
+                AND UPPER(COALESCE(receipt.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+                AND receipt.reversal_of_payment_id IS NULL
+                AND NOT EXISTS (
+                  SELECT 1 FROM plot_payments reversal
+                   WHERE reversal.reversal_of_payment_id=receipt.id
+                     AND LOWER(COALESCE(reversal.status,'approved'))='approved'
+                     AND UPPER(COALESCE(reversal.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+                )) AS canonical_receipt_count,
+            (SELECT COUNT(*)::int
+               FROM plot_registry_payments mapping
+              WHERE mapping.registry_id=$2
+                AND mapping.source_plot_payment_id IS NULL) AS historical_manual_payment_count,
+            (SELECT COUNT(*)::int FROM documents customer_doc
+              WHERE customer_doc.site_id=b.site_id
+                AND (customer_doc.booking_id=b.id OR customer_doc.plot_id=b.plot_id)) AS customer_documents,
+            (SELECT COUNT(*)::int FROM documents deed
+              WHERE deed.site_id=b.site_id
+                AND deed.plot_id=b.plot_id
+                AND UPPER(COALESCE(deed.category,''))='REGISTRY'
+                AND deed.uploaded_source='PLOT_REGISTRY'
+                AND NULLIF(BTRIM(deed.file_path),'') IS NOT NULL
+                AND NULLIF(BTRIM(deed.file_hash),'') IS NOT NULL
+                AND deed.uploaded_by IS NOT NULL) AS controlled_registry_documents
+       FROM bookings b
+       LEFT JOIN booking_agreements agreement
+         ON agreement.id=$3
+        AND agreement.booking_id=b.id
+        AND agreement.plot_id=b.plot_id
+        AND agreement.site_id=b.site_id
+      WHERE b.id=$1 AND b.site_id=$4 AND b.organization_id=$5`,
+    [registry.booking_id, registry.id, registry.agreement_id, registry.site_id, req.user.organization_id],
   );
   const facts = rows[0] || {};
   const factChecks = {
-    agreement_executed: facts.agreement_status === 'EXECUTED',
+    project_context: operatingPolicy.rera_enforced
+      ? isRegistryProjectContextComplete({
+          projectStructure: operatingPolicy.project_structure,
+          projectId: registry.rera_project_id,
+          phaseId: registry.rera_project_phase_id,
+        })
+      : Boolean(registry.rera_project_id && registry.rera_project_phase_id),
+    agreement_context: Boolean(
+      registry.booking_id
+      && registry.agreement_id
+      && Number(facts.registry_agreement_id) === Number(registry.agreement_id)
+    ),
+    agreement_executed: facts.registry_agreement_status === 'EXECUTED'
+      && Boolean(facts.registry_agreement_execution_date),
+    agreement_registered: facts.registry_agreement_status === 'EXECUTED'
+      && facts.agreement_registration_status === 'REGISTERED'
+      && Boolean(String(facts.agreement_registration_number || '').trim())
+      && Boolean(facts.agreement_registration_date),
     full_collection: Number(facts.received) >= Number(facts.final_consideration || 0),
     customer_documents: Number(facts.customer_documents) > 0,
-    registry_documents: Number(facts.registry_documents) > 0,
+    canonical_receipt: Number(facts.canonical_receipt_count) > 0,
+    registry_documents: Number(facts.controlled_registry_documents) > 0,
+    controlled_registry_deed: Number(facts.controlled_registry_documents) > 0,
+    professional_registration_metadata: Boolean(
+      String(registry.deed_number || '').trim()
+      && String(registry.registration_number || '').trim()
+      && String(registry.sub_registrar_office || '').trim()
+      && registry.deed_execution_date
+      && registry.registration_date
+    ),
   };
-  const checks = Array.isArray(configured)
+  const configuredChecks = Array.isArray(configured)
     ? configured.map((item) => ({ key: item.key, label: item.label || item.key, required: item.required !== false, passed: factChecks[item.key] === true }))
     : Object.entries(factChecks).map(([key, passed]) => ({ key, label: key.replaceAll('_', ' '), required: false, passed, informational: true }));
+  const checksByKey = new Map(configuredChecks.map((check) => [check.key, check]));
+  if (operatingPolicy.rera_enforced) {
+    const mandatory = [
+      [
+        'project_context',
+        operatingPolicy.project_structure === 'PHASE_WISE'
+          ? 'RERA project and phase linked'
+          : 'RERA project linked',
+      ],
+      ['agreement_context', 'Agreement linked to this booking'],
+      ['agreement_executed', 'Agreement executed'],
+      ['agreement_registered', 'Executed agreement registered'],
+      ['canonical_receipt', 'Approved Project Payment receipt linked'],
+      ['controlled_registry_deed', 'Controlled registry deed uploaded'],
+      ['professional_registration_metadata', 'Registration number, deed number, dates and Sub-Registrar office completed'],
+    ];
+    for (const [key, label] of mandatory) {
+      checksByKey.set(key, {
+        ...(checksByKey.get(key) || {}),
+        key,
+        label,
+        required: true,
+        passed: factChecks[key] === true,
+        source: 'RERA_OPERATING_PROFILE',
+      });
+    }
+  }
+  const checks = [...checksByKey.values()];
+  const configuredRequired = configuredChecks.filter((check) => check.required);
   const required = checks.filter((check) => check.required);
   return {
     configured: Array.isArray(configured),
-    ready: Array.isArray(configured) ? required.every((check) => check.passed) : null,
+    configured_ready: Array.isArray(configured)
+      ? configuredRequired.every((check) => check.passed)
+      : null,
+    ready: required.length ? required.every((check) => check.passed) : null,
+    execution_ready: operatingPolicy.rera_enforced
+      ? required.every((check) => check.passed)
+      : null,
     checks,
+    facts: {
+      canonical_receipt_count: Number(facts.canonical_receipt_count || 0),
+      canonical_registry_received: Number(facts.canonical_registry_received || 0),
+      historical_manual_payment_count: Number(facts.historical_manual_payment_count || 0),
+      controlled_deed_count: Number(facts.controlled_registry_documents || 0),
+    },
+    operating_policy: operatingPolicy,
     ruleset: policyRow ? { id: policyRow.ruleset_version_id, code: policyRow.ruleset_code, version: policyRow.version, source_review_status: policyRow.source_review_status } : null,
   };
 }
@@ -757,8 +1105,8 @@ export const getRegistryReadiness = asyncHandler(async (req, res) => {
 
 /** PATCH /property-lifecycle/registries/:registryId/status */
 export const transitionRegistryLifecycle = asyncHandler(async (req, res) => {
-  const registry = await inTransaction(async (db) => {
-    const registryId = positiveId(req.params.registryId, 'registry_id');
+  const result = await inTransaction(async (db) => {
+    const registryId = positiveId(req.params.registryId ?? req.params.id, 'registry_id');
     const siteId = siteIdFrom(req);
     const { rows: contextRows } = await db.query(`SELECT booking_id FROM plot_registries WHERE id=$1 AND site_id=$2`, [registryId, siteId]);
     if (!contextRows[0]) throw businessError('Registry not found', 'REGISTRY_NOT_FOUND', 404);
@@ -766,21 +1114,76 @@ export const transitionRegistryLifecycle = asyncHandler(async (req, res) => {
     const { rows } = await db.query(`SELECT * FROM plot_registries WHERE id=$1 AND site_id=$2 FOR UPDATE`, [registryId, siteId]);
     const previous = rows[0];
     if (!previous || Number(previous.booking_id || 0) !== Number(contextRows[0].booking_id || 0)) throw businessError('Registry context changed while this action was in progress', 'REGISTRY_CONTEXT_STALE');
-    const next = assertTransition(REGISTRY_TRANSITIONS, previous.lifecycle_status, req.body.status, 'Registry');
+    const requestedStatus = String(req.body.status || '').trim().toUpperCase();
+    // Retried requests are safe. A slow response, refresh, or second browser
+    // tab must not turn an already-completed action into a workflow failure.
+    if (requestedStatus === previous.lifecycle_status) {
+      return { registry: previous, idempotent: true };
+    }
+    const expectedVersion = req.body.expected_version == null
+      ? null
+      : positiveId(req.body.expected_version, 'expected_version');
+    if (expectedVersion !== null && Number(previous.workflow_version) !== expectedVersion) {
+      throw businessError(
+        'Registry changed in another session. The latest status has been loaded; review it before continuing.',
+        'REGISTRY_VERSION_CONFLICT',
+        409,
+        { registry: previous },
+      );
+    }
+    const next = assertTransition(REGISTRY_TRANSITIONS, previous.lifecycle_status, requestedStatus, 'Registry');
     if (['EXECUTED', 'COMPLETE'].includes(next)) requireAdmin(req);
     const readiness = await computeRegistryReadiness(db, req, previous);
-    if (next === 'READY' && readiness.configured && readiness.ready !== true) throw businessError('Configured registry readiness checks are incomplete', 'REGISTRY_NOT_READY', 409, readiness);
+    if (next === 'READY' && readiness.configured && readiness.configured_ready !== true) {
+      throw businessError('Configured registry readiness checks are incomplete', 'REGISTRY_NOT_READY', 409, readiness);
+    }
+    if (['EXECUTED', 'COMPLETE'].includes(next)
+        && readiness.operating_policy?.rera_enforced
+        && readiness.execution_ready !== true) {
+      throw businessError(
+        'Complete the RERA registry checklist before execution',
+        'RERA_REGISTRY_EXECUTION_NOT_READY',
+        409,
+        readiness,
+      );
+    }
     const scheduledAt = next === 'SCHEDULED' ? cleanText(req.body.scheduled_at, 'Scheduled date/time', 40, { required: true }) : previous.scheduled_at;
-    const { rows: changed } = await db.query(`UPDATE plot_registries SET lifecycle_status=$1,readiness_result=$2,scheduled_at=$3,completed_at=CASE WHEN $1='COMPLETE' THEN NOW() ELSE completed_at END,completed_by=CASE WHEN $1='COMPLETE' THEN $4 ELSE completed_by END,workflow_version=workflow_version+1,updated_at=NOW() WHERE id=$5 RETURNING *`, [next, readiness, scheduledAt, req.user.id, registryId]);
+    const markComplete = next === 'COMPLETE';
+    // Keep status and completion condition in separate parameters. PostgreSQL
+    // otherwise infers $1 as both VARCHAR and TEXT and rejects the statement.
+    const { rows: changed } = await db.query(
+      `UPDATE plot_registries
+          SET lifecycle_status=$1,
+              readiness_result=$2,
+              scheduled_at=$3,
+              completed_at=CASE WHEN $4 THEN NOW() ELSE completed_at END,
+              completed_by=CASE WHEN $4 THEN $5 ELSE completed_by END,
+              workflow_version=workflow_version+1,
+              updated_at=NOW()
+        WHERE id=$6 AND site_id=$7
+        RETURNING *`,
+      [next, readiness, scheduledAt, markComplete, req.user.id, registryId, siteId],
+    );
     if (previous.booking_id) {
       const lifecycle = next === 'COMPLETE' ? 'REGISTRY_COMPLETE' : 'REGISTRY_PENDING';
       await db.query(`UPDATE bookings SET lifecycle_status=$1,workflow_version=workflow_version+1,updated_at=NOW() WHERE id=$2`, [lifecycle, previous.booking_id]);
-      await db.query(`UPDATE plots SET lifecycle_status=$1,registry_status=$2,status=CASE WHEN $2='COMPLETE' THEN 'REGISTRY' ELSE status END,lifecycle_version=lifecycle_version+1,updated_at=NOW() WHERE id=$3`, [lifecycle, next, previous.plot_id]);
+      await db.query(
+        `UPDATE plots
+            SET lifecycle_status=$1,
+                registry_status=$2,
+                status=CASE WHEN $3 THEN 'REGISTRY' ELSE status END,
+                lifecycle_version=lifecycle_version+1,
+                updated_at=NOW()
+          WHERE id=$4`,
+        [lifecycle, next, markComplete, previous.plot_id],
+      );
     }
     await writeComplianceAudit(db, req, { action: 'REGISTRY_LIFECYCLE_CHANGED', entityType: 'PROPERTY_BOOKING', entityId: previous.booking_id || registryId, siteId, previousValue: { status: previous.lifecycle_status }, newValue: { status: next, registry_id: registryId, booking_id: previous.booking_id, readiness }, reason: req.body.reason });
-    return changed[0];
+    return { registry: changed[0], idempotent: false };
+  }).catch((error) => {
+    throw normalizeRegistryLifecycleConstraint(error);
   });
-  res.json({ registry });
+  res.json(result);
 });
 
 /** POST /property-lifecycle/registries/:registryId/possession */
@@ -826,7 +1229,21 @@ export const transitionPossession = asyncHandler(async (req, res) => {
     const scheduledAt = next === 'HANDOVER_SCHEDULED' ? cleanText(req.body.scheduled_at, 'Scheduled date/time', 40, { required: true }) : previous.scheduled_at;
     const possessionDate = next === 'POSSESSED' ? isoDate(req.body.possession_date || new Date().toISOString().slice(0, 10), 'Possession date', { required: true }) : previous.possession_date;
     const acknowledgement = next === 'ACKNOWLEDGED' ? req.body.acknowledgement : previous.acknowledgement;
-    const { rows: changed } = await db.query(`UPDATE plot_possessions SET status=$1,scheduled_at=$2,possession_date=$3,acknowledgement=$4,handled_by=COALESCE($5,handled_by),completed_by=CASE WHEN $1='POSSESSED' THEN $5 ELSE completed_by END,completed_at=CASE WHEN $1='POSSESSED' THEN NOW() ELSE completed_at END,updated_at=NOW() WHERE id=$6 RETURNING *`, [next, scheduledAt, possessionDate, acknowledgement || {}, req.user.id, possessionId]);
+    const markPossessed = next === 'POSSESSED';
+    const { rows: changed } = await db.query(
+      `UPDATE plot_possessions
+          SET status=$1,
+              scheduled_at=$2,
+              possession_date=$3,
+              acknowledgement=$4,
+              handled_by=COALESCE($5,handled_by),
+              completed_by=CASE WHEN $6 THEN $5 ELSE completed_by END,
+              completed_at=CASE WHEN $6 THEN NOW() ELSE completed_at END,
+              updated_at=NOW()
+        WHERE id=$7
+        RETURNING *`,
+      [next, scheduledAt, possessionDate, acknowledgement || {}, req.user.id, markPossessed, possessionId],
+    );
     await db.query(`UPDATE plot_registries SET possession_status=$1,updated_at=NOW() WHERE id=$2`, [next, previous.registry_id]);
     if (next === 'POSSESSED') {
       await db.query(`UPDATE bookings SET lifecycle_status='POSSESSED',workflow_version=workflow_version+1,updated_at=NOW() WHERE id=$1`, [previous.booking_id]);
@@ -878,7 +1295,14 @@ export const createProjectAccountMapping = asyncHandler(async (req, res) => {
     const evidenceDocumentId = positiveId(req.body.evidence_document_id, 'evidence_document_id', { optional: true });
     if (effectiveTo && effectiveTo < effectiveFrom) throw businessError('Effective-to date cannot precede the start date', 'INVALID_EFFECTIVE_RANGE', 400);
     const { rows: context } = await db.query(
-      `SELECT rp.id
+      `SELECT rp.id,f.bank_name,f.account_number,f.ifsc_code,
+              EXISTS (
+                SELECT 1 FROM site_operating_profile_revisions profile
+                 WHERE profile.organization_id=rp.organization_id AND profile.site_id=rp.site_id
+                   AND profile.lifecycle_status='PUBLISHED' AND profile.effective_to IS NULL
+                   AND profile.deleted_at IS NULL
+                   AND profile.operating_model IN ('RERA_PROJECT_PROMOTER','RERA_ONGOING_PROJECT_REGULARISATION')
+              ) AS rera_mode
          FROM rera_projects rp
          JOIN sites s ON s.id=rp.site_id AND s.organization_id=rp.organization_id
          JOIN firms f ON f.id=$4 AND f.site_id=rp.site_id
@@ -890,8 +1314,20 @@ export const createProjectAccountMapping = asyncHandler(async (req, res) => {
       [projectId, siteId, req.user.organization_id, firmId, phaseId],
     );
     if (!context[0]) throw businessError('Account, project and phase must belong to the selected Site', 'PROJECT_ACCOUNT_SCOPE_MISMATCH');
+    const designatedReraPurpose = ['RERA_SEPARATE_ACCOUNT', 'SEPARATE_ACCOUNT', 'DESIGNATED_COLLECTION_ACCOUNT'].includes(purpose);
+    if (context[0].rera_mode && designatedReraPurpose) {
+      if (!context[0].bank_name || !context[0].account_number) {
+        throw businessError('A RERA separate account must have bank name and account number recorded', 'RERA_BANK_ACCOUNT_DETAILS_REQUIRED', 400);
+      }
+      if (!evidenceDocumentId) {
+        throw businessError('Upload and link bank account evidence before mapping the RERA separate account', 'RERA_BANK_ACCOUNT_EVIDENCE_REQUIRED', 400);
+      }
+    }
     if (evidenceDocumentId) {
-      const { rows: evidence } = await db.query(`SELECT 1 FROM documents WHERE id=$1 AND site_id=$2`, [evidenceDocumentId, siteId]);
+      const { rows: evidence } = await db.query(
+        `SELECT 1 FROM documents WHERE id=$1 AND site_id=$2 AND organization_id=$3`,
+        [evidenceDocumentId, siteId, req.user.organization_id],
+      );
       if (!evidence[0]) throw businessError('Account evidence document is outside the selected Site', 'ACCOUNT_EVIDENCE_SCOPE_MISMATCH');
     }
     const { rows } = await db.query(
@@ -916,8 +1352,27 @@ export const reviewProjectAccountMapping = asyncHandler(async (req, res) => {
     const mappingId = positiveId(req.params.mappingId, 'mapping_id');
     const decision = String(req.body.decision || '').toUpperCase();
     if (!['REVIEWED', 'REJECTED'].includes(decision)) throw businessError('decision must be REVIEWED or REJECTED', 'INVALID_REVIEW_DECISION', 400);
-    const { rows } = await db.query(`SELECT * FROM project_account_mappings WHERE id=$1 AND site_id=$2 AND organization_id=$3 FOR UPDATE`, [mappingId, siteId, req.user.organization_id]);
+    const { rows } = await db.query(
+      `SELECT pam.*,f.bank_name,f.account_number,
+              EXISTS (
+                SELECT 1 FROM site_operating_profile_revisions profile
+                 WHERE profile.organization_id=pam.organization_id AND profile.site_id=pam.site_id
+                   AND profile.lifecycle_status='PUBLISHED' AND profile.effective_to IS NULL
+                   AND profile.deleted_at IS NULL
+                   AND profile.operating_model IN ('RERA_PROJECT_PROMOTER','RERA_ONGOING_PROJECT_REGULARISATION')
+              ) AS rera_mode
+         FROM project_account_mappings pam
+         JOIN firms f ON f.id=pam.firm_id AND f.site_id=pam.site_id
+        WHERE pam.id=$1 AND pam.site_id=$2 AND pam.organization_id=$3 FOR UPDATE OF pam`,
+      [mappingId, siteId, req.user.organization_id],
+    );
     if (!rows[0]) throw businessError('Project account mapping not found', 'PROJECT_ACCOUNT_MAPPING_NOT_FOUND', 404);
+    const designatedReraPurpose = ['RERA_SEPARATE_ACCOUNT', 'SEPARATE_ACCOUNT', 'DESIGNATED_COLLECTION_ACCOUNT']
+      .includes(String(rows[0].purpose || '').toUpperCase());
+    if (decision === 'REVIEWED' && rows[0].rera_mode && designatedReraPurpose
+        && (!rows[0].bank_name || !rows[0].account_number || !rows[0].evidence_document_id)) {
+      throw businessError('Bank details and account evidence are required before reviewing a RERA separate account', 'RERA_BANK_ACCOUNT_EVIDENCE_REQUIRED', 400);
+    }
     const { rows: changed } = await db.query(`UPDATE project_account_mappings SET review_status=$1,reviewed_by=$2,reviewed_at=NOW(),effective_to=CASE WHEN $1='REJECTED' THEN COALESCE(effective_to,GREATEST(effective_from,CURRENT_DATE)) ELSE effective_to END WHERE id=$3 RETURNING *`, [decision, req.user.id, mappingId]);
     await writeComplianceAudit(db, req, { action: 'PROJECT_ACCOUNT_REVIEWED', entityType: 'PROJECT_ACCOUNT_MAPPING', entityId: mappingId, siteId, previousValue: { review_status: rows[0].review_status }, newValue: { review_status: decision }, reason: cleanText(req.body.reason, 'Review reason', 4000) });
     return changed[0];
@@ -981,12 +1436,26 @@ export const getProjectFinance = asyncHandler(async (req, res) => {
   const projectParams = [siteId, projectId, phaseId];
   const projectScope = `p.site_id=$1 AND p.rera_project_id=$2 AND ($3::bigint IS NULL OR p.rera_project_phase_id=$3)`;
   const organizationProjectParams = [siteId, req.user.organization_id, projectId, phaseId];
-  const [metrics, collections, expenses, accounts, allocations] = await Promise.all([
+  const [metrics, collections, expenses, accounts, allocations, evidenceDocuments] = await Promise.all([
     pool.query(`SELECT COALESCE(SUM(b.final_consideration),0) AS booked,COALESCE(SUM(received.total),0) AS collected,COALESCE(SUM(GREATEST(b.final_consideration-COALESCE(received.total,0),0)),0) AS receivable,COALESCE(SUM(overdue.total),0) AS overdue,COALESCE(SUM(unmatched.total),0) AS unreconciled FROM bookings b JOIN plots p ON p.id=b.plot_id LEFT JOIN LATERAL (SELECT SUM(amount) AS total FROM plot_payments WHERE booking_id=b.id AND LOWER(COALESCE(status,'approved'))='approved' AND UPPER(COALESCE(cheque_status,'')) NOT IN ('BOUNCED','RETURNED')) received ON TRUE LEFT JOIN LATERAL (SELECT SUM(GREATEST(pi.amount-COALESCE(pa.total,0),0)) AS total FROM plot_installments pi LEFT JOIN LATERAL (SELECT SUM(ppa.allocated_amount) AS total FROM plot_payment_allocations ppa JOIN plot_payments allocated_payment ON allocated_payment.id=ppa.plot_payment_id WHERE ppa.installment_id=pi.id AND LOWER(COALESCE(allocated_payment.status,'approved'))='approved' AND UPPER(COALESCE(allocated_payment.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')) pa ON TRUE WHERE pi.booking_id=b.id AND pi.due_date<CURRENT_DATE AND pi.superseded_at IS NULL) overdue ON TRUE LEFT JOIN LATERAL (SELECT SUM(amount) AS total FROM plot_payments WHERE booking_id=b.id AND reconciliation_status<>'MATCHED' AND LOWER(COALESCE(status,'approved'))='approved') unmatched ON TRUE WHERE ${projectScope}`, projectParams),
     pool.query(`SELECT pp.*,b.booking_no,p.plot_no,m.full_name AS customer_name FROM plot_payments pp JOIN bookings b ON b.id=pp.booking_id JOIN plots p ON p.id=pp.plot_id LEFT JOIN members m ON m.id=b.client_member_id WHERE ${projectScope} ORDER BY pp.date DESC,pp.id DESC LIMIT 200`, projectParams),
     pool.query(`SELECT e.id,e.date,COALESCE(e.remark,e.category) AS description,e.debit AS amount,e.status,e.rera_project_id,e.rera_project_phase_id FROM expenses e WHERE e.site_id=$1 AND e.rera_project_id=$2 AND ($3::bigint IS NULL OR e.rera_project_phase_id=$3) ORDER BY e.date DESC,e.id DESC LIMIT 200`, projectParams),
     pool.query(`SELECT pam.*,f.name AS firm_name,f.bank_name,f.account_number FROM project_account_mappings pam JOIN firms f ON f.id=pam.firm_id WHERE pam.organization_id=$2 AND pam.site_id=$1 AND pam.rera_project_id=$3 AND ($4::bigint IS NULL OR pam.rera_project_phase_id=$4) ORDER BY pam.effective_from DESC`, organizationProjectParams),
     pool.query(`SELECT * FROM project_transaction_allocations WHERE organization_id=$2 AND site_id=$1 AND rera_project_id=$3 AND ($4::bigint IS NULL OR rera_project_phase_id=$4) ORDER BY created_at DESC LIMIT 200`, organizationProjectParams),
+    pool.query(
+      `SELECT id,title,original_name,category,doc_date,mime_type,created_at
+         FROM documents
+        WHERE organization_id=$1 AND site_id=$2 AND uploaded_source='DMS'
+        ORDER BY created_at DESC,id DESC LIMIT 200`,
+      [req.user.organization_id, siteId],
+    ),
   ]);
-  res.json({ metrics: metrics.rows[0] || {}, collections: collections.rows, expenses: expenses.rows, accounts: accounts.rows, allocations: allocations.rows });
+  res.json({
+    metrics: metrics.rows[0] || {},
+    collections: collections.rows,
+    expenses: expenses.rows,
+    accounts: accounts.rows,
+    allocations: allocations.rows,
+    evidence_documents: evidenceDocuments.rows,
+  });
 });

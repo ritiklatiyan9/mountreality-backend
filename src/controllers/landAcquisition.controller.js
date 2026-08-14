@@ -332,6 +332,18 @@ export const getLandAcquisitionOverview = asyncHandler(async (req, res) => {
     total_acquisitions: 0, active_acquisitions: 0, total_land: 0,
     total_agreed: 0, total_paid: 0, outstanding: 0, payments_due: 0,
   });
+  // Top acquisitions by agreed value — drives the agreed-vs-paid bar chart on Overview.
+  const chart = acquisitions
+    .filter((item) => item.total_amount > 0)
+    .sort((left, right) => right.total_amount - left.total_amount)
+    .slice(0, 8)
+    .map((item) => ({
+      id: item.id,
+      label: item.landowner_name || item.acquisition_reference,
+      reference: item.acquisition_reference,
+      agreed: item.total_amount,
+      paid: item.total_paid,
+    }));
   const attention = acquisitions.flatMap((item) => {
     const messages = [];
     if (!item.agreement_status || !['EXECUTED', 'SUPERSEDED'].includes(item.agreement_status)) messages.push('Agreement pending execution');
@@ -372,7 +384,9 @@ export const getLandAcquisitionOverview = asyncHandler(async (req, res) => {
   const recentActivity = [...auditResult.rows, ...paymentResult.rows]
     .sort((left, right) => new Date(right.created_at) - new Date(left.created_at))
     .slice(0, 12);
-  res.json({ summary, attention, recent_activity: recentActivity, recent_acquisitions: acquisitions.slice(0, 8) });
+  res.json({
+    summary, chart, attention, recent_activity: recentActivity, recent_acquisitions: acquisitions.slice(0, 6),
+  });
 });
 
 export const createLandAcquisition = asyncHandler(async (req, res) => {

@@ -51,6 +51,32 @@ test('state transitions are centralized and fail closed', () => {
   );
 });
 
+test('agreement propagation uses an explicit execution flag instead of an ambiguously typed status parameter', async () => {
+  const controller = await readFile(new URL('../src/controllers/propertyLifecycle.controller.js', import.meta.url), 'utf8');
+  assert.match(controller, /const isExecuted = next === 'EXECUTED'/);
+  assert.match(controller, /lifecycle_status=CASE WHEN \$3 THEN 'AGREEMENT_EXECUTED'/);
+  assert.doesNotMatch(controller, /CASE WHEN \$1='EXECUTED' THEN 'AGREEMENT_EXECUTED'/);
+});
+
+test('registry lifecycle uses one retry-safe handler without ambiguous PostgreSQL parameters', async () => {
+  const controller = await readFile(new URL('../src/controllers/propertyLifecycle.controller.js', import.meta.url), 'utf8');
+  const registryRoutes = await readFile(new URL('../src/routes/registry.routes.js', import.meta.url), 'utf8');
+  assert.match(controller, /const markComplete = next === 'COMPLETE'/);
+  assert.match(controller, /completed_at=CASE WHEN \$4 THEN NOW\(\)/);
+  assert.doesNotMatch(controller, /CASE WHEN \$1='COMPLETE'/);
+  assert.match(controller, /status=CASE WHEN \$3 THEN 'REGISTRY'/);
+  assert.match(controller, /requestedStatus === previous\.lifecycle_status/);
+  assert.match(controller, /REGISTRY_VERSION_CONFLICT/);
+  assert.match(registryRoutes, /router\.patch\('\/:registryId\/status'[\s\S]*transitionRegistryLifecycle/);
+});
+
+test('registry possession completion also avoids ambiguous status parameters', async () => {
+  const controller = await readFile(new URL('../src/controllers/propertyLifecycle.controller.js', import.meta.url), 'utf8');
+  assert.match(controller, /const markPossessed = next === 'POSSESSED'/);
+  assert.match(controller, /completed_at=CASE WHEN \$6 THEN NOW\(\)/);
+  assert.doesNotMatch(controller, /CASE WHEN \$1='POSSESSED'/);
+});
+
 test('unreviewed ruleset configuration warns but never invents a legal block', () => {
   const result = evaluateCollectionPolicy({
     workflowPolicy: { collections: { agreement_guard: { enabled: true, decision: 'BLOCKED' } } },
@@ -83,6 +109,80 @@ test('reviewed explicit agreement control produces an explainable decision', () 
   assert.equal(result.decision, 'REQUIRES_APPROVAL');
   assert.equal(result.after_receipt, '500000.00');
   assert.equal(result.rule, 'TENANT-REVIEWED-1');
+});
+
+test('RERA operating profiles enforce the central ten-percent baseline without waiting for a state ruleset', () => {
+  const atLimit = evaluateCollectionPolicy({
+    operatingModel: 'RERA_PROJECT_PROMOTER',
+    agreementStatus: 'PREPARED',
+    agreementRegistrationStatus: 'NOT_REGISTERED',
+    currentQualifyingCollection: '80000',
+    proposedAmount: '20000',
+    finalConsideration: '1000000',
+  });
+  assert.equal(atLimit.decision, 'ALLOWED');
+
+  const aboveLimit = evaluateCollectionPolicy({
+    operatingModel: 'RERA_PROJECT_PROMOTER',
+    agreementStatus: 'PREPARED',
+    agreementRegistrationStatus: 'NOT_REGISTERED',
+    currentQualifyingCollection: '80000',
+    proposedAmount: '20000.01',
+    finalConsideration: '1000000',
+  });
+  assert.equal(aboveLimit.decision, 'BLOCKED');
+  assert.equal(aboveLimit.code, 'RERA_PRE_AGREEMENT_COLLECTION_LIMIT');
+  assert.equal(aboveLimit.configured_limit, '100000.00');
+});
+
+test('an executed agreement unlocks RERA collections only after registration metadata is recorded', () => {
+  const executedOnly = evaluateCollectionPolicy({
+    operatingModel: 'RERA_ONGOING_PROJECT_REGULARISATION',
+    agreementStatus: 'EXECUTED',
+    agreementRegistrationStatus: 'NOT_REGISTERED',
+    currentQualifyingCollection: '100000',
+    proposedAmount: '1',
+    finalConsideration: '1000000',
+  });
+  assert.equal(executedOnly.decision, 'BLOCKED');
+
+  const registered = evaluateCollectionPolicy({
+    operatingModel: 'RERA_ONGOING_PROJECT_REGULARISATION',
+    agreementStatus: 'EXECUTED',
+    agreementRegistrationStatus: 'REGISTERED',
+    agreementRegistrationNumber: 'REG-2026-0042',
+    agreementRegistrationDate: '2026-08-14',
+    currentQualifyingCollection: '100000',
+    proposedAmount: '500000',
+    finalConsideration: '1000000',
+  });
+  assert.equal(registered.decision, 'ALLOWED');
+  assert.equal(registered.agreement_registered, true);
+});
+
+test('reviewed state controls remain an additional stricter layer over the RERA baseline', () => {
+  const result = evaluateCollectionPolicy({
+    operatingModel: 'RERA_PROJECT_PROMOTER',
+    workflowPolicy: {
+      collections: {
+        pre_agreement_threshold: {
+          enabled: true,
+          percentage: 5,
+          decision: 'BLOCKED',
+          rule_reference: 'STATE-RERA-5-PERCENT',
+        },
+      },
+    },
+    ruleset: { id: 7, code: 'STATE_RERA', version: 3, source_review_status: 'REVIEWED' },
+    agreementStatus: 'PREPARED',
+    currentQualifyingCollection: '40000',
+    proposedAmount: '20000',
+    finalConsideration: '1000000',
+  });
+  assert.equal(result.decision, 'BLOCKED');
+  assert.equal(result.code, 'PRE_AGREEMENT_COLLECTION_THRESHOLD');
+  assert.equal(result.configured_limit, '50000.00');
+  assert.equal(result.rule, 'STATE-RERA-5-PERCENT');
 });
 
 test('collection summary keeps schedule, receipts, refunds and outstanding distinct', () => {
@@ -119,10 +219,40 @@ test('existing Plot Payment route performs booking allocation and ruleset guard'
   assert.match(controller, /Idempotency-Key/);
 });
 
+test('all Project Payment writers share the RERA guard and serialized plot lock', async () => {
+  const daybook = await readFile(new URL('../src/controllers/daybook.controller.js', import.meta.url), 'utf8');
+  const installments = await readFile(new URL('../src/controllers/installment.controller.js', import.meta.url), 'utf8');
+  assert.match(daybook, /resolveCollectionGuard/);
+  assert.match(daybook, /pg_advisory_xact_lock\(96096,\$1\)/);
+  assert.match(daybook, /ruleset_decision: collectionDecision/);
+  assert.match(installments, /resolveCollectionGuard/);
+  assert.match(installments, /pg_advisory_xact_lock\(96096,\$1\)/);
+  assert.match(installments, /FOR UPDATE/);
+});
+
+test('RERA payment migration distinguishes execution from registration and adds a database backstop', async () => {
+  const migration = await readFile(new URL('../src/migrations/118_rera_project_payment_controls.js', import.meta.url), 'utf8');
+  assert.match(migration, /registration_status/);
+  assert.match(migration, /registration_number/);
+  assert.match(migration, /registration_date/);
+  assert.match(migration, /RERA_PRE_AGREEMENT_COLLECTION_LIMIT/);
+  assert.match(migration, /v_consideration \* 0\.10/);
+  assert.match(migration, /trg_rera_collection_limit_plot_payments/);
+  assert.match(migration, /trg_rera_collection_limit_installment_payments/);
+  assert.match(migration, /trg_z_installment_payment_balance/);
+  assert.match(migration, /sync_installment_paid_amount/);
+});
+
 test('existing Registry create path derives booking, allottee, project, phase and agreement context', async () => {
   const controller = await readFile(new URL('../src/controllers/registry.controller.js', import.meta.url), 'utf8');
   assert.match(controller, /current_booking_id/);
   assert.match(controller, /booking_id,allottee_member_id,rera_project_id,rera_project_phase_id,agreement_id/);
+});
+
+test('registry supporting photos and PDFs stay separate from the controlled deed category', async () => {
+  const controller = await readFile(new URL('../src/controllers/registryDocument.controller.js', import.meta.url), 'utf8');
+  assert.match(controller, /\['REGISTRY', 'REGISTRY_SUPPORT', 'NOC'\]/);
+  assert.match(controller, /category === 'REGISTRY' && !workflowUnlocked/);
 });
 
 test('database migration serializes booking and enforces lifecycle relationship scope', async () => {

@@ -5,12 +5,51 @@ import pool from '../config/db.js';
 import applicationSettingModel, { FEATURE_KEYS } from '../models/ApplicationSetting.model.js';
 import { classifyPaymentMode } from '../utils/paymentMode.js';
 import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
+import { cleanText, isoDate, money } from '../services/propertyLifecycle.service.js';
+import {
+  isRegistryProjectContextComplete,
+  resolveRegistryOperatingPolicy,
+} from '../services/registryPolicy.service.js';
 
 // ══════════════════════════════════════════════════
 //  REGISTRY ENDPOINTS
 // ══════════════════════════════════════════════════
 
 const isAdminRole = (role) => role === 'admin' || role === 'super_admin';
+const EXECUTED_REGISTRY_LEGAL_FIELDS = Object.freeze([
+  'plot_no', 'customer_name', 'size_meter', 'size_sqyard', 'registry_date',
+  'farmer_name', 'plot_id', 'circle_rate', 'firm_name', 'seller_name',
+  'created_entry_date', 'deed_number', 'registration_number',
+  'sub_registrar_office', 'registrar_district', 'deed_execution_date',
+  'registration_date', 'stamp_duty_amount', 'registration_fee_amount',
+]);
+const owns = (object, key) => Object.prototype.hasOwnProperty.call(object || {}, key);
+const upperRegistryText = (value, field, max) => {
+  const normalized = cleanText(value, field, max);
+  return normalized ? normalized.toUpperCase() : null;
+};
+const registrationDetailsFrom = (body = {}) => {
+  const details = {};
+  if (body.deed_number !== undefined) details.deed_number = upperRegistryText(body.deed_number, 'Deed number', 160);
+  if (body.registration_number !== undefined) details.registration_number = upperRegistryText(body.registration_number, 'Registration number', 160);
+  if (body.sub_registrar_office !== undefined) details.sub_registrar_office = upperRegistryText(body.sub_registrar_office, 'Sub-Registrar office', 240);
+  if (body.registrar_district !== undefined) details.registrar_district = upperRegistryText(body.registrar_district, 'Registrar district', 160);
+  if (body.deed_execution_date !== undefined) details.deed_execution_date = isoDate(body.deed_execution_date, 'Deed execution date');
+  if (body.registration_date !== undefined) details.registration_date = isoDate(body.registration_date, 'Registration date');
+  if (body.stamp_duty_amount !== undefined) details.stamp_duty_amount = money(body.stamp_duty_amount, 'Stamp duty amount');
+  if (body.registration_fee_amount !== undefined) details.registration_fee_amount = money(body.registration_fee_amount, 'Registration fee amount');
+  return details;
+};
+
+const registrationDatesAreValid = (details, fallback = {}) => {
+  const deedDate = details.deed_execution_date !== undefined
+    ? details.deed_execution_date
+    : fallback.deed_execution_date;
+  const registrationDate = details.registration_date !== undefined
+    ? details.registration_date
+    : fallback.registration_date;
+  return !deedDate || !registrationDate || registrationDate >= deedDate;
+};
 const isRegistryWorkflowUnlocked = (siteId) => applicationSettingModel.isFeatureEnabled(
   siteId,
   FEATURE_KEYS.PLOT_REGISTRY_WORKFLOW_UNLOCKED
@@ -41,12 +80,83 @@ const REGISTRY_PAYMENT_ELIGIBILITY_SQL = `(
     prp.source_plot_payment_id IS NOT NULL
     AND LOWER(COALESCE(pp.status, 'approved')) = 'approved'
     AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+    AND pp.reversal_of_payment_id IS NULL
+    AND NOT EXISTS (
+      SELECT 1 FROM plot_payments reversal
+       WHERE reversal.reversal_of_payment_id=pp.id
+         AND LOWER(COALESCE(reversal.status,'approved'))='approved'
+         AND UPPER(COALESCE(reversal.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+    )
   )
 )`;
 const REGISTRY_PAYMENT_AMOUNT_SQL = `CASE
   WHEN prp.source_plot_payment_id IS NULL THEN COALESCE(prp.amount, 0)
   ELSE COALESCE(pp.amount, 0)
 END`;
+
+// Exact source-receipt predicate used by every registry linking surface. A
+// reversal is a separate audit row; once approved and clear it makes the
+// original receipt ineligible without deleting either record.
+const CANONICAL_PLOT_RECEIPT_ELIGIBILITY_SQL = `
+  pp.amount>0
+  AND LOWER(COALESCE(pp.status,'approved'))='approved'
+  AND UPPER(COALESCE(pp.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+  AND pp.reversal_of_payment_id IS NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM plot_payments reversal
+     WHERE reversal.reversal_of_payment_id=pp.id
+       AND LOWER(COALESCE(reversal.status,'approved'))='approved'
+       AND UPPER(COALESCE(reversal.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+  )`;
+
+/** Refresh the stored presentation amounts from canonical receipts only.
+ * Generic Sites are intentionally untouched. PostgreSQL performs the money
+ * arithmetic so no binary floating-point value becomes authoritative. */
+const syncReraRegistryAmounts = async (db, registryId) => {
+  const { rows } = await db.query(
+    `WITH target AS (
+       SELECT registry.id,registry.site_id,registry.plot_id,registry.booking_id
+         FROM plot_registries registry
+         JOIN sites site ON site.id=registry.site_id
+        WHERE registry.id=$1
+          AND EXISTS (
+            SELECT 1 FROM site_operating_profile_revisions profile
+             WHERE profile.organization_id=site.organization_id
+               AND profile.site_id=site.id
+               AND profile.lifecycle_status='PUBLISHED'
+               AND profile.effective_to IS NULL
+               AND profile.deleted_at IS NULL
+               AND profile.operating_model IN (
+                 'RERA_PROJECT_PROMOTER','RERA_ONGOING_PROJECT_REGULARISATION'
+               )
+          )
+     ), totals AS (
+       SELECT target.id,
+              COALESCE(SUM(pp.amount) FILTER (WHERE ${CANONICAL_PLOT_RECEIPT_ELIGIBILITY_SQL}),0)::numeric AS total_amount,
+              COALESCE(SUM(pp.amount) FILTER (
+                WHERE ${CANONICAL_PLOT_RECEIPT_ELIGIBILITY_SQL}
+                  AND ledger_bucket(pp.payment_type)<>'cash'
+              ),0)::numeric AS bank_amount
+         FROM target
+         LEFT JOIN plot_registry_payments mapping ON mapping.registry_id=target.id
+         LEFT JOIN plot_payments pp
+           ON pp.id=mapping.source_plot_payment_id
+          AND pp.site_id=target.site_id
+          AND pp.plot_id=target.plot_id
+          AND pp.booking_id=target.booking_id
+        GROUP BY target.id
+     )
+     UPDATE plot_registries registry
+        SET registry_payment=totals.total_amount,
+            bank_amount=totals.bank_amount,
+            updated_at=NOW()
+       FROM totals
+      WHERE registry.id=totals.id
+      RETURNING registry.*`,
+    [registryId],
+  );
+  return rows[0] || null;
+};
 
 /** Bank-clearance snapshot for a plot: what the plot expects in bank
  *  (plots.to_receive_bank) vs what has actually landed — bank/cheque plot
@@ -61,6 +171,13 @@ export async function getPlotBankClearance(plotId) {
                  AND ledger_bucket(pp.payment_type) <> 'cash'
                  AND LOWER(COALESCE(pp.status, 'approved')) = 'approved'
                  AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+                 AND pp.reversal_of_payment_id IS NULL
+                 AND NOT EXISTS (
+                   SELECT 1 FROM plot_payments reversal
+                    WHERE reversal.reversal_of_payment_id=pp.id
+                      AND LOWER(COALESCE(reversal.status,'approved'))='approved'
+                      AND UPPER(COALESCE(reversal.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+                 )
             ), 0)::numeric
           + COALESCE((
               SELECT SUM(pip.amount) FROM plot_installment_payments pip
@@ -97,24 +214,37 @@ export const getRegistryPlotClearance = asyncHandler(async (req, res) => {
 
 /** POST /registries — Create a new registry.
  *  Business rules:
- *  1. Money-mapped: the payload must carry `payments` totalling > 0 (see
- *     createRegistryRecord).
- *  2. Payments-clear: the linked plot's bank money must be fully received
- *     (up to plots.to_receive_bank). Admins may create anyway; sub-admins
- *     are routed to the admin-approval flow (POST /edit-requests, module
- *     'plot_registry_create') and blocked here. */
+ *  1. Generic profiles retain the legacy money-mapped and bank-clearance
+ *     create gates.
+ *  2. A published RERA profile may create a staged NOT_READY registry before
+ *     collection is complete. Any attached money must be an approved
+ *     canonical Project Payment receipt; final execution readiness is the
+ *     authoritative gate. */
 export const createRegistry = asyncHandler(async (req, res) => {
   const requestedSiteId = parseInt(req.body.site_id);
   const requestedPlotId = parseInt(req.body.plot_id);
+  let resolvedSiteId = Number.isFinite(requestedSiteId) ? requestedSiteId : null;
   if (Number.isFinite(requestedPlotId)) {
     const { rows } = await pool.query('SELECT site_id FROM plots WHERE id = $1 LIMIT 1', [requestedPlotId]);
     if (!rows[0]) return res.status(404).json({ message: 'Plot not found' });
+    resolvedSiteId = parseInt(rows[0].site_id);
     if (Number.isFinite(requestedSiteId) && parseInt(rows[0].site_id) !== requestedSiteId) {
       return res.status(400).json({ message: 'Selected plot does not belong to the registry site' });
     }
   }
 
-  if (!isAdminRole(req.user.role)) {
+  const operatingPolicy = resolvedSiteId
+    ? await resolveRegistryOperatingPolicy({
+        siteId: resolvedSiteId,
+        organizationId: req.user.organization_id,
+      })
+    : null;
+
+  // RERA uses a staged registry lifecycle: preparation may start before a
+  // receipt exists, supplied mappings must be canonical, and full collection
+  // is enforced only when an explicit ruleset readiness check asks for it. The
+  // legacy bank-clear gate remains unchanged for generic Sites.
+  if (!isAdminRole(req.user.role) && !operatingPolicy?.rera_enforced) {
     // Resolve the gate plot by FK or (site, plot_no) fallback — omitting
     // plot_id must not skip the clearance check.
     let gatePlotId = parseInt(req.body.plot_id);
@@ -142,14 +272,15 @@ export const createRegistry = asyncHandler(async (req, res) => {
 
 /** Core create logic, callable outside the HTTP handler (admin-approval flow
  *  applies an approved 'plot_registry_create' edit request through this).
- *  A registry can only be created with money mapped to it — `payments` is an
- *  array of either
+ *  `payments` is an array of either
  *    { source_plot_payment_id }                              (link a bank/cheque plot payment)
  *    { payment_date, amount, payment_mode, tally_date, tally_amount, notes, cheque_no }  (manual)
- *  totalling > 0. Registry + payments are created in ONE transaction, so a
- *  registry can never exist without its money. An optional transaction client
- *  lets the edit-request approval commit the registry and approval state as one
- *  unit. Returns { status, body }. */
+ *  totalling > 0 for generic profiles. RERA profiles support a staged
+ *  NOT_READY record with no receipt yet, but reject every manual payment and
+ *  require canonical receipts before execution. Registry + supplied mappings
+ *  are created in ONE transaction. An optional transaction client lets the
+ *  edit-request approval commit the registry and approval state as one unit.
+ *  Returns { status, body }. */
 export async function createRegistryRecord(body, userId, transactionClient = null) {
   const {
     site_id, plot_no, customer_name, size_meter, size_sqyard, registry_date, farmer_name,
@@ -173,20 +304,38 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
   if (!Number.isInteger(plotIdInt) || plotIdInt <= 0) {
     return { status: 400, body: { message: 'A valid plot is required' } };
   }
-  const { rows: plotRows } = await db.query(
-    `SELECT p.site_id,p.plot_no,p.current_booking_id,p.rera_project_id,p.rera_project_phase_id,
-            b.client_member_id,b.buyer_name AS booking_buyer_name,
-            a.id AS agreement_id
-       FROM plots p
-       LEFT JOIN bookings b ON b.id=p.current_booking_id AND b.site_id=p.site_id
-       LEFT JOIN LATERAL (
-         SELECT ba.id FROM booking_agreements ba
-          WHERE ba.booking_id=b.id AND ba.status NOT IN ('SUPERSEDED','CANCELLED')
-          ORDER BY ba.version_number DESC,ba.id DESC LIMIT 1
-       ) a ON TRUE
-      WHERE p.id=$1 LIMIT 1`,
-    [plotIdInt]
-  );
+  let registrationDetails;
+  try {
+    registrationDetails = registrationDetailsFrom(body);
+  } catch (error) {
+    return { status: error.statusCode || 400, body: { code: error.code, message: error.message } };
+  }
+  if (!registrationDatesAreValid(registrationDetails)) {
+    return { status: 400, body: {
+      code: 'INVALID_REGISTRATION_DATES',
+      message: 'Registration date cannot be earlier than the deed execution date',
+    } };
+  }
+
+  const [plotResult, initialOperatingPolicy] = await Promise.all([
+    db.query(
+      `SELECT p.site_id,p.plot_no,p.current_booking_id,p.rera_project_id,p.rera_project_phase_id,
+              b.client_member_id,b.buyer_name AS booking_buyer_name,
+              a.id AS agreement_id,a.status AS agreement_status,a.execution_date AS agreement_execution_date
+         FROM plots p
+         LEFT JOIN bookings b ON b.id=p.current_booking_id AND b.site_id=p.site_id
+         LEFT JOIN LATERAL (
+           SELECT ba.id,ba.status,ba.execution_date FROM booking_agreements ba
+            WHERE ba.booking_id=b.id AND ba.status NOT IN ('SUPERSEDED','CANCELLED')
+            ORDER BY ba.version_number DESC,ba.id DESC LIMIT 1
+         ) a ON TRUE
+        WHERE p.id=$1 LIMIT 1`,
+      [plotIdInt],
+    ),
+    resolveRegistryOperatingPolicy({ siteId: siteIdInt, db }),
+  ]);
+  let operatingPolicy = initialOperatingPolicy;
+  const plotRows = plotResult.rows;
   if (!plotRows[0]) return { status: 404, body: { message: 'Plot not found' } };
   if (parseInt(plotRows[0].site_id) !== siteIdInt) {
     return { status: 400, body: { message: 'Selected plot does not belong to the registry site' } };
@@ -195,6 +344,24 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
     return { status: 400, body: { message: 'Registry plot number does not match the selected plot' } };
   }
   let plotContext = plotRows[0];
+  if (operatingPolicy.rera_enforced) {
+    const missingContext = [
+      ['booking', plotContext.current_booking_id],
+      ['primary allottee', plotContext.client_member_id],
+      ['RERA project', plotContext.rera_project_id],
+      ...(operatingPolicy.project_structure === 'PHASE_WISE'
+        ? [['RERA phase', plotContext.rera_project_phase_id]]
+        : []),
+      ['agreement', plotContext.agreement_id],
+    ].filter(([, value]) => !value).map(([label]) => label);
+    if (missingContext.length) {
+      return { status: 409, body: {
+        code: 'RERA_REGISTRY_CONTEXT_INCOMPLETE',
+        message: `Complete the ${missingContext.join(', ')} context before starting this RERA registry`,
+        missing: missingContext,
+      } };
+    }
+  }
 
   // ── Money-mapped gate ──
   const paymentRows = Array.isArray(payments) ? payments : [];
@@ -204,6 +371,13 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
     .filter(Number.isFinite))];
   const manualRows = paymentRows.filter((p) => p && !p.source_plot_payment_id && (parseFloat(p.amount) || 0) > 0);
 
+  if (operatingPolicy.rera_enforced && manualRows.length) {
+    return { status: 409, body: {
+      code: 'RERA_CANONICAL_RECEIPT_REQUIRED',
+      message: 'RERA registry payments must be selected from approved Project Payment receipts; manual registry-only payments are not accepted',
+    } };
+  }
+
   let linkedTotal = 0;
   let linkable = [];
   if (linkedIds.length) {
@@ -211,16 +385,22 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
     // sufficient: otherwise receipts from another plot could satisfy this
     // registry's NOC payment gate.
     const { rows } = await db.query(
-      `SELECT pp.id, pp.site_id, pp.date, pp.amount, pp.payment_from, pp.payment_type,
+      `SELECT pp.id, pp.site_id, pp.booking_id, pp.date, pp.amount, pp.payment_from, pp.payment_type,
               pp.bank_details, pp.narration, pp.cheque_no, pp.cheque_status, pp.bank_account_id
          FROM plot_payments pp
         WHERE pp.id = ANY($1::int[])
           AND pp.site_id = $2
           AND pp.plot_id = $3
-          AND LOWER(COALESCE(pp.status, 'approved')) = 'approved'
-          AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+          AND ($4::boolean=FALSE OR pp.booking_id=$5)
+          AND ${CANONICAL_PLOT_RECEIPT_ELIGIBILITY_SQL}
           AND NOT EXISTS (SELECT 1 FROM plot_registry_payments x WHERE x.source_plot_payment_id = pp.id)`,
-      [linkedIds, siteIdInt, plotIdInt]
+      [
+        linkedIds,
+        siteIdInt,
+        plotIdInt,
+        operatingPolicy.rera_enforced,
+        plotContext.current_booking_id || null,
+      ]
     );
     linkable = rows;
     if (linkable.length !== linkedIds.length) {
@@ -231,7 +411,8 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
     linkedTotal = rows.reduce((n, r) => n + (parseFloat(r.amount) || 0), 0);
   }
   const manualTotal = manualRows.reduce((n, r) => n + (parseFloat(r.amount) || 0), 0);
-  if (linkable.length + manualRows.length === 0 || linkedTotal + manualTotal <= 0) {
+  if (!operatingPolicy.rera_enforced
+      && (linkable.length + manualRows.length === 0 || linkedTotal + manualTotal <= 0)) {
     return { status: 400, body: {
       message: 'Map at least one payment before creating a registry — a registry cannot be created without money mapped to it',
     } };
@@ -246,11 +427,12 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
     await client.query(`SELECT pg_advisory_xact_lock(96096,$1)`, [plotIdInt]);
     const { rows: lockedPlots } = await client.query(
       `SELECT p.site_id,p.plot_no,p.current_booking_id,p.rera_project_id,p.rera_project_phase_id,
-              b.client_member_id,b.buyer_name AS booking_buyer_name,a.id AS agreement_id
+              b.client_member_id,b.buyer_name AS booking_buyer_name,
+              a.id AS agreement_id,a.status AS agreement_status,a.execution_date AS agreement_execution_date
          FROM plots p
          LEFT JOIN bookings b ON b.id=p.current_booking_id AND b.site_id=p.site_id
          LEFT JOIN LATERAL (
-           SELECT ba.id FROM booking_agreements ba
+           SELECT ba.id,ba.status,ba.execution_date FROM booking_agreements ba
             WHERE ba.booking_id=b.id AND ba.status NOT IN ('SUPERSEDED','CANCELLED')
             ORDER BY ba.version_number DESC,ba.id DESC LIMIT 1
          ) a ON TRUE
@@ -262,24 +444,68 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
       return { status: 409, body: { message: 'Plot context changed while the registry form was open' } };
     }
     plotContext = lockedPlots[0];
+    operatingPolicy = await resolveRegistryOperatingPolicy({ siteId: siteIdInt, db: client });
+    if (operatingPolicy.rera_enforced && (
+      !plotContext.current_booking_id
+      || !plotContext.client_member_id
+      || !isRegistryProjectContextComplete({
+        projectStructure: operatingPolicy.project_structure,
+        projectId: plotContext.rera_project_id,
+        phaseId: plotContext.rera_project_phase_id,
+      })
+      || !plotContext.agreement_id
+    )) {
+      if (ownsTransaction) await client.query('ROLLBACK');
+      return { status: 409, body: {
+        code: 'RERA_REGISTRY_CONTEXT_STALE',
+        message: 'The RERA booking or agreement context changed while the registry form was open',
+      } };
+    }
+    if (operatingPolicy.rera_enforced && manualRows.length) {
+      if (ownsTransaction) await client.query('ROLLBACK');
+      return { status: 409, body: {
+        code: 'RERA_CANONICAL_RECEIPT_REQUIRED',
+        message: 'The operating profile changed. Select approved Project Payment receipts for this RERA registry',
+      } };
+    }
     if (linkedIds.length) {
       const { rows: currentLinkable } = await client.query(
-        `SELECT pp.id,pp.site_id,pp.date,pp.amount,pp.payment_from,pp.payment_type,
+        `SELECT pp.id,pp.site_id,pp.booking_id,pp.date,pp.amount,pp.payment_from,pp.payment_type,
                 pp.bank_details,pp.narration,pp.cheque_no,pp.cheque_status,pp.bank_account_id
            FROM plot_payments pp
           WHERE pp.id=ANY($1::int[]) AND pp.site_id=$2 AND pp.plot_id=$3
-            AND LOWER(COALESCE(pp.status,'approved'))='approved'
-            AND UPPER(COALESCE(pp.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+            AND ($4::boolean=FALSE OR pp.booking_id=$5)
+            AND ${CANONICAL_PLOT_RECEIPT_ELIGIBILITY_SQL}
             AND NOT EXISTS (SELECT 1 FROM plot_registry_payments x WHERE x.source_plot_payment_id=pp.id)
           FOR UPDATE OF pp`,
-        [linkedIds, siteIdInt, plotIdInt],
+        [
+          linkedIds,
+          siteIdInt,
+          plotIdInt,
+          operatingPolicy.rera_enforced,
+          plotContext.current_booking_id || null,
+        ],
       );
       if (currentLinkable.length !== linkedIds.length) {
         if (ownsTransaction) await client.query('ROLLBACK');
         return { status: 409, body: { message: 'A linked receipt changed or was used while this registry form was open' } };
       }
       linkable = currentLinkable;
+      linkedTotal = currentLinkable.reduce((sum, receipt) => (
+        sum + (parseFloat(receipt.amount) || 0)
+      ), 0);
     }
+
+    const derivedRegistryPayment = operatingPolicy.rera_enforced
+      ? linkedTotal
+      : (parseFloat(registry_payment) || 0);
+    const derivedBankAmount = operatingPolicy.rera_enforced
+      ? linkable.reduce((sum, receipt) => (
+          classifyPaymentMode(receipt.payment_type) === 'cash'
+            ? sum
+            : sum + (parseFloat(receipt.amount) || 0)
+        ), 0)
+      : (bank_amount !== undefined && bank_amount !== '' ? (parseFloat(bank_amount) || 0) : null);
 
     // Single CTE: dup-check + INSERT + plot-status auto-bump in ONE round-trip.
     const result = await client.query(
@@ -327,8 +553,8 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
         firm_name ? firm_name.trim().toUpperCase() : null,                      // $10
         seller_name ? seller_name.trim().toUpperCase() : null,                  // $11
         created_entry_date || today,                                            // $12
-        bank_amount !== undefined && bank_amount !== '' ? (parseFloat(bank_amount) || 0) : null, // $13
-        parseFloat(registry_payment) || 0,                                      // $14
+        derivedBankAmount,                                                      // $13
+        derivedRegistryPayment,                                                 // $14
         notes ? notes.trim() : null,                                            // $15
         body.assigned_admin_id ? parseInt(body.assigned_admin_id) : null,       // $16
         userId,                                                                 // $17
@@ -346,6 +572,9 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
       return { status: 409, body: { message: `Registry for plot "${trimmed}" already exists` } };
     }
     const registryId = row.registry.id;
+    if (Object.keys(registrationDetails).length) {
+      row.registry = await plotRegistryModel.update(registryId, registrationDetails, client);
+    }
 
     // ── Linked bank/cheque plot payments (same shape saveRegistryNoc uses) ──
     for (const pp of linkable) {
@@ -392,9 +621,23 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
       );
     }
 
+    if (operatingPolicy.rera_enforced) {
+      row.registry = await syncReraRegistryAmounts(client, registryId) || row.registry;
+    }
+
     if (ownsTransaction) await client.query('COMMIT');
   } catch (err) {
     if (ownsTransaction) await client.query('ROLLBACK');
+    if (err.constraint === 'uq_plot_registry_site_registration_number') {
+      err.statusCode = 409;
+      err.code = 'REGISTRATION_NUMBER_EXISTS';
+      err.message = 'This registration number is already used by another registry in the Site';
+    }
+    if (err.constraint === 'rera_registry_canonical_payment_required') {
+      err.statusCode = 409;
+      err.code = 'RERA_CANONICAL_RECEIPT_REQUIRED';
+      err.message = 'RERA registry payments must link approved Project Payment receipts';
+    }
     throw err;
   } finally {
     if (ownsTransaction) client.release();
@@ -402,9 +645,11 @@ export async function createRegistryRecord(body, userId, transactionClient = nul
 
   return { status: 201, body: {
     registry: row.registry,
+    operating_policy: operatingPolicy,
     plot_status_updated: row.plot_status_updated,
     payments_created: linkable.length + manualRows.length,
     payments_skipped: linkedIds.length - linkable.length,
+    monetary_fields_derived: operatingPolicy.rera_enforced,
   } };
 }
 
@@ -435,6 +680,16 @@ export const updateRegistry = asyncHandler(async (req, res) => {
 
   const existing = await plotRegistryModel.findById(registryId, pool);
   if (!existing) return res.status(404).json({ message: 'Registry not found' });
+  const operatingPolicy = await resolveRegistryOperatingPolicy({ siteId: existing.site_id });
+  if (operatingPolicy.rera_enforced
+      && ['EXECUTED', 'COMPLETE'].includes(existing.lifecycle_status)
+      && EXECUTED_REGISTRY_LEGAL_FIELDS.some((field) => owns(req.body, field))) {
+    return res.status(409).json({
+      code: 'RERA_EXECUTED_REGISTRY_IMMUTABLE',
+      message: 'Executed registry details are immutable. A controlled reopen workflow is required before legal data can change',
+    });
+  }
+  const clientAmountOverride = owns(req.body, 'registry_payment') || owns(req.body, 'bank_amount');
 
   const updateData = {};
   if (plot_no !== undefined) {
@@ -462,12 +717,34 @@ export const updateRegistry = asyncHandler(async (req, res) => {
   if (firm_name !== undefined) updateData.firm_name = firm_name ? firm_name.trim().toUpperCase() : null;
   if (seller_name !== undefined) updateData.seller_name = seller_name ? seller_name.trim().toUpperCase() : null;
   if (created_entry_date !== undefined) updateData.created_entry_date = created_entry_date || null;
-  if (bank_amount !== undefined) updateData.bank_amount = bank_amount === '' ? null : (parseFloat(bank_amount) || 0);
-  if (registry_payment !== undefined) updateData.registry_payment = parseFloat(registry_payment) || 0;
+  if (!operatingPolicy.rera_enforced && bank_amount !== undefined) {
+    updateData.bank_amount = bank_amount === '' ? null : (parseFloat(bank_amount) || 0);
+  }
+  if (!operatingPolicy.rera_enforced && registry_payment !== undefined) {
+    updateData.registry_payment = parseFloat(registry_payment) || 0;
+  }
   if (notes !== undefined) updateData.notes = notes ? notes.trim() : null;
   if (req.body.assigned_admin_id !== undefined) updateData.assigned_admin_id = req.body.assigned_admin_id ? parseInt(req.body.assigned_admin_id) : null;
+  Object.assign(updateData, registrationDetailsFrom(req.body));
 
-  if (Object.keys(updateData).length === 0) return res.status(400).json({ message: 'Nothing to update' });
+  if (!registrationDatesAreValid(updateData, existing)) {
+    return res.status(400).json({
+      code: 'INVALID_REGISTRATION_DATES',
+      message: 'Registration date cannot be earlier than the deed execution date',
+    });
+  }
+
+  if (Object.keys(updateData).length === 0) {
+    if (operatingPolicy.rera_enforced && clientAmountOverride) {
+      const registry = await syncReraRegistryAmounts(pool, registryId) || existing;
+      return res.json({
+        registry,
+        monetary_fields_derived: true,
+        message: 'Registry amounts were refreshed from canonical Project Payment receipts',
+      });
+    }
+    return res.status(400).json({ message: 'Nothing to update' });
+  }
 
   const prospectivePlotId = updateData.plot_id !== undefined ? updateData.plot_id : existing.plot_id;
   const prospectivePlotNo = updateData.plot_no !== undefined ? updateData.plot_no : existing.plot_no;
@@ -516,6 +793,9 @@ export const updateRegistry = asyncHandler(async (req, res) => {
   try {
     await client.query('BEGIN');
     updated = await plotRegistryModel.update(registryId, updateData, client);
+    if (operatingPolicy.rera_enforced) {
+      updated = await syncReraRegistryAmounts(client, registryId) || updated;
+    }
     // Plot becomes 'REGISTRY' only via NOC approval (approveRegistryNoc); here
     // we only move a fresh BOOKED plot into the pending stage.
     if (resolvedPlotId) {
@@ -541,11 +821,25 @@ export const updateRegistry = asyncHandler(async (req, res) => {
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
+    if (error.constraint === 'uq_plot_registry_site_registration_number') {
+      error.statusCode = 409;
+      error.code = 'REGISTRATION_NUMBER_EXISTS';
+      error.message = 'This registration number is already used by another registry in the Site';
+    }
+    if (error.constraint === 'executed_rera_registry_legal_metadata_immutable') {
+      error.statusCode = 409;
+      error.code = 'RERA_EXECUTED_REGISTRY_IMMUTABLE';
+      error.message = 'Executed registry details are immutable until a controlled reopen workflow is completed';
+    }
     throw error;
   } finally {
     client.release();
   }
-  res.json({ registry: updated, plot_status_updated: (plotBumpRes.rows?.length || 0) > 0 });
+  res.json({
+    registry: updated,
+    plot_status_updated: (plotBumpRes.rows?.length || 0) > 0,
+    monetary_fields_derived: operatingPolicy.rera_enforced,
+  });
 });
 
 /** DELETE /registries/:id */
@@ -555,7 +849,7 @@ export const deleteRegistry = asyncHandler(async (req, res) => {
   try {
     await client.query('BEGIN');
     const { rows } = await client.query(
-      `SELECT id, plot_id, site_id, plot_no, noc_approved_at
+      `SELECT id, plot_id, site_id, plot_no, lifecycle_status, noc_approved_at
          FROM plot_registries
         WHERE id = $1
         FOR UPDATE`,
@@ -570,6 +864,15 @@ export const deleteRegistry = asyncHandler(async (req, res) => {
       await client.query('ROLLBACK');
       return res.status(409).json({
         message: 'An approved registry cannot be deleted. Keep the audit record and use the relevant cancellation workflow.',
+      });
+    }
+    const operatingPolicy = await resolveRegistryOperatingPolicy({ siteId: registry.site_id, db: client });
+    if (operatingPolicy.rera_enforced
+        && ['EXECUTED', 'COMPLETE'].includes(registry.lifecycle_status)) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({
+        code: 'RERA_EXECUTED_REGISTRY_IMMUTABLE',
+        message: 'An executed RERA registry is a retained legal record and cannot be deleted',
       });
     }
 
@@ -598,6 +901,11 @@ export const deleteRegistry = asyncHandler(async (req, res) => {
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
+    if (error.constraint === 'executed_rera_registry_legal_metadata_immutable') {
+      error.statusCode = 409;
+      error.code = 'RERA_EXECUTED_REGISTRY_IMMUTABLE';
+      error.message = 'An executed RERA registry is a retained legal record and cannot be deleted';
+    }
     throw error;
   } finally {
     client.release();
@@ -629,19 +937,18 @@ export const createRegistryPayment = asyncHandler(async (req, res) => {
     // Was 4 serial RTTs (registry SELECT + col check + dup SELECT + source SELECT).
     const [registryRes, dupRes, sourceRes] = await Promise.all([
       pool.query(
-        `SELECT id, site_id, plot_id, plot_no FROM plot_registries WHERE id = $1`,
+        `SELECT id, site_id, plot_id, plot_no, booking_id FROM plot_registries WHERE id = $1`,
         [registryIdInt]
       ),
       pool.query(`SELECT id FROM plot_registry_payments WHERE source_plot_payment_id = $1 LIMIT 1`, [sourceId]),
       pool.query(
-        `SELECT pp.id, pp.site_id, pp.plot_id, p.plot_no, pp.date, pp.amount,
+        `SELECT pp.id, pp.site_id, pp.plot_id, pp.booking_id, p.plot_no, pp.date, pp.amount,
                 pp.payment_from, pp.payment_type, pp.bank_details, pp.narration,
                 pp.cheque_no, pp.cheque_status, pp.bank_account_id
-           FROM plot_payments pp
+          FROM plot_payments pp
            LEFT JOIN plots p ON p.id = pp.plot_id
           WHERE pp.id = $1
-            AND LOWER(COALESCE(pp.status, 'approved')) = 'approved'
-            AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+            AND ${CANONICAL_PLOT_RECEIPT_ELIGIBILITY_SQL}
           LIMIT 1`,
         [sourceId]
       ),
@@ -668,6 +975,17 @@ export const createRegistryPayment = asyncHandler(async (req, res) => {
     if (!sourceMatchesPlot) {
       return res.status(400).json({ message: 'Selected payment belongs to a different plot' });
     }
+    const operatingPolicy = await resolveRegistryOperatingPolicy({ siteId: registry.site_id });
+    if (operatingPolicy.rera_enforced && (
+      !registry.booking_id
+      || Number(sourcePayment.booking_id) !== Number(registry.booking_id)
+      || Number(sourcePayment.amount) <= 0
+    )) {
+      return res.status(409).json({
+        code: 'RERA_CANONICAL_RECEIPT_REQUIRED',
+        message: 'Select an approved Project Payment receipt from this exact booking',
+      });
+    }
 
     const linkedData = {
       registry_id: registryIdInt,
@@ -685,8 +1003,34 @@ export const createRegistryPayment = asyncHandler(async (req, res) => {
       created_by: req.user.id,
       assigned_admin_id: req.body.assigned_admin_id ? parseInt(req.body.assigned_admin_id) : null,
     };
-    const linkedPayment = await plotRegistryPaymentModel.create(linkedData, pool);
-    return res.status(201).json({ payment: linkedPayment, linked: true });
+    const client = await pool.connect();
+    let linkedPayment;
+    let derivedRegistry = null;
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT id FROM plot_registries WHERE id=$1 FOR UPDATE', [registryIdInt]);
+      linkedPayment = await plotRegistryPaymentModel.create(linkedData, client);
+      if (operatingPolicy.rera_enforced) {
+        derivedRegistry = await syncReraRegistryAmounts(client, registryIdInt);
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      if (error.constraint === 'rera_registry_canonical_payment_required') {
+        error.statusCode = 409;
+        error.code = 'RERA_CANONICAL_RECEIPT_REQUIRED';
+        error.message = 'Select an approved Project Payment receipt from this exact booking';
+      }
+      throw error;
+    } finally {
+      client.release();
+    }
+    return res.status(201).json({
+      payment: linkedPayment,
+      linked: true,
+      registry: derivedRegistry,
+      monetary_fields_derived: operatingPolicy.rera_enforced,
+    });
   }
 
   // ── Non-linked payment: registry lookup + INSERT in parallel(ish). ──
@@ -696,6 +1040,13 @@ export const createRegistryPayment = asyncHandler(async (req, res) => {
   );
   const registry = registryRes.rows[0];
   if (!registry) return res.status(404).json({ message: 'Registry not found' });
+  const operatingPolicy = await resolveRegistryOperatingPolicy({ siteId: registry.site_id });
+  if (operatingPolicy.rera_enforced) {
+    return res.status(409).json({
+      code: 'RERA_CANONICAL_RECEIPT_REQUIRED',
+      message: 'Add the payment in Project Payments, then link its approved receipt to this RERA registry',
+    });
+  }
 
   const normalizedMode = payment_mode ? payment_mode.trim().toUpperCase() : null;
   const isCheque = classifyPaymentMode(normalizedMode) === 'cheque';
@@ -758,6 +1109,13 @@ export const updateRegistryPayment = asyncHandler(async (req, res) => {
       message: 'Linked registry rows mirror their source Plot Payment and cannot be edited independently',
     });
   }
+  const operatingPolicy = await resolveRegistryOperatingPolicy({ siteId: existing.site_id });
+  if (operatingPolicy.rera_enforced) {
+    return res.status(409).json({
+      code: 'RERA_CANONICAL_RECEIPT_REQUIRED',
+      message: 'Manual registry-only payments are historical in RERA mode and cannot be used as canonical receipts',
+    });
+  }
 
   const updateData = {};
   if (payment_date !== undefined) updateData.payment_date = payment_date;
@@ -801,13 +1159,67 @@ export const updateRegistryPayment = asyncHandler(async (req, res) => {
 
 /** DELETE /registries/payments/:id */
 export const deleteRegistryPayment = asyncHandler(async (req, res) => {
-  // Atomic DELETE — saves a SELECT round-trip.
-  const result = await pool.query(
-    `DELETE FROM plot_registry_payments WHERE id = $1 RETURNING id`,
-    [parseInt(req.params.id)]
-  );
-  if (!result.rows[0]) return res.status(404).json({ message: 'Payment not found' });
-  res.json({ message: 'Payment deleted' });
+  const paymentId = parseInt(req.params.id);
+  const client = await pool.connect();
+  let derivedRegistry = null;
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `SELECT mapping.id,mapping.source_plot_payment_id,
+              registry.id AS registry_id,registry.site_id,registry.plot_id,
+              registry.booking_id,registry.lifecycle_status
+         FROM plot_registry_payments mapping
+         JOIN plot_registries registry ON registry.id=mapping.registry_id
+        WHERE mapping.id=$1
+        FOR UPDATE OF mapping,registry`,
+      [paymentId],
+    );
+    const payment = rows[0];
+    if (!payment) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Payment not found' });
+    }
+    const operatingPolicy = await resolveRegistryOperatingPolicy({ siteId: payment.site_id, db: client });
+    if (operatingPolicy.rera_enforced
+        && payment.source_plot_payment_id
+        && ['EXECUTED', 'COMPLETE'].includes(payment.lifecycle_status)) {
+      const { rows: remaining } = await client.query(
+        `SELECT COUNT(*)::int AS receipt_count
+           FROM plot_registry_payments other
+           JOIN plot_payments pp ON pp.id=other.source_plot_payment_id
+          WHERE other.registry_id=$1
+            AND other.id<>$2
+            AND pp.site_id=$3
+            AND pp.plot_id=$4
+            AND pp.booking_id=$5
+            AND ${CANONICAL_PLOT_RECEIPT_ELIGIBILITY_SQL}`,
+        [payment.registry_id, paymentId, payment.site_id, payment.plot_id, payment.booking_id],
+      );
+      if (Number(remaining[0]?.receipt_count || 0) === 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          code: 'RERA_EXECUTED_RECEIPT_RETENTION',
+          message: 'An executed RERA registry must retain at least one canonical Project Payment receipt',
+        });
+      }
+    }
+    await client.query('DELETE FROM plot_registry_payments WHERE id=$1', [paymentId]);
+    if (operatingPolicy.rera_enforced) {
+      derivedRegistry = await syncReraRegistryAmounts(client, payment.registry_id);
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (error.constraint === 'executed_rera_registry_canonical_receipt_retention') {
+      error.statusCode = 409;
+      error.code = 'RERA_EXECUTED_RECEIPT_RETENTION';
+      error.message = 'An executed RERA registry must retain at least one canonical Project Payment receipt';
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+  res.json({ message: 'Payment deleted', registry: derivedRegistry });
 });
 
 /** GET /registries/autocomplete?site_id=X */
@@ -815,8 +1227,16 @@ export const getRegistryAutocomplete = asyncHandler(async (req, res) => {
   const { site_id } = req.query;
   if (!site_id) return res.status(400).json({ message: 'site_id is required' });
 
-  const data = await plotRegistryPaymentModel.getAutocomplete(parseInt(site_id), pool);
-  res.json(data);
+  const resolvedSiteId = parseInt(site_id);
+  const [data, operatingPolicy] = await Promise.all([
+    plotRegistryPaymentModel.getAutocomplete(resolvedSiteId, pool),
+    resolveRegistryOperatingPolicy({ siteId: resolvedSiteId }),
+  ]);
+  res.json({
+    ...data,
+    paymentModes: operatingPolicy.rera_enforced ? [] : data.paymentModes,
+    operating_policy: operatingPolicy,
+  });
 });
 
 // ══════════════════════════════════════════════════
@@ -838,7 +1258,11 @@ const buildNocPayload = async (registryId) => {
         [registry.site_id, registry.plot_no]
       );
   const sitePromise = pool.query(
-    `SELECT id, name, code, address, city, state FROM sites WHERE id = $1`,
+    `SELECT s.id, s.name, s.code, s.address, s.city, s.state, s.organization_id,
+            o.name AS organization_name
+       FROM sites s
+       LEFT JOIN organizations o ON o.id = s.organization_id
+      WHERE s.id = $1`,
     [registry.site_id]
   );
   // Letterhead comes from the booking module's project_settings table (same
@@ -861,12 +1285,16 @@ const buildNocPayload = async (registryId) => {
     [registryId]
   );
   const workflowOverridePromise = isRegistryWorkflowUnlocked(registry.site_id);
+  const operatingPolicyPromise = resolveRegistryOperatingPolicy({ siteId: registry.site_id });
 
-  const [plotRes, siteRes, letterheadRes, inlineRes, workflowUnlocked] = await Promise.all([
-    plotPromise, sitePromise, letterheadPromise, inlinePromise, workflowOverridePromise,
+  const [plotRes, siteRes, letterheadRes, inlineRes, workflowUnlocked, operatingPolicy] = await Promise.all([
+    plotPromise, sitePromise, letterheadPromise, inlinePromise, workflowOverridePromise, operatingPolicyPromise,
   ]);
   const plot = plotRes.rows[0] || null;
   const site = siteRes.rows[0] || null;
+  const organization = site?.organization_id
+    ? { id: site.organization_id, name: site.organization_name || null }
+    : null;
 
   let plotPayments = [];
   if (plot) {
@@ -880,14 +1308,16 @@ const buildNocPayload = async (registryId) => {
          FROM plot_payments pp
          LEFT JOIN plot_registry_payments prp ON prp.source_plot_payment_id = pp.id
         WHERE pp.plot_id = $1
-          AND LOWER(COALESCE(pp.status, 'approved')) = 'approved'
-          AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+          AND ($3::boolean=FALSE OR pp.booking_id=$4)
+          AND ${CANONICAL_PLOT_RECEIPT_ELIGIBILITY_SQL}
         ORDER BY pp.date ASC, pp.created_at ASC`,
-      [plot.id, registryId]
+      [plot.id, registryId, operatingPolicy.rera_enforced, registry.booking_id || null]
     );
     plotPayments = payRes.rows;
   }
-  const inlinePayments = inlineRes.rows;
+  // Keep legacy manual mappings stored for audit, but never present them as
+  // usable consideration in an active RERA workflow.
+  const inlinePayments = operatingPolicy.rera_enforced ? [] : inlineRes.rows;
 
   const includedPlot = plotPayments.filter((p) => p.included);
   const includedInline = inlinePayments.filter((p) => p.include_in_noc);
@@ -899,8 +1329,7 @@ const buildNocPayload = async (registryId) => {
     registry.noc_no ||
     `NOC/${String(site?.code || 'RG').toUpperCase()}/${new Date().getFullYear()}/${String(registry.id).padStart(4, '0')}`;
 
-  // Signed verify QR target — same HMAC scheme/secret as the payment
-  // receipts, so it validates on the public Defence Garden verify page.
+  // Signed verification target uses the shared HMAC receipt scheme.
   const verifyUrl = buildVerifyUrl({
     t: ReceiptType.NOC,
     i: registry.id,
@@ -919,9 +1348,12 @@ const buildNocPayload = async (registryId) => {
     registry,
     plot,
     site,
+    organization,
     letterhead: letterheadRes.rows[0] || null,
     plotPayments,
     inlinePayments,
+    historical_inline_payment_count: operatingPolicy.rera_enforced ? inlineRes.rows.length : 0,
+    operating_policy: operatingPolicy,
     workflow_unlocked: workflowUnlocked,
     suggested_noc_no: suggestedNocNo,
     verifyUrl,
@@ -933,14 +1365,16 @@ const buildNocPayload = async (registryId) => {
 };
 
 /** PUT /registries/:id/noc/approve — approve a generated NOC.
- *  This is the ONLY place a plot is promoted to 'REGISTRY' status:
- *  registry created -> plot 'PENDING NOC' -> NOC generated -> approved here -> 'REGISTRY'. */
+ *  Generic Sites retain the legacy plot promotion. For RERA Sites, NOC
+ *  approval is a prerequisite and the controlled lifecycle promotes the plot
+ *  only after registry execution is complete. */
 export const approveRegistryNoc = asyncHandler(async (req, res) => {
   const registryId = parseInt(req.params.id);
   const client = await pool.connect();
   let updated;
   let plotStatusUpdated = false;
   let workflowUnlocked = false;
+  let operatingPolicy = null;
 
   try {
     await client.query('BEGIN');
@@ -969,11 +1403,12 @@ export const approveRegistryNoc = asyncHandler(async (req, res) => {
                      )
                    )
                    AND ${REGISTRY_PAYMENT_ELIGIBILITY_SQL}
+                   AND ($2::boolean=FALSE OR prp.source_plot_payment_id IS NOT NULL)
               ), 0)::numeric AS total_paid
          FROM plot_registries pr
         WHERE pr.id = $1
         FOR UPDATE OF pr`,
-      [registryId]
+      [registryId, false]
     );
     const registry = rows[0];
     if (!registry) {
@@ -989,10 +1424,39 @@ export const approveRegistryNoc = asyncHandler(async (req, res) => {
       return res.status(409).json({ message: 'NOC is already approved' });
     }
 
+    operatingPolicy = await resolveRegistryOperatingPolicy({ siteId: registry.site_id, db: client });
+    if (operatingPolicy.rera_enforced) {
+      const { rows: canonicalRows } = await client.query(
+        `SELECT COUNT(*)::int AS receipt_count,
+                COALESCE(SUM(receipt.amount),0)::numeric AS total_paid
+           FROM plot_registry_payments mapping
+           JOIN plot_payments receipt ON receipt.id=mapping.source_plot_payment_id
+          WHERE mapping.registry_id=$1
+            AND receipt.site_id=$2
+            AND receipt.plot_id=$3
+            AND receipt.booking_id=$4
+            AND receipt.amount>0
+            AND LOWER(COALESCE(receipt.status,'approved'))='approved'
+            AND UPPER(COALESCE(receipt.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+            AND receipt.reversal_of_payment_id IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM plot_payments reversal
+               WHERE reversal.reversal_of_payment_id=receipt.id
+                 AND LOWER(COALESCE(reversal.status,'approved'))='approved'
+                 AND UPPER(COALESCE(reversal.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+            )`,
+        [registryId, registry.site_id, registry.plot_id, registry.booking_id],
+      );
+      registry.total_paid = canonicalRows[0]?.total_paid || 0;
+    }
+    const derivedRegistry = operatingPolicy.rera_enforced
+      ? await syncReraRegistryAmounts(client, registryId)
+      : null;
+    if (derivedRegistry) Object.assign(registry, derivedRegistry);
     workflowUnlocked = await readRegistryWorkflowUnlocked(client, registry.site_id);
-    // Payment-clear gate (defense in depth — generation is gated the same way).
+    // Generic legacy payment-clear gate; RERA uses configured readiness checks.
     const approveDue = (parseFloat(registry.registry_payment) || 0) - (parseFloat(registry.total_paid) || 0);
-    if (!workflowUnlocked && approveDue > 0.005) {
+    if (!operatingPolicy.rera_enforced && !workflowUnlocked && approveDue > 0.005) {
       await client.query('ROLLBACK');
       return res.status(400).json({
         message: `NOC can only be approved after full payment — ₹${approveDue.toLocaleString('en-IN')} is still due`,
@@ -1008,26 +1472,31 @@ export const approveRegistryNoc = asyncHandler(async (req, res) => {
     );
     updated = approvalResult.rows[0];
 
-    // Older registries may not carry plot_id. Resolve those records by their
-    // immutable site + plot number pair and promote only the newest match.
-    const plotResult = await client.query(
-      `WITH target_plot AS (
-         SELECT id
-           FROM plots
-          WHERE ($1::integer IS NOT NULL AND id = $1)
-             OR ($1::integer IS NULL AND site_id = $2 AND UPPER(plot_no) = UPPER($3))
-          ORDER BY id DESC
-          LIMIT 1
-       )
-       UPDATE plots p
-          SET status = 'REGISTRY', updated_at = NOW()
-         FROM target_plot target
-        WHERE p.id = target.id
-          AND UPPER(COALESCE(p.status, '')) != 'REGISTRY'
-        RETURNING p.id`,
-      [registry.plot_id, registry.site_id, registry.plot_no]
-    );
-    plotStatusUpdated = plotResult.rows.length > 0;
+    // A legacy/generic Site retains the established NOC shortcut. Under RERA,
+    // NOC approval is only a prerequisite; the property becomes registered
+    // when the controlled registry lifecycle reaches COMPLETE.
+    if (!operatingPolicy.rera_enforced) {
+      // Older registries may not carry plot_id. Resolve those records by their
+      // immutable site + plot number pair and promote only the newest match.
+      const plotResult = await client.query(
+        `WITH target_plot AS (
+           SELECT id
+             FROM plots
+            WHERE ($1::integer IS NOT NULL AND id = $1)
+               OR ($1::integer IS NULL AND site_id = $2 AND UPPER(plot_no) = UPPER($3))
+            ORDER BY id DESC
+            LIMIT 1
+         )
+         UPDATE plots p
+            SET status = 'REGISTRY', updated_at = NOW()
+           FROM target_plot target
+          WHERE p.id = target.id
+            AND UPPER(COALESCE(p.status, '')) != 'REGISTRY'
+          RETURNING p.id`,
+        [registry.plot_id, registry.site_id, registry.plot_no]
+      );
+      plotStatusUpdated = plotResult.rows.length > 0;
+    }
 
     await client.query('COMMIT');
   } catch (error) {
@@ -1037,7 +1506,12 @@ export const approveRegistryNoc = asyncHandler(async (req, res) => {
     client.release();
   }
 
-  res.json({ registry: updated, plot_status_updated: plotStatusUpdated, workflow_unlocked: workflowUnlocked });
+  res.json({
+    registry: updated,
+    plot_status_updated: plotStatusUpdated,
+    workflow_unlocked: workflowUnlocked,
+    operating_policy: operatingPolicy,
+  });
 });
 
 /** GET /registries/:id/noc — one-shot NOC payload */
@@ -1060,7 +1534,16 @@ export const saveRegistryNoc = asyncHandler(async (req, res) => {
 
   const registry = await plotRegistryModel.findById(registryId, pool);
   if (!registry) return res.status(404).json({ message: 'Registry not found' });
-  const workflowUnlocked = await isRegistryWorkflowUnlocked(registry.site_id);
+  const [workflowUnlocked, operatingPolicy] = await Promise.all([
+    isRegistryWorkflowUnlocked(registry.site_id),
+    resolveRegistryOperatingPolicy({ siteId: registry.site_id }),
+  ]);
+  if (operatingPolicy.rera_enforced && Array.isArray(inline_payments) && inline_payments.length) {
+    return res.status(409).json({
+      code: 'RERA_CANONICAL_RECEIPT_REQUIRED',
+      message: 'RERA NOCs can only use approved Project Payment receipts; remove registry-only inline payments',
+    });
+  }
 
   const includedIds = Array.isArray(included_plot_payment_ids)
     ? included_plot_payment_ids.map((n) => parseInt(n)).filter(Number.isFinite)
@@ -1104,6 +1587,7 @@ export const saveRegistryNoc = asyncHandler(async (req, res) => {
             AND prp.source_plot_payment_id = ANY($2::int[])
             AND LOWER(COALESCE(pp.status, 'approved')) = 'approved'
             AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+            AND ${CANONICAL_PLOT_RECEIPT_ELIGIBILITY_SQL}
             AND (
               ($3::integer IS NOT NULL AND pp.plot_id = $3)
               OR (
@@ -1115,8 +1599,14 @@ export const saveRegistryNoc = asyncHandler(async (req, res) => {
                      AND UPPER(target.plot_no) = UPPER($5)
                 )
               )
-            )`,
-        [registryId, includedIds, registry.plot_id || null, registry.site_id, registry.plot_no]
+            )
+            AND ($6::boolean=FALSE OR pp.booking_id=$7)`,
+        [registryId, includedIds, registry.plot_id || null,
+          registry.site_id,
+          registry.plot_no,
+          operatingPolicy.rera_enforced,
+          registry.booking_id || null,
+        ]
       );
       // Link payments that aren't assigned to any registry yet.
       await client.query(
@@ -1132,8 +1622,7 @@ export const saveRegistryNoc = asyncHandler(async (req, res) => {
            FROM plot_payments pp
           WHERE pp.id = ANY($2::int[])
             AND pp.site_id = $4
-            AND LOWER(COALESCE(pp.status, 'approved')) = 'approved'
-            AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+            AND ${CANONICAL_PLOT_RECEIPT_ELIGIBILITY_SQL}
             AND (
               ($5::integer IS NOT NULL AND pp.plot_id = $5)
               OR (
@@ -1146,6 +1635,7 @@ export const saveRegistryNoc = asyncHandler(async (req, res) => {
                 )
               )
             )
+            AND ($7::boolean=FALSE OR (pp.booking_id=$8 AND pp.amount>0))
             AND NOT EXISTS (SELECT 1 FROM plot_registry_payments x WHERE x.source_plot_payment_id = pp.id)`,
         [
           registryId,
@@ -1154,6 +1644,8 @@ export const saveRegistryNoc = asyncHandler(async (req, res) => {
           registry.site_id,
           registry.plot_id || null,
           registry.plot_no,
+          operatingPolicy.rera_enforced,
+          registry.booking_id || null,
         ]
       );
     }
@@ -1221,11 +1713,17 @@ export const saveRegistryNoc = asyncHandler(async (req, res) => {
       }
     }
 
-    // ── Payment-clear gate: the NOC may only be generated once the registry is
-    // fully paid. Evaluated INSIDE the transaction, after the payment syncs
-    // above, so payments added in this very save count toward the total. ──
+    const derivedRegistry = operatingPolicy.rera_enforced
+      ? await syncReraRegistryAmounts(client, registryId)
+      : null;
+    if (derivedRegistry) Object.assign(registry, derivedRegistry);
+
+    // ── Legacy payment-clear gate. Evaluated INSIDE the transaction, after
+    // payment sync, for generic Sites. RERA execution relies on the explicit
+    // ruleset readiness checklist instead of an implicit full-payment rule. ──
     const totalRes = await client.query(
-      `SELECT COALESCE(SUM(${REGISTRY_PAYMENT_AMOUNT_SQL}), 0)::numeric AS total_paid
+      `SELECT COALESCE(SUM(${REGISTRY_PAYMENT_AMOUNT_SQL}), 0)::numeric AS total_paid,
+              COUNT(*) FILTER (WHERE prp.source_plot_payment_id IS NOT NULL)::int AS canonical_receipt_count
          FROM plot_registry_payments prp
          LEFT JOIN plot_payments pp ON pp.id = prp.source_plot_payment_id
         WHERE prp.registry_id = $1
@@ -1242,12 +1740,24 @@ export const saveRegistryNoc = asyncHandler(async (req, res) => {
               )
             )
           )
-          AND ${REGISTRY_PAYMENT_ELIGIBILITY_SQL}`,
-      [registryId, registry.plot_id || null, registry.site_id, registry.plot_no]
+          AND ${REGISTRY_PAYMENT_ELIGIBILITY_SQL}
+          AND ($5::boolean=FALSE OR (
+            prp.source_plot_payment_id IS NOT NULL
+            AND pp.booking_id=$6
+            AND pp.amount>0
+          ))`,
+      [
+        registryId,
+        registry.plot_id || null,
+        registry.site_id,
+        registry.plot_no,
+        operatingPolicy.rera_enforced,
+        registry.booking_id || null,
+      ]
     );
     const totalPaid = parseFloat(totalRes.rows[0]?.total_paid) || 0;
     const due = (parseFloat(registry.registry_payment) || 0) - totalPaid;
-    if (!workflowUnlocked && due > 0.005) {
+    if (!operatingPolicy.rera_enforced && !workflowUnlocked && due > 0.005) {
       await client.query('ROLLBACK');
       return res.status(400).json({
         message: `NOC can only be generated after full payment — ₹${due.toLocaleString('en-IN')} is still due against this registry`,
@@ -1258,6 +1768,11 @@ export const saveRegistryNoc = asyncHandler(async (req, res) => {
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK');
+    if (err.constraint === 'rera_registry_canonical_payment_required') {
+      err.statusCode = 409;
+      err.code = 'RERA_CANONICAL_RECEIPT_REQUIRED';
+      err.message = 'RERA NOCs can only use approved Project Payment receipts';
+    }
     throw err;
   } finally {
     client.release();

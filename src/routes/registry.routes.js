@@ -15,6 +15,7 @@ import {
   uploadRegistryDocument,
   deleteRegistryDocument,
 } from '../controllers/registryDocument.controller.js';
+import { transitionRegistryLifecycle } from '../controllers/propertyLifecycle.controller.js';
 import authMiddleware from '../middlewares/auth.middleware.js';
 import requireRole from '../middlewares/role.middleware.js';
 import requirePermission from '../middlewares/permission.middleware.js';
@@ -34,6 +35,7 @@ const bustRegistryCache = invalidateCacheOnSuccess(['registries|']);
 const accessByQuerySite = requireRegistrySiteAccess({ entity: 'site', source: 'query', key: 'site_id' });
 const accessByBodySite = requireRegistrySiteAccess({ entity: 'site', source: 'body', key: 'site_id' });
 const accessByParamRegistry = requireRegistrySiteAccess({ entity: 'registry', source: 'params', key: 'id' });
+const accessByParamLifecycleRegistry = requireRegistrySiteAccess({ entity: 'registry', source: 'params', key: 'registryId' });
 const accessByQueryRegistry = requireRegistrySiteAccess({ entity: 'registry', source: 'query', key: 'registry_id' });
 const accessByBodyRegistry = requireRegistrySiteAccess({ entity: 'registry', source: 'body', key: 'registry_id' });
 const accessByParamPayment = requireRegistrySiteAccess({ entity: 'payment', source: 'params', key: 'id' });
@@ -108,6 +110,9 @@ router.put('/:id/noc/approve', requireRole('admin'), requirePermission('plot_reg
 // ── Registry endpoints ──
 router.get('/', requireRole('admin', 'sub_admin'), requirePermission('plot_registry', 'read'), accessByQuerySite, registryReadCache, listRegistries);                                           // ?site_id=X
 router.get('/autocomplete', requireRole('admin', 'sub_admin'), requirePermission('plot_registry', 'read'), accessByQuerySite, registryMetaCache, getRegistryAutocomplete);                      // ?site_id=X
+// Canonical resource route. /property-lifecycle/registries/:registryId/status
+// remains as a compatibility alias and executes this same handler.
+router.patch('/:registryId/status', requireRole('admin', 'sub_admin'), requirePermission('plot_registry', 'update'), accessByParamLifecycleRegistry, bustRegistryCache, transitionRegistryLifecycle);
 router.get('/:id', requireRole('admin', 'sub_admin'), requirePermission('plot_registry', 'read'), accessByParamRegistry, registryReadCache, getRegistry);
 router.post('/', requireRole('admin', 'sub_admin'), requirePermission('plot_registry', 'write'), accessByBodySite, accessByBodyPlot, bustRegistryCache, createRegistry);
 router.put('/:id', requireRole('admin', 'sub_admin'), requirePermission('plot_registry', 'update'), accessByParamRegistry, accessByBodyPlot, bustRegistryCache, updateRegistry);

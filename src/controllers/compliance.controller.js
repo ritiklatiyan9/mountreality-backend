@@ -81,6 +81,12 @@ const boundedPage = (req) => ({
   limit: Math.min(Math.max(Number.parseInt(req.query.limit, 10) || 25, 1), 100),
 });
 const codeFor = (prefix) => `${prefix}-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+const complianceCategoryCode = (value) => String(value ?? '')
+  .trim()
+  .toUpperCase()
+  .replace(/[^A-Z0-9]+/g, '_')
+  .replace(/^_+|_+$/g, '')
+  .slice(0, 80);
 const normalizeIntArray = (value, fallback = []) => {
   if (value === undefined || value === null) return [...fallback];
   const source = Array.isArray(value) ? value : String(value ?? '').split(',');
@@ -919,12 +925,158 @@ export const complianceCalendar = asyncHandler(async (req, res) => {
   const selectedSite = (alias) => siteParam ? `AND ${alias}.site_id=$${siteParam}` : '';
   const [items, cases, notices, inspections, licences] = await Promise.all([
     pool.query(`SELECT i.id,'COMPLIANCE' AS event_type,i.title,i.current_due_date AS event_date,NULL::text AS event_time,i.status,i.risk_level,i.site_id,s.name AS site_name FROM compliance_items i LEFT JOIN sites s ON s.id=i.site_id WHERE i.organization_id=$1 AND i.deleted_at IS NULL AND i.current_due_date BETWEEN $2 AND $3 ${itemScope} ${selectedSite('i')}`, params),
-    canViewLegal ? pool.query(`SELECT c.id,'LEGAL_HEARING' AS event_type,c.title,c.next_hearing_date AS event_date,to_char(c.next_hearing_date AT TIME ZONE 'Asia/Kolkata','HH12:MI AM') AS event_time,c.status,c.risk_level,c.site_id,s.name AS site_name FROM legal_cases c LEFT JOIN sites s ON s.id=c.site_id WHERE c.organization_id=$1 AND c.deleted_at IS NULL AND c.next_hearing_date::date BETWEEN $2 AND $3 ${caseScope} ${selectedSite('c')}`, params) : Promise.resolve({ rows: [] }),
+    canViewLegal ? pool.query(`SELECT c.id,'LEGAL_HEARING' AS event_type,c.title,to_char(c.next_hearing_date AT TIME ZONE 'Asia/Kolkata','YYYY-MM-DD') AS event_date,to_char(c.next_hearing_date AT TIME ZONE 'Asia/Kolkata','HH12:MI AM') AS event_time,c.status,c.risk_level,c.site_id,s.name AS site_name FROM legal_cases c LEFT JOIN sites s ON s.id=c.site_id WHERE c.organization_id=$1 AND c.deleted_at IS NULL AND (c.next_hearing_date AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3 ${caseScope} ${selectedSite('c')}`, params) : Promise.resolve({ rows: [] }),
     canViewLegal ? pool.query(`SELECT n.id,'NOTICE_REPLY' AS event_type,n.subject AS title,n.reply_due_date AS event_date,NULL::text AS event_time,n.status,n.risk_level,n.site_id,s.name AS site_name FROM legal_notices n LEFT JOIN sites s ON s.id=n.site_id WHERE n.organization_id=$1 AND n.deleted_at IS NULL AND n.reply_due_date BETWEEN $2 AND $3 ${noticeScope} ${selectedSite('n')}`, params) : Promise.resolve({ rows: [] }),
-    pool.query(`SELECT x.id,'INSPECTION' AS event_type,x.inspection_type AS title,x.scheduled_at AS event_date,to_char(x.scheduled_at AT TIME ZONE 'Asia/Kolkata','HH12:MI AM') AS event_time,x.status,'MEDIUM' AS risk_level,x.site_id,s.name AS site_name FROM compliance_inspections x LEFT JOIN sites s ON s.id=x.site_id WHERE x.organization_id=$1 AND x.deleted_at IS NULL AND x.scheduled_at::date BETWEEN $2 AND $3 ${inspectionScope} ${selectedSite('x')}`, params),
+    pool.query(`SELECT x.id,'INSPECTION' AS event_type,x.inspection_type AS title,to_char(x.scheduled_at AT TIME ZONE 'Asia/Kolkata','YYYY-MM-DD') AS event_date,to_char(x.scheduled_at AT TIME ZONE 'Asia/Kolkata','HH12:MI AM') AS event_time,x.status,'MEDIUM' AS risk_level,x.site_id,s.name AS site_name FROM compliance_inspections x LEFT JOIN sites s ON s.id=x.site_id WHERE x.organization_id=$1 AND x.deleted_at IS NULL AND (x.scheduled_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3 ${inspectionScope} ${selectedSite('x')}`, params),
     pool.query(`SELECT l.id,'LICENCE_EXPIRY' AS event_type,l.name AS title,l.expiry_date AS event_date,NULL::text AS event_time,l.renewal_status AS status,'HIGH' AS risk_level,l.site_id,s.name AS site_name FROM compliance_licences l LEFT JOIN sites s ON s.id=l.site_id WHERE l.organization_id=$1 AND l.deleted_at IS NULL AND l.expiry_date BETWEEN $2 AND $3 ${licenceScope} ${selectedSite('l')}`, params),
   ]);
-  res.json({ events: [...items.rows, ...cases.rows, ...notices.rows, ...inspections.rows, ...licences.rows].sort((a, b) => new Date(a.event_date) - new Date(b.event_date)) });
+  res.json({ events: [...items.rows, ...cases.rows, ...notices.rows, ...inspections.rows, ...licences.rows].sort((a, b) => String(a.event_date).localeCompare(String(b.event_date))) });
+});
+
+// ── Organisation-managed compliance categories ─────────────────────
+
+export const listComplianceCategories = asyncHandler(async (req, res) => {
+  const onlyActive = req.query.active === 'true';
+  const { rows } = await pool.query(
+    `SELECT c.*,
+            (SELECT COUNT(*)::int FROM compliance_items i
+              WHERE i.organization_id=c.organization_id AND i.deleted_at IS NULL
+                AND UPPER(i.category)=UPPER(c.code)) AS compliance_count,
+            (SELECT COUNT(*)::int FROM compliance_templates t
+              WHERE t.organization_id=c.organization_id AND t.deleted_at IS NULL
+                AND UPPER(t.category)=UPPER(c.code)) AS template_count
+       FROM compliance_categories c
+      WHERE c.organization_id=$1 AND c.deleted_at IS NULL
+        AND ($2::boolean=FALSE OR c.is_active=TRUE)
+      ORDER BY c.is_active DESC,c.sort_order,c.name`,
+    [req.user.organization_id, onlyActive]
+  );
+  res.json({ categories: rows });
+});
+
+export const createComplianceCategory = asyncHandler(async (req, res) => {
+  const name = text(req.body.name, 160);
+  const code = complianceCategoryCode(req.body.code || name);
+  if (!name) return res.status(400).json({ message: 'Category name is required' });
+  if (!code) return res.status(400).json({ message: 'Category code is required' });
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO compliance_categories
+        (organization_id,code,name,description,sort_order,is_active,created_by,updated_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$7) RETURNING *`,
+      [req.user.organization_id, code, name, text(req.body.description, 2000),
+        Number.parseInt(req.body.sort_order, 10) || 0, req.body.is_active !== false, req.user.id]
+    );
+    await writeComplianceAudit(pool, req, {
+      action: 'CREATE', entityType: 'COMPLIANCE_CATEGORY', entityId: rows[0].id, newValue: rows[0],
+    });
+    res.status(201).json({ category: rows[0] });
+  } catch (error) {
+    if (error.code === '23505') return res.status(409).json({ message: 'A compliance category with this name or code already exists' });
+    throw error;
+  }
+});
+
+export const updateComplianceCategory = asyncHandler(async (req, res) => {
+  const id = parsePositiveId(req.params.id);
+  if (!id) return res.status(400).json({ message: 'Invalid compliance category ID' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: beforeRows } = await client.query(
+      `SELECT * FROM compliance_categories
+        WHERE id=$1 AND organization_id=$2 AND deleted_at IS NULL FOR UPDATE`,
+      [id, req.user.organization_id]
+    );
+    const before = beforeRows[0];
+    if (!before) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ message: 'Compliance category not found' });
+    }
+
+    const payload = {};
+    if (req.body.name !== undefined) {
+      payload.name = text(req.body.name, 160);
+      if (!payload.name) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'Category name is required' });
+      }
+    }
+    if (req.body.code !== undefined) {
+      payload.code = complianceCategoryCode(req.body.code);
+      if (!payload.code) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ message: 'Category code is required' });
+      }
+    }
+    if (req.body.description !== undefined) payload.description = text(req.body.description, 2000);
+    if (req.body.sort_order !== undefined) payload.sort_order = Number.parseInt(req.body.sort_order, 10) || 0;
+    if (req.body.is_active !== undefined) payload.is_active = Boolean(req.body.is_active);
+    if (!Object.keys(payload).length) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ message: 'Nothing to update' });
+    }
+    payload.updated_by = req.user.id;
+
+    const update = sqlUpdate(payload);
+    const { rows } = await client.query(
+      `UPDATE compliance_categories SET ${update.set},updated_at=NOW()
+        WHERE id=$${update.values.length + 1} AND organization_id=$${update.values.length + 2}
+        RETURNING *`,
+      [...update.values, id, req.user.organization_id]
+    );
+    if (payload.code && payload.code !== before.code) {
+      await client.query(
+        `UPDATE compliance_items SET category=$1,updated_at=NOW()
+          WHERE organization_id=$2 AND deleted_at IS NULL AND UPPER(category)=UPPER($3)`,
+        [payload.code, req.user.organization_id, before.code]
+      );
+      await client.query(
+        `UPDATE compliance_templates SET category=$1,updated_at=NOW()
+          WHERE organization_id=$2 AND deleted_at IS NULL AND UPPER(category)=UPPER($3)`,
+        [payload.code, req.user.organization_id, before.code]
+      );
+    }
+    await writeComplianceAudit(client, req, {
+      action: 'UPDATE', entityType: 'COMPLIANCE_CATEGORY', entityId: id,
+      previousValue: before, newValue: rows[0],
+    });
+    await client.query('COMMIT');
+    res.json({ category: rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    if (error.code === '23505') return res.status(409).json({ message: 'A compliance category with this name or code already exists' });
+    throw error;
+  } finally {
+    client.release();
+  }
+});
+
+export const deleteComplianceCategory = asyncHandler(async (req, res) => {
+  const id = parsePositiveId(req.params.id);
+  if (!id) return res.status(400).json({ message: 'Invalid compliance category ID' });
+  const reason = requireReason(req.body.reason);
+  const { rows: categoryRows } = await pool.query(
+    `SELECT c.*,
+            ((SELECT COUNT(*) FROM compliance_items i WHERE i.organization_id=c.organization_id AND i.deleted_at IS NULL AND UPPER(i.category)=UPPER(c.code)) +
+             (SELECT COUNT(*) FROM compliance_templates t WHERE t.organization_id=c.organization_id AND t.deleted_at IS NULL AND UPPER(t.category)=UPPER(c.code)))::int AS usage_count
+       FROM compliance_categories c
+      WHERE c.id=$1 AND c.organization_id=$2 AND c.deleted_at IS NULL`,
+    [id, req.user.organization_id]
+  );
+  const category = categoryRows[0];
+  if (!category) return res.status(404).json({ message: 'Compliance category not found' });
+  if (category.usage_count > 0) return res.status(409).json({ message: 'This category is in use. Deactivate it instead of deleting it.' });
+  const { rows } = await pool.query(
+    `UPDATE compliance_categories SET deleted_at=NOW(),is_active=FALSE,updated_by=$1,updated_at=NOW()
+      WHERE id=$2 AND organization_id=$3 RETURNING *`,
+    [req.user.id, id, req.user.organization_id]
+  );
+  await writeComplianceAudit(pool, req, {
+    action: 'DELETE', entityType: 'COMPLIANCE_CATEGORY', entityId: id,
+    previousValue: category, newValue: rows[0], reason,
+  });
+  res.json({ success: true });
 });
 
 // ── Authorities ─────────────────────────────────────────────────────

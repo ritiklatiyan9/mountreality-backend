@@ -6,6 +6,7 @@ import {
   oauthCallback,
   disconnect,
   getStatus,
+  syncFutureEvents,
   addNotifyEmail,
   removeNotifyEmail,
 } from '../controllers/googleCalendar.controller.js';
@@ -22,6 +23,7 @@ router.get('/google-calendar/callback', oauthCallback);
 router.get('/google-calendar/status', authMiddleware, getStatus);
 router.get('/google-calendar/connect', authMiddleware, requireRole('admin'), getConnectUrl);
 router.post('/google-calendar/disconnect', authMiddleware, requireRole('admin'), disconnect);
+router.post('/google-calendar/sync', authMiddleware, requireRole('admin'), syncFutureEvents);
 router.post('/google-calendar/emails', authMiddleware, requireRole('admin'), addNotifyEmail);
 router.delete('/google-calendar/emails/:id', authMiddleware, requireRole('admin'), removeNotifyEmail);
 

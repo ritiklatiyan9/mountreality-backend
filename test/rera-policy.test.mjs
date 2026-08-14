@@ -98,6 +98,20 @@ test('published profiles derive safe project-shape and RERA capabilities', () =>
   assert.equal(policy.fields.plots.plot_no.label, 'Approved Plot Number');
 });
 
+test('mixed-use profiles expose neutral property terminology across operational modules', () => {
+  const policy = resolvePolicyFromProfile({
+    profile: publishedProfile({ project_shape: 'MIXED_USE' }),
+  });
+
+  assert.equal(policy.capabilities.mixed_use_inventory, true);
+  assert.equal(policy.terminology.inventory_unit, 'Property');
+  assert.equal(policy.terminology.collections_module, 'Property Payments');
+  assert.equal(policy.terminology.conveyance_module, 'Property Registries');
+  assert.equal(policy.terminology.commission_module, 'Property Commissions');
+  assert.equal(policy.fields.plots.plot_no.label, 'Property Number');
+  assert.equal(policy.fields.plots.block.label, 'Block / Tower / Section');
+});
+
 test('address alone never infers HRERA and non-plotted defaults hide plot workflows safely', () => {
   const genericHaryana = resolvePolicyFromProfile({
     profile: publishedProfile({

@@ -20,7 +20,7 @@ const allDay = buildEventBody('COMPLIANCE', {
 }, ['a@x.com', 'b@x.com']);
 assert.strictEqual(allDay.start.date, '2026-08-20');
 assert.strictEqual(allDay.end.date, '2026-08-21', 'all-day end must be next day (Google exclusive end)');
-assert.strictEqual(allDay.summary, '[Compliance deadline] GST return');
+assert.strictEqual(allDay.summary, 'GST return');
 assert.deepStrictEqual(allDay.attendees, [{ email: 'a@x.com' }, { email: 'b@x.com' }]);
 assert.ok(allDay.description.includes('Status: PENDING') && allDay.description.includes('Risk: HIGH'));
 

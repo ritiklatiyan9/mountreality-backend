@@ -12,6 +12,8 @@ import { buildVerifyUrl, ReceiptType } from '../utils/receiptToken.js';
 import { classifyPaymentMode, normalizeCashType, emptyBucketMap, BUCKETS } from '../utils/paymentMode.js';
 import { getRevenue, getExpenseBreakdown, getProfit } from '../graphql/services/kpi.service.js';
 import { resolveBankAccountSelection } from '../services/bankAccount.service.js';
+import { resolveCollectionGuard } from '../services/collectionGuard.service.js';
+import { assertFinancePaymentModeAllowed } from '../services/sitePolicy.service.js';
 
 // All-time bounds for endpoints that report a running total rather than a
 // date-windowed one (matches the wide bounds already used by getSiteCashflow).
@@ -485,6 +487,11 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
     const ppAmount = parseFloat(credit) || parseFloat(debit) || 0;
     const ppPaymentFrom = req.body.pp_payment_from ? req.body.pp_payment_from.trim().toUpperCase() : null;
     const ppPaymentType = normalizePlotPaymentType(req.body.pp_payment_type ?? payment_mode);
+    await assertFinancePaymentModeAllowed({
+      organizationId: req.user.organization_id,
+      siteId: plot.site_id,
+      paymentMode: ppPaymentType,
+    });
     const selectedBankAccountId = await resolveBankAccountSelection({ siteId: site_id, paymentMode: ppPaymentType, bankAccountId: bank_account_id });
     const ppBankDetails = req.body.pp_bank_details ? req.body.pp_bank_details.trim().toUpperCase() : null;
     const ppNarration = req.body.pp_narration ? req.body.pp_narration.trim().toUpperCase() : null;
@@ -511,8 +518,50 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
       bank_account_id: selectedBankAccountId,
     };
 
-    const { plotPayment, dayBookEntry } = await atomicWrite(async (db) => {
-      const plotPayment = await plotPaymentModel.create(ppData, db);
+    const { plotPayment, dayBookEntry, collectionDecision } = await atomicWrite(async (db) => {
+      await db.query('SELECT pg_advisory_xact_lock(96096,$1)', [pp_plot_id]);
+      const { rows: contextRows } = await db.query(
+        `SELECT p.current_booking_id,b.client_member_id,b.rera_project_id,b.rera_project_phase_id,
+                agreement.id AS agreement_id
+           FROM plots p
+           JOIN sites s ON s.id=p.site_id AND s.organization_id=$3
+           LEFT JOIN bookings b ON b.id=p.current_booking_id AND b.plot_id=p.id AND b.site_id=p.site_id
+           LEFT JOIN LATERAL (
+             SELECT ba.id FROM booking_agreements ba
+              WHERE ba.booking_id=b.id AND ba.site_id=p.site_id
+                AND ba.status NOT IN ('SUPERSEDED','CANCELLED')
+              ORDER BY ba.version_number DESC,ba.id DESC LIMIT 1
+           ) agreement ON TRUE
+          WHERE p.id=$1 AND p.site_id=$2
+          FOR UPDATE OF p`,
+        [pp_plot_id, Number(site_id), req.user.organization_id],
+      );
+      const context = contextRows[0];
+      if (!context) {
+        throw Object.assign(new Error('Plot is outside the selected organization/Site'), { statusCode: 404 });
+      }
+      const collectionDecision = await resolveCollectionGuard({
+        organizationId: req.user.organization_id,
+        siteId: Number(site_id),
+        bookingId: context.current_booking_id,
+        proposedAmount: ppAmount,
+        db,
+      });
+      if (collectionDecision.decision === 'BLOCKED') {
+        throw Object.assign(
+          new Error(collectionDecision.message || 'Payment is blocked by the active collection control'),
+          { statusCode: 409, code: collectionDecision.code || 'COLLECTION_BLOCKED', details: collectionDecision },
+        );
+      }
+      const plotPayment = await plotPaymentModel.create({
+        ...ppData,
+        booking_id: context.current_booking_id || null,
+        allottee_member_id: context.client_member_id || null,
+        rera_project_id: context.rera_project_id || null,
+        rera_project_phase_id: context.rera_project_phase_id || null,
+        agreement_id: context.agreement_id || null,
+        ruleset_decision: collectionDecision,
+      }, db);
       const dbData = {
       site_id: parseInt(site_id),
       date: ppDate,
@@ -538,11 +587,12 @@ export const createDayBookEntry = asyncHandler(async (req, res) => {
       bank_account_id: selectedBankAccountId,
       };
       const dayBookEntry = await dayBookModel.create(dbData, db);
-      return { plotPayment, dayBookEntry };
+      return { plotPayment, dayBookEntry, collectionDecision };
     });
     return res.status(201).json({
       entry: dayBookEntry,
       plot_payment: plotPayment,
+      collection_decision: collectionDecision,
       message: `Plot payment recorded in Day Book and Plot Payments for "${plot.plot_no}"`,
     });
   }
@@ -2261,6 +2311,11 @@ export const updatePlotPaymentFromDayBook = asyncHandler(async (req, res) => {
       ? payment_mode
       : existing.payment_type;
   const ppPaymentType = normalizePlotPaymentType(requestedPaymentType);
+  await assertFinancePaymentModeAllowed({
+    organizationId: req.user.organization_id,
+    siteId: existing.site_id,
+    paymentMode: ppPaymentType,
+  });
   const resolvedBankAccountId = await resolveBankAccountSelection({
     siteId: existing.site_id,
     paymentMode: ppPaymentType,
@@ -2291,6 +2346,23 @@ export const updatePlotPaymentFromDayBook = asyncHandler(async (req, res) => {
     cheque_no: ppPaymentType === 'CHEQUE' ? ppChequeNo : null,
     cheque_status: ppChequeStatus,
   };
+  if (credit !== undefined || debit !== undefined) {
+    const collectionDecision = await resolveCollectionGuard({
+      organizationId: req.user.organization_id,
+      siteId: existing.site_id,
+      bookingId: existing.booking_id,
+      proposedAmount: ppUpdate.amount,
+      excludePlotPaymentId: Number(id),
+    });
+    if (collectionDecision.decision === 'BLOCKED') {
+      const error = new Error(collectionDecision.message || 'Payment is blocked by the active collection control');
+      error.statusCode = 409;
+      error.code = collectionDecision.code || 'COLLECTION_BLOCKED';
+      error.details = collectionDecision;
+      throw error;
+    }
+    ppUpdate.ruleset_decision = collectionDecision;
+  }
 
   const updatedPp = await atomicWrite(async (db) => {
     const updated = await plotPaymentModel.update(parseInt(id), ppUpdate, db);
@@ -2803,7 +2875,7 @@ export const getLatestDate = asyncHandler(async (req, res) => {
 const DAYBOOK_MODULE_TABLES = {
   'vendor-payment':      { table: 'vendor_payments',           dateCol: 'payment_date', modeCol: 'payment_mode', remarksCol: 'note',    lowerMode: true, siteSql: 'payment.site_id', joinSql: '' },
   'commission-payment':  { table: 'plot_commission_payments',  dateCol: 'date',         modeCol: 'payment_mode', remarksCol: 'remarks', siteSql: 'payment.site_id', joinSql: '' },
-  'installment-payment': { table: 'plot_installment_payments', dateCol: 'payment_date', modeCol: 'payment_mode', remarksCol: 'notes',   siteSql: 'plot.site_id', joinSql: 'JOIN plots plot ON plot.id = payment.plot_id' },
+  'installment-payment': { table: 'plot_installment_payments', dateCol: 'payment_date', modeCol: 'payment_mode', remarksCol: 'notes',   siteSql: 'plot.site_id', bookingSql: 'plot.current_booking_id', joinSql: 'JOIN plots plot ON plot.id = payment.plot_id' },
 };
 
 export const updateModulePaymentFromDayBook = asyncHandler(async (req, res) => {
@@ -2817,7 +2889,8 @@ export const updateModulePaymentFromDayBook = asyncHandler(async (req, res) => {
 
   const currentResult = await pool.query(
     `SELECT payment.${cfg.modeCol} AS payment_mode, payment.cheque_status,
-            payment.cheque_no, payment.bank_account_id, ${cfg.siteSql} AS site_id
+            payment.cheque_no, payment.bank_account_id, payment.amount AS current_amount,
+            ${cfg.siteSql} AS site_id, ${cfg.bookingSql || 'NULL::integer'} AS booking_id
        FROM ${cfg.table} payment
        ${cfg.joinSql}
       WHERE payment.id = $1`,
@@ -2833,6 +2906,11 @@ export const updateModulePaymentFromDayBook = asyncHandler(async (req, res) => {
   const effectiveMode = payment_mode !== undefined
     ? (String(payment_mode ?? '').trim() || 'BANK')
     : current.payment_mode;
+  await assertFinancePaymentModeAllowed({
+    organizationId: req.user.organization_id,
+    siteId: current.site_id,
+    paymentMode: effectiveMode,
+  });
   const resolvedBankAccountId = await resolveBankAccountSelection({
     siteId: current.site_id,
     paymentMode: effectiveMode,
@@ -2842,7 +2920,31 @@ export const updateModulePaymentFromDayBook = asyncHandler(async (req, res) => {
   add('bank_account_id', resolvedBankAccountId);
 
   if (date) add(cfg.dateCol, date);
-  if (amount > 0) add('amount', amount);
+  if (amount > 0) {
+    if (req.params.module === 'installment-payment') {
+      const collectionDecision = await resolveCollectionGuard({
+        organizationId: req.user.organization_id,
+        siteId: current.site_id,
+        bookingId: current.booking_id,
+        proposedAmount: amount,
+        excludeInstallmentPaymentId: id,
+      });
+      if (['BLOCKED', 'REQUIRES_APPROVAL'].includes(collectionDecision.decision)) {
+        const error = new Error(
+          collectionDecision.decision === 'REQUIRES_APPROVAL'
+            ? 'Use Project Payments to submit this receipt for the required approval before allocating it'
+            : (collectionDecision.message || 'Payment is blocked by the active collection control'),
+        );
+        error.statusCode = 409;
+        error.code = collectionDecision.decision === 'REQUIRES_APPROVAL'
+          ? 'COLLECTION_APPROVAL_REQUIRED'
+          : (collectionDecision.code || 'COLLECTION_BLOCKED');
+        error.details = collectionDecision;
+        throw error;
+      }
+    }
+    add('amount', amount);
+  }
   let nextModeBucket;
   if (payment_mode !== undefined) {
     const rawMode = String(payment_mode ?? '').trim() || 'BANK';

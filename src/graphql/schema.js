@@ -484,6 +484,7 @@ const PlotType = new GraphQLObjectType({
   fields: {
     id:                  { type: new GraphQLNonNull(GraphQLID) },
     site_id:             { type: GraphQLInt },
+    property_type:       { type: GraphQLString },
     plot_no:             { type: GraphQLString },
     block:               { type: GraphQLString },
     buyer_name:          { type: GraphQLString },

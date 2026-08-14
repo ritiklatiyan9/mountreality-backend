@@ -79,7 +79,7 @@ export const buildEventBody = (eventType, row, attendeeEmails = []) => {
   }
 
   return {
-    summary: `[${label}] ${title}`,
+    summary: title,
     description: descriptionLines.join('\n'),
     start,
     end,
@@ -171,6 +171,7 @@ export const syncComplianceEvent = async (orgId, eventType, sourceId) => {
         calendarId: 'primary', eventId: link.google_event_id, requestBody: body, sendUpdates: 'all',
       });
       await pool.query('UPDATE google_calendar_event_links SET updated_at=NOW() WHERE id=$1', [link.id]);
+      console.log(`[gcal] updated ${eventType}#${sourceId} (org ${orgId}) → ${link.google_event_id}`);
       return;
     } catch (err) {
       if (![404, 410].includes(err?.code ?? err?.response?.status)) throw err;
@@ -189,6 +190,7 @@ export const syncComplianceEvent = async (orgId, eventType, sourceId) => {
      DO UPDATE SET google_event_id=EXCLUDED.google_event_id, updated_at=NOW()`,
     [orgId, eventType, sourceId, data.id],
   );
+  console.log(`[gcal] created ${eventType}#${sourceId} (org ${orgId}) → ${data.id}`);
 };
 
 /** Fire-and-forget hook for controllers — never throws into the request path. */
@@ -196,4 +198,30 @@ export const queueCalendarSync = (orgId, eventType, sourceId) => {
   syncComplianceEvent(orgId, eventType, sourceId).catch((err) => {
     console.error(`[gcal] sync ${eventType}#${sourceId} (org ${orgId}) failed:`, err.message);
   });
+};
+
+/**
+ * Push every future-dated live event to the connected calendar. Runs after a
+ * successful connect so existing records appear without waiting to be edited.
+ * Sequential on purpose — one org's backfill stays far below API rate limits.
+ */
+export const backfillOrgEvents = async (orgId) => {
+  let synced = 0;
+  for (const [eventType, cfg] of Object.entries(SOURCES)) {
+    const { rows } = await pool.query(
+      `SELECT id FROM ${cfg.table}
+        WHERE organization_id=$1 AND deleted_at IS NULL AND ${cfg.dateField} >= CURRENT_DATE`,
+      [orgId],
+    );
+    for (const row of rows) {
+      try {
+        await syncComplianceEvent(orgId, eventType, row.id);
+        synced += 1;
+      } catch (err) {
+        console.error(`[gcal] backfill ${eventType}#${row.id} (org ${orgId}) failed:`, err.message);
+      }
+    }
+  }
+  console.log(`[gcal] backfill complete for org ${orgId}: ${synced} events synced`);
+  return synced;
 };

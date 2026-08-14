@@ -66,9 +66,16 @@ class PlotModel extends MasterModel {
   }
 
   /** Check for duplicate plot_no within a site — returns ALL matches */
-  async findAllByPlotNo(siteId, plotNo, pool) {
-    const query = `SELECT * FROM plots WHERE site_id = $1 AND UPPER(plot_no) = UPPER($2) ORDER BY id`;
-    const result = await pool.query(query, [siteId, plotNo]);
+  async findAllByPlotNo(siteId, plotNo, pool, propertyType = 'PLOT', block = null) {
+    const query = `
+      SELECT * FROM plots
+       WHERE site_id = $1
+         AND UPPER(plot_no) = UPPER($2)
+         AND property_type = $3
+         AND COALESCE(UPPER(block), '') = COALESCE(UPPER($4), '')
+       ORDER BY id
+    `;
+    const result = await pool.query(query, [siteId, plotNo, propertyType, block]);
     return result.rows;
   }
 
@@ -84,7 +91,7 @@ class PlotModel extends MasterModel {
     // Escape LIKE wildcards so a stray % / _ in the query can't broaden the match.
     const escaped = term.replace(/[\\%_]/g, (c) => `\\${c}`);
     const query = `
-      SELECT id, plot_no, block, buyer_name, booking_by, status
+      SELECT id, property_type, plot_no, block, buyer_name, booking_by, status
       FROM plots
       WHERE site_id = $1 AND plot_no ILIKE $2 ESCAPE '\\'
       ORDER BY

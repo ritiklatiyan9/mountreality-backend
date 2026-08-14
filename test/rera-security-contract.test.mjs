@@ -240,14 +240,24 @@ test('RERA evidence is exact-Site scoped, field-policy enforced and privately st
   assert.match(migration, /uq_compliance_documents_series_version/);
 });
 
-test('Operating Profile UI mirrors create, update and admin-only publish permissions', async () => {
-  const component = await frontendSource('src/components/settings/OperatingProfileSettings.jsx');
+test('Operating Profile UI uses one admin-only immediate save while preserving revision controls', async () => {
+  const [component, routes, controller] = await Promise.all([
+    frontendSource('src/components/settings/OperatingProfileSettings.jsx'),
+    backendSource('src/routes/operatingProfile.routes.js'),
+    backendSource('src/controllers/operatingProfile.controller.js'),
+  ]);
   assert.match(component, /const canCreate = isAdmin \|\| hasPermission\('operating_profile', 'write'\)/);
   assert.match(component, /const canEdit = isAdmin \|\| hasPermission\('operating_profile', 'update'\)/);
-  assert.match(component, /const canReviewPublish = isAdmin/);
-  assert.match(component, /draft\?\.id \? canEdit : canCreate/);
-  assert.match(component, /canReviewPublish && <Button[\s\S]*Approve review/);
-  assert.match(component, /canReviewPublish && <Button[\s\S]*Publish profile/);
+  assert.match(component, /const canSave = isAdmin &&/);
+  assert.match(component, /api\.put\('\/settings\/operating-profile'/);
+  assert.match(component, /Changes are active now/);
+  assert.doesNotMatch(component, /Save draft|Submit for review|Approve review|Publish profile/);
+  assert.match(routes, /router\.put\('\/operating-profile', requireRole\('admin'\), requirePermission\('operating_profile', 'update'\), saveOperatingProfile\)/);
+  assert.match(controller, /export const saveOperatingProfile/);
+  assert.match(controller, /validateOperatingProfile\(input/);
+  assert.match(controller, /lifecycle_status='SUPERSEDED'/);
+  assert.match(controller, /lifecycle_status='PUBLISHED',review_decision='APPROVED'/);
+  assert.match(controller, /OPERATING_PROFILE_SAVED/);
 });
 
 test('reviewed or rejected project source claims require an auditable reviewer', async () => {

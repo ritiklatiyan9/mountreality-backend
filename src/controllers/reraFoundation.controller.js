@@ -806,7 +806,8 @@ async function loadProjectWorkspace(req, siteId, selectedProject, policy) {
 export const getReraControlCentre = endpoint(async (req, res) => {
   const site = await getReraSite(req, res, req.query.site_id ?? req.siteContextId);
   if (!site) return;
-  const policy = await resolveSitePolicy({
+  const projectsOnly = ['1', 'true'].includes(String(req.query.projects_only));
+  const policy = projectsOnly ? null : await resolveSitePolicy({
     organizationId: req.user.organization_id,
     siteId: site.id,
     db: pool,
@@ -837,6 +838,13 @@ export const getReraControlCentre = endpoint(async (req, res) => {
     [req.user.organization_id, site.id],
   );
   const projects = rows.map(publicProject);
+  // Callers that only fill a project picker (Project Finance) skip the selected
+  // project's workspace, which is ~8 further queries they never read.
+  if (projectsOnly) {
+    res.set('Cache-Control', 'private, no-store');
+    res.json({ site: { id: site.id, name: site.name }, projects });
+    return;
+  }
   const suppliedProject = req.query.project_id;
   const requestedProjectId = suppliedProject ? parsePositiveId(suppliedProject) : null;
   if (suppliedProject && !requestedProjectId) {

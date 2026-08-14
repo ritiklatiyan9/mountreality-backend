@@ -12,6 +12,7 @@ class ExcelModel extends MasterModel {
     const query = `
       SELECT ef.id, ef.name, ef.created_by, ef.updated_by,
              ef.created_at, ef.updated_at, ef.folder_id, ef.file_type, ef.site_id,
+             ef.size_bytes,
              u.name as creator_name
       FROM excel_files ef
       LEFT JOIN users u ON ef.created_by = u.id

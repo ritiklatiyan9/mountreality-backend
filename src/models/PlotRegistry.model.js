@@ -13,6 +13,14 @@ const REGISTRY_PAYMENT_ELIGIBILITY_SQL = `(
     prp.source_plot_payment_id IS NOT NULL
     AND LOWER(COALESCE(pp.status, 'approved')) = 'approved'
     AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+    AND pp.reversal_of_payment_id IS NULL
+    AND NOT EXISTS (
+      SELECT 1
+        FROM plot_payments reversal
+       WHERE reversal.reversal_of_payment_id=pp.id
+         AND LOWER(COALESCE(reversal.status,'approved'))='approved'
+         AND UPPER(COALESCE(reversal.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+    )
   )
 )`;
 const REGISTRY_PAYMENT_AMOUNT_SQL = `CASE
@@ -66,9 +74,15 @@ class PlotRegistryModel extends MasterModel {
       : '';
     const query = `
       SELECT pr.*,
+        COALESCE(p.property_type, 'PLOT') AS property_type,
         COALESCE(agg.total_paid,    0) AS total_paid,
         COALESCE(agg.payment_count, 0) AS payment_count,
         COALESCE(docs.registry_doc_count, 0) AS registry_doc_count,
+        COALESCE(docs.controlled_deed_count, 0) AS controlled_deed_count,
+        active_profile.id AS operating_profile_revision_id,
+        active_profile.operating_model,
+        active_profile.project_structure,
+        (active_profile.operating_model IN ('RERA_PROJECT_PROMOTER','RERA_ONGOING_PROJECT_REGULARISATION')) AS rera_registry_controls,
         ${handoverSelect}
         p.team AS plot_team,
         p.booking_by AS agent_name,
@@ -80,6 +94,13 @@ class PlotRegistryModel extends MasterModel {
         pos.scheduled_at AS possession_scheduled_at
       FROM plot_registries pr
       LEFT JOIN plots p ON pr.plot_id = p.id
+      LEFT JOIN sites registry_site ON registry_site.id=pr.site_id
+      LEFT JOIN site_operating_profile_revisions active_profile
+        ON active_profile.organization_id=registry_site.organization_id
+       AND active_profile.site_id=registry_site.id
+       AND active_profile.lifecycle_status='PUBLISHED'
+       AND active_profile.effective_to IS NULL
+       AND active_profile.deleted_at IS NULL
       LEFT JOIN bookings b ON b.id=pr.booking_id AND b.site_id=pr.site_id
       LEFT JOIN members m ON m.id=COALESCE(pr.allottee_member_id,b.client_member_id) AND m.site_id=pr.site_id
       LEFT JOIN rera_projects rp ON rp.id=pr.rera_project_id AND rp.site_id=pr.site_id AND rp.deleted_at IS NULL
@@ -107,11 +128,27 @@ class PlotRegistryModel extends MasterModel {
             )
           )
           AND ${REGISTRY_PAYMENT_ELIGIBILITY_SQL}
+          AND (
+            active_profile.operating_model NOT IN ('RERA_PROJECT_PROMOTER','RERA_ONGOING_PROJECT_REGULARISATION')
+            OR active_profile.operating_model IS NULL
+            OR (
+              prp.source_plot_payment_id IS NOT NULL
+              AND pp.booking_id=pr.booking_id
+              AND pp.amount>0
+            )
+          )
       ) agg ON TRUE
       LEFT JOIN LATERAL (
-        SELECT COUNT(*)::int AS registry_doc_count
+        SELECT COUNT(*)::int AS registry_doc_count,
+               COUNT(*) FILTER (
+                 WHERE d.uploaded_source='PLOT_REGISTRY'
+                   AND NULLIF(BTRIM(d.file_path),'') IS NOT NULL
+                   AND NULLIF(BTRIM(d.file_hash),'') IS NOT NULL
+                   AND d.uploaded_by IS NOT NULL
+               )::int AS controlled_deed_count
         FROM documents d
         WHERE d.plot_id = pr.plot_id
+          AND d.site_id = pr.site_id
           AND UPPER(COALESCE(d.category, '')) = 'REGISTRY'
           AND COALESCE(d.uploaded_source, 'BOOKING') <> 'DMS'
       ) docs ON TRUE
@@ -134,8 +171,15 @@ class PlotRegistryModel extends MasterModel {
   async findByIdWithTotals(id, pool) {
     const query = `
       SELECT pr.*,
+        COALESCE(p.property_type, 'PLOT') AS property_type,
         COALESCE(agg.total_paid,    0) AS total_paid,
         COALESCE(agg.payment_count, 0) AS payment_count,
+        COALESCE(docs.registry_doc_count, 0) AS registry_doc_count,
+        COALESCE(docs.controlled_deed_count, 0) AS controlled_deed_count,
+        active_profile.id AS operating_profile_revision_id,
+        active_profile.operating_model,
+        active_profile.project_structure,
+        (active_profile.operating_model IN ('RERA_PROJECT_PROMOTER','RERA_ONGOING_PROJECT_REGULARISATION')) AS rera_registry_controls,
         COALESCE(m.full_name,pr.customer_name) AS lifecycle_customer_name,
         m.phone AS customer_phone,m.photo AS customer_photo,
         rp.name AS project_name,rpp.name AS phase_name,
@@ -143,6 +187,14 @@ class PlotRegistryModel extends MasterModel {
         pos.id AS possession_id,pos.status AS possession_lifecycle_status,
         pos.scheduled_at AS possession_scheduled_at,pos.possession_date
       FROM plot_registries pr
+      LEFT JOIN plots p ON p.id=pr.plot_id
+      LEFT JOIN sites registry_site ON registry_site.id=pr.site_id
+      LEFT JOIN site_operating_profile_revisions active_profile
+        ON active_profile.organization_id=registry_site.organization_id
+       AND active_profile.site_id=registry_site.id
+       AND active_profile.lifecycle_status='PUBLISHED'
+       AND active_profile.effective_to IS NULL
+       AND active_profile.deleted_at IS NULL
       LEFT JOIN bookings b ON b.id=pr.booking_id AND b.site_id=pr.site_id
       LEFT JOIN members m ON m.id=COALESCE(pr.allottee_member_id,b.client_member_id) AND m.site_id=pr.site_id
       LEFT JOIN rera_projects rp ON rp.id=pr.rera_project_id AND rp.site_id=pr.site_id AND rp.deleted_at IS NULL
@@ -170,7 +222,30 @@ class PlotRegistryModel extends MasterModel {
             )
           )
           AND ${REGISTRY_PAYMENT_ELIGIBILITY_SQL}
+          AND (
+            active_profile.operating_model NOT IN ('RERA_PROJECT_PROMOTER','RERA_ONGOING_PROJECT_REGULARISATION')
+            OR active_profile.operating_model IS NULL
+            OR (
+              prp.source_plot_payment_id IS NOT NULL
+              AND pp.booking_id=pr.booking_id
+              AND pp.amount>0
+            )
+          )
       ) agg ON TRUE
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS registry_doc_count,
+               COUNT(*) FILTER (
+                 WHERE d.uploaded_source='PLOT_REGISTRY'
+                   AND NULLIF(BTRIM(d.file_path),'') IS NOT NULL
+                   AND NULLIF(BTRIM(d.file_hash),'') IS NOT NULL
+                   AND d.uploaded_by IS NOT NULL
+               )::int AS controlled_deed_count
+          FROM documents d
+         WHERE d.plot_id=pr.plot_id
+           AND d.site_id=pr.site_id
+           AND UPPER(COALESCE(d.category,''))='REGISTRY'
+           AND COALESCE(d.uploaded_source,'BOOKING')<>'DMS'
+      ) docs ON TRUE
       WHERE pr.id = $1
     `;
     const result = await pool.query(query, [id]);
@@ -227,6 +302,25 @@ class PlotRegistryPaymentModel extends MasterModel {
                ELSE COALESCE(pp.narration, pp.bank_details, prp.notes)
              END AS notes,
              u.name AS created_by_name,
+             (prp.source_plot_payment_id IS NOT NULL) AS canonical_receipt,
+             CASE
+               WHEN active_profile.operating_model IN ('RERA_PROJECT_PROMOTER','RERA_ONGOING_PROJECT_REGULARISATION')
+                 THEN prp.source_plot_payment_id IS NOT NULL
+                   AND pp.booking_id=pr.booking_id
+                   AND pp.plot_id=pr.plot_id
+                   AND pp.site_id=pr.site_id
+                   AND pp.amount>0
+                   AND LOWER(COALESCE(pp.status,'approved'))='approved'
+                   AND UPPER(COALESCE(pp.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+                   AND pp.reversal_of_payment_id IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1 FROM plot_payments reversal
+                      WHERE reversal.reversal_of_payment_id=pp.id
+                        AND LOWER(COALESCE(reversal.status,'approved'))='approved'
+                        AND UPPER(COALESCE(reversal.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+                   )
+               ELSE TRUE
+             END AS usable_for_registry,
              CASE
                WHEN prp.source_plot_payment_id IS NULL THEN TRUE
                WHEN pr.plot_id IS NOT NULL THEN pp.plot_id = pr.plot_id
@@ -239,6 +333,13 @@ class PlotRegistryPaymentModel extends MasterModel {
              END AS plot_matches_registry
       FROM plot_registry_payments prp
       JOIN plot_registries pr ON pr.id = prp.registry_id
+      LEFT JOIN sites registry_site ON registry_site.id=pr.site_id
+      LEFT JOIN site_operating_profile_revisions active_profile
+        ON active_profile.organization_id=registry_site.organization_id
+       AND active_profile.site_id=registry_site.id
+       AND active_profile.lifecycle_status='PUBLISHED'
+       AND active_profile.effective_to IS NULL
+       AND active_profile.deleted_at IS NULL
       LEFT JOIN plot_payments pp ON pp.id = prp.source_plot_payment_id
       LEFT JOIN users u ON u.id = prp.created_by
       WHERE prp.registry_id = $1
@@ -261,6 +362,7 @@ class PlotRegistryPaymentModel extends MasterModel {
         SELECT
           pp.id,
           pp.plot_id,
+          pp.booking_id,
           p.plot_no,
           p.buyer_name AS customer_name,
           m.phone AS customer_phone,
@@ -279,12 +381,20 @@ class PlotRegistryPaymentModel extends MasterModel {
           AND (pp.amount IS NOT NULL AND pp.amount > 0)
           AND LOWER(COALESCE(pp.status, 'approved')) = 'approved'
           AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+          AND pp.reversal_of_payment_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM plot_payments reversal
+             WHERE reversal.reversal_of_payment_id=pp.id
+               AND LOWER(COALESCE(reversal.status,'approved'))='approved'
+               AND UPPER(COALESCE(reversal.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+          )
         ORDER BY pp.date DESC, pp.created_at DESC
       `
       : `
         SELECT
           pp.id,
           pp.plot_id,
+          pp.booking_id,
           p.plot_no,
           p.buyer_name AS customer_name,
           m.phone AS customer_phone,
@@ -302,6 +412,13 @@ class PlotRegistryPaymentModel extends MasterModel {
           AND (pp.amount IS NOT NULL AND pp.amount > 0)
           AND LOWER(COALESCE(pp.status, 'approved')) = 'approved'
           AND UPPER(COALESCE(pp.cheque_status, '')) NOT IN ('BOUNCED', 'RETURNED')
+          AND pp.reversal_of_payment_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM plot_payments reversal
+             WHERE reversal.reversal_of_payment_id=pp.id
+               AND LOWER(COALESCE(reversal.status,'approved'))='approved'
+               AND UPPER(COALESCE(reversal.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')
+          )
         ORDER BY pp.date DESC, pp.created_at DESC
       `;
 
@@ -314,7 +431,7 @@ class PlotRegistryPaymentModel extends MasterModel {
       pool.query(`SELECT DISTINCT payment_mode AS val FROM plot_registry_payments WHERE site_id = $1 AND payment_mode IS NOT NULL AND payment_mode != '' ORDER BY val ASC`, [siteId]),
       pool.query(`
         SELECT
-          p.id, p.plot_no, p.buyer_name, p.plot_size,
+          p.id, p.property_type, p.plot_no, p.block, p.buyer_name, p.plot_size,
           p.circle_rate, p.to_receive_bank, p.registry_area
         FROM plots p
         WHERE p.site_id = $1

@@ -1375,7 +1375,7 @@ async function migrate() {
     // ---------------------------------------------------------------------
     // Configuration-only seed identities and v1 policies.
     // These contain no statutory requirement rows and no deadline rules.
-    // HRERA remains explicitly source-review pending.
+    // The RERA identity is nationwide; jurisdiction packs are tenant-managed.
     // ---------------------------------------------------------------------
     await client.query(`
       INSERT INTO rera_rulesets (
@@ -1402,15 +1402,15 @@ async function migrate() {
         source_review_status, source_review_notes, disclaimer
       )
       SELECT
-        NULL, 'PLATFORM', 'HRERA_FOUNDATION', 'Haryana RERA Operating Foundation', 'IN',
-        'HR', 'Haryana Real Estate Regulatory Authority',
-        'Configuration-only Haryana operating profile. Official source mapping and legal review are pending.',
-        'UNVERIFIED_REFERENCE', 'PENDING',
-        'Pending official-source mapping and qualified legal review; no statutory claims are encoded.',
-        'Configuration only. It does not provide legal advice, determine applicability, or assert HRERA/RERA compliance.'
+        NULL, 'PLATFORM', 'INDIA_RERA_CENTRAL', 'Central RERA Controls — India', 'IN',
+        NULL, NULL,
+        'Nationwide configuration identity for central RERA workflow controls; state and union-territory packs are optional extensions.',
+        'INTERNAL_CONFIGURATION', 'NOT_APPLICABLE',
+        'Central safeguards are enforced by application services and are not inferred from a state address.',
+        'Operational configuration only. State-specific applicability and legal conclusions require reviewed jurisdiction sources.'
       WHERE NOT EXISTS (
         SELECT 1 FROM rera_rulesets
-        WHERE organization_id IS NULL AND UPPER(code) = 'HRERA_FOUNDATION' AND deleted_at IS NULL
+        WHERE organization_id IS NULL AND UPPER(code) = 'INDIA_RERA_CENTRAL' AND deleted_at IS NULL
       )
     `);
 
@@ -1462,15 +1462,13 @@ async function migrate() {
         published_at
       )
       SELECT
-        r.id, 1, 'Foundation v1 — source review pending', 'PUBLISHED',
-        'CONFIGURATION_ONLY', FALSE, 'UNVERIFIED_REFERENCE',
-        'Haryana RERA operating configuration (official-source review pending)', 'PENDING',
+        r.id, 1, 'Central controls v1', 'PUBLISHED',
+        'CONFIGURATION_ONLY', FALSE, 'INTERNAL_CONFIGURATION',
+        'MountReality central RERA workflow controls', 'NOT_APPLICABLE',
         'No legal requirement, filing deadline, threshold, fee or statutory interpretation is included.',
-        'Source review pending. This configuration does not assert HRERA/RERA registration, approval or compliance.',
+        'Operational configuration only; this version does not certify legal compliance.',
         '{
-          "mode":"HRERA_FOUNDATION",
-          "jurisdiction":"HR",
-          "source_review":"PENDING",
+          "mode":"INDIA_RERA_CENTRAL",
           "modules":{
             "operating_profile":{"enabled":true},
             "rera_projects":{"enabled":true},
@@ -1501,7 +1499,7 @@ async function migrate() {
         NOW()
       FROM rera_rulesets r
       WHERE r.organization_id IS NULL
-        AND UPPER(r.code) = 'HRERA_FOUNDATION'
+        AND UPPER(r.code) = 'INDIA_RERA_CENTRAL'
         AND r.deleted_at IS NULL
         AND NOT EXISTS (
           SELECT 1 FROM rera_ruleset_versions v
