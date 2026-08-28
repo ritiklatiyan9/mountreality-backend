@@ -10,6 +10,7 @@ import {
   buildOccurrences, COMPLIANCE_STATUSES, DEFAULT_TRANSITIONS, isTransitionAllowed, parseDate,
 } from '../services/complianceEngine.service.js';
 import { queueCalendarSync } from '../services/googleCalendarSync.service.js';
+import { sendScheduledEventPush } from '../services/firebasePush.service.js';
 
 // Best-effort Google Calendar push per entity; keys match ENTITY_CONFIG.
 const CALENDAR_EVENT_TYPES = Object.freeze({
@@ -100,6 +101,15 @@ const storedDate = (value) => {
   const parsed = parseDate(value);
   if (!parsed) throw Object.assign(new Error('Invalid date. Use YYYY-MM-DD.'), { statusCode: 400 });
   return parsed.toISOString().slice(0, 10);
+};
+const storedTime = (value) => {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+  const normalized = String(value).trim();
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(normalized)) {
+    throw Object.assign(new Error('Invalid time. Use HH:MM.'), { statusCode: 400 });
+  }
+  return normalized;
 };
 const requireReason = (value) => {
   const reason = text(value, 2000);
@@ -911,6 +921,7 @@ export const complianceCalendar = asyncHandler(async (req, res) => {
   if (!from || !to) return res.status(400).json({ message: 'from and to dates are required' });
   const params = [req.user.organization_id, from, to];
   const itemScope = addComplianceSiteScope(req, 'i', params);
+  const scheduledEventScope = isOrgAdmin(req.user) ? '' : `AND e.site_id IN (SELECT site_id FROM user_sites WHERE user_id=$${params.length})`;
   const caseScope = isOrgAdmin(req.user) ? '' : `AND c.site_id IN (SELECT site_id FROM user_sites WHERE user_id=$${params.length})`;
   const noticeScope = isOrgAdmin(req.user) ? '' : `AND n.site_id IN (SELECT site_id FROM user_sites WHERE user_id=$${params.length})`;
   const inspectionScope = isOrgAdmin(req.user) ? '' : `AND x.site_id IN (SELECT site_id FROM user_sites WHERE user_id=$${params.length})`;
@@ -923,14 +934,115 @@ export const complianceCalendar = asyncHandler(async (req, res) => {
     siteParam = params.length;
   }
   const selectedSite = (alias) => siteParam ? `AND ${alias}.site_id=$${siteParam}` : '';
-  const [items, cases, notices, inspections, licences] = await Promise.all([
+  const [items, cases, notices, inspections, licences, scheduledEvents] = await Promise.all([
     pool.query(`SELECT i.id,'COMPLIANCE' AS event_type,i.title,i.current_due_date AS event_date,NULL::text AS event_time,i.status,i.risk_level,i.site_id,s.name AS site_name FROM compliance_items i LEFT JOIN sites s ON s.id=i.site_id WHERE i.organization_id=$1 AND i.deleted_at IS NULL AND i.current_due_date BETWEEN $2 AND $3 ${itemScope} ${selectedSite('i')}`, params),
     canViewLegal ? pool.query(`SELECT c.id,'LEGAL_HEARING' AS event_type,c.title,to_char(c.next_hearing_date AT TIME ZONE 'Asia/Kolkata','YYYY-MM-DD') AS event_date,to_char(c.next_hearing_date AT TIME ZONE 'Asia/Kolkata','HH12:MI AM') AS event_time,c.status,c.risk_level,c.site_id,s.name AS site_name FROM legal_cases c LEFT JOIN sites s ON s.id=c.site_id WHERE c.organization_id=$1 AND c.deleted_at IS NULL AND (c.next_hearing_date AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3 ${caseScope} ${selectedSite('c')}`, params) : Promise.resolve({ rows: [] }),
     canViewLegal ? pool.query(`SELECT n.id,'NOTICE_REPLY' AS event_type,n.subject AS title,n.reply_due_date AS event_date,NULL::text AS event_time,n.status,n.risk_level,n.site_id,s.name AS site_name FROM legal_notices n LEFT JOIN sites s ON s.id=n.site_id WHERE n.organization_id=$1 AND n.deleted_at IS NULL AND n.reply_due_date BETWEEN $2 AND $3 ${noticeScope} ${selectedSite('n')}`, params) : Promise.resolve({ rows: [] }),
     pool.query(`SELECT x.id,'INSPECTION' AS event_type,x.inspection_type AS title,to_char(x.scheduled_at AT TIME ZONE 'Asia/Kolkata','YYYY-MM-DD') AS event_date,to_char(x.scheduled_at AT TIME ZONE 'Asia/Kolkata','HH12:MI AM') AS event_time,x.status,'MEDIUM' AS risk_level,x.site_id,s.name AS site_name FROM compliance_inspections x LEFT JOIN sites s ON s.id=x.site_id WHERE x.organization_id=$1 AND x.deleted_at IS NULL AND (x.scheduled_at AT TIME ZONE 'Asia/Kolkata')::date BETWEEN $2 AND $3 ${inspectionScope} ${selectedSite('x')}`, params),
     pool.query(`SELECT l.id,'LICENCE_EXPIRY' AS event_type,l.name AS title,l.expiry_date AS event_date,NULL::text AS event_time,l.renewal_status AS status,'HIGH' AS risk_level,l.site_id,s.name AS site_name FROM compliance_licences l LEFT JOIN sites s ON s.id=l.site_id WHERE l.organization_id=$1 AND l.deleted_at IS NULL AND l.expiry_date BETWEEN $2 AND $3 ${licenceScope} ${selectedSite('l')}`, params),
+    pool.query(`SELECT e.id,'SCHEDULED_EVENT' AS event_type,e.title,e.event_date,CASE WHEN e.event_time IS NULL THEN NULL::text ELSE to_char(e.event_time,'HH12:MI AM') END AS event_time,e.status,e.priority AS risk_level,e.site_id,s.name AS site_name FROM scheduled_events e LEFT JOIN sites s ON s.id=e.site_id WHERE e.organization_id=$1 AND e.deleted_at IS NULL AND e.event_date BETWEEN $2 AND $3 ${scheduledEventScope} ${selectedSite('e')}`, params),
   ]);
-  res.json({ events: [...items.rows, ...cases.rows, ...notices.rows, ...inspections.rows, ...licences.rows].sort((a, b) => String(a.event_date).localeCompare(String(b.event_date))) });
+  res.json({ events: [...items.rows, ...cases.rows, ...notices.rows, ...inspections.rows, ...licences.rows, ...scheduledEvents.rows].sort((a, b) => `${a.event_date} ${a.event_time || ''}`.localeCompare(`${b.event_date} ${b.event_time || ''}`)) });
+});
+
+/** Lightweight work item scheduled directly from the dashboard calendar. */
+export const createScheduledCalendarEvent = asyncHandler(async (req, res) => {
+  const siteId = await assertComplianceSiteAccess(req, res, req.body.site_id, { required: true });
+  if (siteId === false) return;
+  const title = text(req.body.title, 300);
+  const eventDate = storedDate(req.body.event_date);
+  if (!title) return res.status(400).json({ message: 'Event title is required' });
+  if (!eventDate) return res.status(400).json({ message: 'Event date is required' });
+  const priority = PRIORITIES.has(upper(req.body.priority)) ? upper(req.body.priority) : 'MEDIUM';
+  const eventTime = storedTime(req.body.event_time);
+  const description = text(req.body.description, 10000);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query(
+      `WITH inserted AS (
+        INSERT INTO scheduled_events
+          (organization_id,site_id,title,description,event_date,event_time,priority,created_by,updated_by)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)
+        RETURNING *
+      )
+      SELECT e.*,s.name AS site_name,
+             CASE WHEN e.event_time IS NULL THEN NULL::text ELSE to_char(e.event_time,'HH12:MI AM') END AS calendar_event_time
+        FROM inserted e
+        LEFT JOIN sites s ON s.id=e.site_id`,
+      [req.user.organization_id, siteId, title, description, eventDate, eventTime, priority, req.user.id],
+    );
+    const event = rows[0];
+    const creatorName = text(req.user.name, 200) || 'A team member';
+    const timeLabel = event.calendar_event_time ? ` at ${event.calendar_event_time}` : '';
+    const notificationMessage = `${creatorName} scheduled “${title}” for ${eventDate}${timeLabel}.`;
+    const notificationResult = await client.query(
+      `INSERT INTO compliance_notification_log
+        (organization_id,site_id,entity_type,entity_id,recipient_user_id,channel,
+         notification_type,scheduled_for,title,due_date,message,status,attempt_count,sent_at,last_attempt_at)
+       SELECT $1,$2,'SCHEDULED_EVENT',$3,u.id,'DASHBOARD','EVENT_SCHEDULED',CURRENT_DATE,
+              $4,$5,$6,'DELIVERED',1,NOW(),NOW()
+         FROM users u
+        WHERE u.organization_id=$1 AND u.is_active=TRUE
+          AND (
+            u.id=$7
+            OR u.role IN ('admin','super_admin')
+            OR (
+              EXISTS (SELECT 1 FROM user_sites us WHERE us.user_id=u.id AND us.site_id=$2)
+              AND EXISTS (
+                SELECT 1 FROM user_permissions up
+                 WHERE up.user_id=u.id AND up.module='compliance' AND up.can_read=TRUE
+              )
+            )
+          )
+       ON CONFLICT DO NOTHING
+       RETURNING id,recipient_user_id`,
+      [req.user.organization_id, siteId, event.id, text(`Event scheduled: ${title}`, 300), eventDate, notificationMessage, req.user.id],
+    );
+    const { rows: deliveryRows } = await client.query(
+      `SELECT
+         EXISTS (
+           SELECT 1 FROM google_calendar_connections
+            WHERE organization_id=$1 AND status='active'
+         ) AS calendar_connected,
+         (SELECT COUNT(*)::int FROM google_calendar_notify_emails WHERE organization_id=$1) AS connected_emails`,
+      [req.user.organization_id],
+    );
+    await writeComplianceAudit(client, req, {
+      action: 'CREATE', entityType: 'SCHEDULED_EVENT', entityId: event.id, siteId, newValue: event,
+    });
+    await client.query('COMMIT');
+
+    const delivery = deliveryRows[0] || {};
+    queueCalendarSync(req.user.organization_id, 'SCHEDULED_EVENT', event.id);
+    const push = await sendScheduledEventPush({
+      organizationId: req.user.organization_id,
+      recipientUserIds: notificationResult.rows.map((row) => row.recipient_user_id),
+      event: { ...event, event_date: eventDate },
+    }).catch((error) => {
+      console.error(`[fcm] scheduled event ${event.id} delivery failed:`, error.message);
+      return { configured: true, targeted: 0, sent: 0, failed: 1 };
+    });
+    res.status(201).json({
+      event: {
+        ...event,
+        event_time: event.calendar_event_time,
+        risk_level: event.priority,
+        event_type: 'SCHEDULED_EVENT',
+      },
+      notification_summary: {
+        dashboard_recipients: notificationResult.rowCount,
+        calendar_connected: Boolean(delivery.calendar_connected),
+        connected_emails: Number(delivery.connected_emails) || 0,
+        fcm: push,
+      },
+    });
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
 });
 
 // ── Organisation-managed compliance categories ─────────────────────
@@ -1963,7 +2075,7 @@ export const complianceNotifications = asyncHandler(async (req, res) => {
     params
   );
   const { rows } = await pool.query(
-    `SELECT n.*,s.name AS site_name
+    `SELECT n.*,s.name AS site_name,to_char(n.due_date,'YYYY-MM-DD') AS action_date
        FROM compliance_notification_log n
        LEFT JOIN sites s ON s.id=n.site_id AND s.organization_id=n.organization_id
       WHERE ${clause}
@@ -1972,6 +2084,7 @@ export const complianceNotifications = asyncHandler(async (req, res) => {
     params
   );
   const actionPath = (row) => {
+    if (row.entity_type === 'SCHEDULED_EVENT') return `/compliance/calendar?date=${row.action_date || ''}`;
     if (row.entity_type === 'LEGAL_CASE') return `/legal/cases/${row.entity_id}`;
     if (row.entity_type === 'LEGAL_NOTICE') return `/legal/notices/${row.entity_id}`;
     if (row.entity_type === 'LICENCE') return '/compliance/licences';

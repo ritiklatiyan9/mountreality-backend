@@ -20,6 +20,10 @@ export const SOURCES = Object.freeze({
   NOTICE_REPLY: { table: 'legal_notices', titleField: 'subject', dateField: 'reply_due_date', timed: false },
   INSPECTION: { table: 'compliance_inspections', titleField: 'inspection_type', dateField: 'scheduled_at', timed: true },
   LICENCE_EXPIRY: { table: 'compliance_licences', titleField: 'name', dateField: 'expiry_date', timed: false },
+  SCHEDULED_EVENT: {
+    table: 'scheduled_events', titleField: 'title', dateField: 'event_date', timeField: 'event_time',
+    descriptionField: 'description', timed: false,
+  },
 });
 
 const EVENT_LABELS = Object.freeze({
@@ -28,6 +32,7 @@ const EVENT_LABELS = Object.freeze({
   NOTICE_REPLY: 'Notice reply due',
   INSPECTION: 'Inspection',
   LICENCE_EXPIRY: 'Licence expiry',
+  SCHEDULED_EVENT: 'Scheduled calendar event',
 });
 
 const isConfigured = () =>
@@ -52,6 +57,25 @@ const nextDay = (dateStr) => {
   return d.toISOString().slice(0, 10);
 };
 
+// Google Calendar popup reminders surface through the native Calendar app on
+// phones signed into the connected account. Direct email reminders are sent by
+// scheduledEventReminder.service, so Google only handles the mobile popup path.
+const scheduledEventCalendarReminders = (optionalTime) => {
+  if (!optionalTime) {
+    return [
+      { method: 'popup', minutes: 1440 },
+      { method: 'popup', minutes: 0 },
+    ];
+  }
+  const [hours, minutes] = optionalTime.split(':').map(Number);
+  const startMinutes = (hours * 60) + minutes;
+  const onDayMinutes = startMinutes > 540
+    ? startMinutes - 540
+    : Math.min(60, startMinutes);
+  return [...new Set([1440, onDayMinutes, 30])]
+    .map((offset) => ({ method: 'popup', minutes: offset }));
+};
+
 /** Pure event-body builder — exercised directly by the sanity check script. */
 export const buildEventBody = (eventType, row, attendeeEmails = []) => {
   const cfg = SOURCES[eventType];
@@ -62,13 +86,23 @@ export const buildEventBody = (eventType, row, attendeeEmails = []) => {
     label,
     row.status ? `Status: ${row.status}` : null,
     row.risk_level ? `Risk: ${row.risk_level}` : null,
+    row.priority ? `Priority: ${row.priority}` : null,
     row.location ? `Location: ${row.location}` : null,
+    cfg.descriptionField && row[cfg.descriptionField]
+      ? String(row[cfg.descriptionField]).trim()
+      : null,
   ].filter(Boolean);
 
   let start;
   let end;
-  if (cfg.timed) {
-    const startDate = dateValue instanceof Date ? dateValue : new Date(dateValue);
+  const optionalTime = cfg.timeField && row[cfg.timeField]
+    ? String(row[cfg.timeField]).slice(0, 8)
+    : null;
+  if (cfg.timed || optionalTime) {
+    const datePart = typeof dateValue === 'string' ? dateValue.slice(0, 10) : ymd(dateValue);
+    const startDate = optionalTime
+      ? new Date(`${datePart}T${optionalTime}+05:30`)
+      : (dateValue instanceof Date ? dateValue : new Date(dateValue));
     const endDate = new Date(startDate.getTime() + 60 * 60 * 1000); // 1h default duration
     start = { dateTime: startDate.toISOString(), timeZone: TIME_ZONE };
     end = { dateTime: endDate.toISOString(), timeZone: TIME_ZONE };
@@ -84,7 +118,9 @@ export const buildEventBody = (eventType, row, attendeeEmails = []) => {
     start,
     end,
     attendees: attendeeEmails.map((email) => ({ email })),
-    reminders: { useDefault: true },
+    reminders: eventType === 'SCHEDULED_EVENT'
+      ? { useDefault: false, overrides: scheduledEventCalendarReminders(optionalTime) }
+      : { useDefault: true },
   };
 };
 

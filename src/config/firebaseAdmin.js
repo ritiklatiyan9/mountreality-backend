@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { initializeApp, cert } from 'firebase-admin/app';
 import { getAuth } from 'firebase-admin/auth';
+import { getMessaging } from 'firebase-admin/messaging';
 
 /**
  * Firebase Admin — verifies Google Sign-In ID tokens minted by the frontend's
@@ -75,3 +76,6 @@ export const firebaseStatus = () => ({
 
 /** Verify a Firebase ID token → decoded payload (throws on invalid/expired). */
 export const verifyFirebaseIdToken = (idToken) => getAuth(app).verifyIdToken(idToken);
+
+/** Return the Admin messaging client used for browser FCM delivery. */
+export const firebaseMessaging = () => (app ? getMessaging(app) : null);
