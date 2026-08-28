@@ -62,7 +62,7 @@ test('land and plot payment screens use the same configurable receipt engine', a
   assert.match(land, /printUnifiedReceipt\(\{/);
   assert.match(plot, /printUnifiedReceipt\(\{/);
   assert.match(land, /configuration: receiptConfiguration/);
-  assert.match(plot, /configuration: receiptConfiguration/);
+  assert.match(plot, /configuration: \{ \.\.\.receiptConfiguration, show_verification_qr: false \}/);
   assert.match(settings, /UnifiedReceiptPreview/);
   assert.match(settings, /updateReceiptConfiguration/);
   assert.match(settings, /DndContext/);

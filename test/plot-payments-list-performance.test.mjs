@@ -39,3 +39,10 @@ test('plot list defers form metadata and has a real table skeleton', async () =>
   assert.match(page, /void Promise\.all\(\[ensureAutocomplete\(\), ensureApprovers\(\)\]\)/);
   assert.doesNotMatch(pageQuery, /autocomplete \{/);
 });
+
+test('plot payment rows open the dedicated payment details route', async () => {
+  const page = await frontend('src/pages/PlotPayments.jsx');
+
+  assert.match(page, /\(id\) => navigate\(`\/plot-payments\/\$\{id\}`\)/);
+  assert.doesNotMatch(page, /\(id\) => navigate\(`\/customer-inventory\?plot_id=\$\{id\}&tab=payments`\)/);
+});

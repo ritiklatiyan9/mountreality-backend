@@ -6,6 +6,10 @@ import { initSocket } from './config/socket.js';
 import { initCache } from './config/cache.js';
 import { startSmsReminderScheduler, stopSmsReminderScheduler } from './services/smsReminder.service.js';
 import { startComplianceScheduler, stopComplianceScheduler } from './services/complianceScheduler.service.js';
+import {
+  startScheduledEventReminderScheduler,
+  stopScheduledEventReminderScheduler,
+} from './services/scheduledEventReminder.service.js';
 import { validateRuntimeConfig } from './config/runtime.js';
 import pool from './config/db.js';
 
@@ -26,6 +30,7 @@ connectDB().then(async () => {
   });
   startSmsReminderScheduler();
   startComplianceScheduler();
+  startScheduledEventReminderScheduler();
 }).catch(err => {
   console.error('Failed to connect to DB', err);
   process.exit(1);
@@ -38,6 +43,7 @@ const shutdown = (signal) => {
   console.log(`[shutdown] ${signal} received; draining connections`);
   stopSmsReminderScheduler();
   stopComplianceScheduler();
+  stopScheduledEventReminderScheduler();
   const forceExit = setTimeout(() => {
     console.error('[shutdown] graceful timeout exceeded');
     process.exit(1);

@@ -4,7 +4,7 @@ import requireRole from '../middlewares/role.middleware.js';
 import requirePermission from '../middlewares/permission.middleware.js';
 import { cacheResponse, invalidateCacheOnSuccess } from '../middlewares/cache.middleware.js';
 import {
-  addLegalCaseTimeline, applyTemplate, complianceAuditLog, complianceCalendar,
+  addLegalCaseTimeline, applyTemplate, complianceAuditLog, complianceCalendar, createScheduledCalendarEvent,
   complianceDashboard, complianceNotifications, complianceReports, createAuthority,
   createChecklistItem, createComplianceCategory, createComplianceEntity, createComplianceItem, createTemplate,
   deleteAuthority, deleteComplianceCategory, deleteComplianceEntity, deleteComplianceItem, deleteTemplate, duplicateTemplate,
@@ -17,6 +17,9 @@ import {
   updateAuthority, updateChecklistItem, updateComplianceCategory, updateComplianceEntity, updateComplianceItem,
   updateComplianceSettings, updateComplianceStatus, updateLegalNoticeStatus, updateTemplate,
 } from '../controllers/compliance.controller.js';
+import {
+  registerWebPushToken, unregisterWebPushToken, webPushStatus,
+} from '../controllers/pushNotification.controller.js';
 
 const router = express.Router();
 const cache = cacheResponse({ ttlSeconds: 45, namespace: 'compliance' });
@@ -26,6 +29,10 @@ router.use(authMiddleware, requireRole('admin', 'sub_admin'));
 
 router.get('/dashboard', requirePermission('compliance', 'read'), cache, complianceDashboard);
 router.get('/calendar', requirePermission('compliance', 'read'), cache, complianceCalendar);
+router.post('/calendar/events', requirePermission('compliance', 'write'), bust, createScheduledCalendarEvent);
+router.get('/push-tokens/status', requirePermission('compliance', 'read'), webPushStatus);
+router.post('/push-tokens', requirePermission('compliance', 'read'), registerWebPushToken);
+router.delete('/push-tokens', requirePermission('compliance', 'read'), unregisterWebPushToken);
 router.get('/my-tasks', requirePermission('compliance', 'read'), getMyComplianceTasks);
 router.get('/users', requirePermission('compliance', 'read'), listComplianceUsers);
 router.get('/legal-users', requirePermission('legal', 'read'), listComplianceUsers);

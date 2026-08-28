@@ -1436,10 +1436,12 @@ export const getProjectFinance = asyncHandler(async (req, res) => {
   const projectParams = [siteId, projectId, phaseId];
   const projectScope = `p.site_id=$1 AND p.rera_project_id=$2 AND ($3::bigint IS NULL OR p.rera_project_phase_id=$3)`;
   const organizationProjectParams = [siteId, req.user.organization_id, projectId, phaseId];
-  const [metrics, collections, expenses, accounts, allocations, evidenceDocuments] = await Promise.all([
+  const [metrics, collections, expenses, unassignedExpenses, projectCostSummary, accounts, allocations, evidenceDocuments] = await Promise.all([
     pool.query(`SELECT COALESCE(SUM(b.final_consideration),0) AS booked,COALESCE(SUM(received.total),0) AS collected,COALESCE(SUM(GREATEST(b.final_consideration-COALESCE(received.total,0),0)),0) AS receivable,COALESCE(SUM(overdue.total),0) AS overdue,COALESCE(SUM(unmatched.total),0) AS unreconciled FROM bookings b JOIN plots p ON p.id=b.plot_id LEFT JOIN LATERAL (SELECT SUM(amount) AS total FROM plot_payments WHERE booking_id=b.id AND LOWER(COALESCE(status,'approved'))='approved' AND UPPER(COALESCE(cheque_status,'')) NOT IN ('BOUNCED','RETURNED')) received ON TRUE LEFT JOIN LATERAL (SELECT SUM(GREATEST(pi.amount-COALESCE(pa.total,0),0)) AS total FROM plot_installments pi LEFT JOIN LATERAL (SELECT SUM(ppa.allocated_amount) AS total FROM plot_payment_allocations ppa JOIN plot_payments allocated_payment ON allocated_payment.id=ppa.plot_payment_id WHERE ppa.installment_id=pi.id AND LOWER(COALESCE(allocated_payment.status,'approved'))='approved' AND UPPER(COALESCE(allocated_payment.cheque_status,'')) NOT IN ('BOUNCED','RETURNED')) pa ON TRUE WHERE pi.booking_id=b.id AND pi.due_date<CURRENT_DATE AND pi.superseded_at IS NULL) overdue ON TRUE LEFT JOIN LATERAL (SELECT SUM(amount) AS total FROM plot_payments WHERE booking_id=b.id AND reconciliation_status<>'MATCHED' AND LOWER(COALESCE(status,'approved'))='approved') unmatched ON TRUE WHERE ${projectScope}`, projectParams),
     pool.query(`SELECT pp.*,b.booking_no,p.plot_no,m.full_name AS customer_name FROM plot_payments pp JOIN bookings b ON b.id=pp.booking_id JOIN plots p ON p.id=pp.plot_id LEFT JOIN members m ON m.id=b.client_member_id WHERE ${projectScope} ORDER BY pp.date DESC,pp.id DESC LIMIT 200`, projectParams),
-    pool.query(`SELECT e.id,e.date,COALESCE(e.remark,e.category) AS description,e.debit AS amount,e.status,e.rera_project_id,e.rera_project_phase_id FROM expenses e WHERE e.site_id=$1 AND e.rera_project_id=$2 AND ($3::bigint IS NULL OR e.rera_project_phase_id=$3) ORDER BY e.date DESC,e.id DESC LIMIT 200`, projectParams),
+    pool.query(`SELECT e.id,e.date,COALESCE(e.remark,e.category) AS description,GREATEST(COALESCE(e.debit,0),COALESCE(e.credit,0)) AS amount,e.debit,e.credit,e.status,e.rera_project_id,e.rera_project_phase_id,'PROJECT' AS project_scope FROM expenses e WHERE e.site_id=$1 AND ((e.rera_project_id=$2 AND ($3::bigint IS NULL OR e.rera_project_phase_id=$3)) OR EXISTS (SELECT 1 FROM project_transaction_allocations a WHERE a.site_id=e.site_id AND a.source_module='EXPENSE' AND a.source_id=e.id AND a.rera_project_id=$2 AND ($3::bigint IS NULL OR a.rera_project_phase_id IS NULL OR a.rera_project_phase_id=$3))) ORDER BY e.date DESC,e.id DESC LIMIT 200`, projectParams),
+    pool.query(`SELECT e.id,e.date,COALESCE(e.remark,e.category) AS description,GREATEST(COALESCE(e.debit,0),COALESCE(e.credit,0)) AS amount,e.debit,e.credit,e.status,e.rera_project_id,e.rera_project_phase_id,'UNASSIGNED' AS project_scope FROM expenses e WHERE e.site_id=$1 AND e.rera_project_id IS NULL AND NOT EXISTS (SELECT 1 FROM project_transaction_allocations a WHERE a.site_id=e.site_id AND a.source_module='EXPENSE' AND a.source_id=e.id) ORDER BY e.date DESC,e.id DESC LIMIT 200`, [siteId]),
+    pool.query(`SELECT COALESCE(SUM(GREATEST(COALESCE(e.debit,0),COALESCE(e.credit,0))),0) AS project_cost FROM expenses e WHERE e.site_id=$1 AND ((e.rera_project_id=$2 AND ($3::bigint IS NULL OR e.rera_project_phase_id=$3)) OR EXISTS (SELECT 1 FROM project_transaction_allocations a WHERE a.site_id=e.site_id AND a.source_module='EXPENSE' AND a.source_id=e.id AND a.rera_project_id=$2 AND ($3::bigint IS NULL OR a.rera_project_phase_id IS NULL OR a.rera_project_phase_id=$3)))`, projectParams),
     pool.query(`SELECT pam.*,f.name AS firm_name,f.bank_name,f.account_number FROM project_account_mappings pam JOIN firms f ON f.id=pam.firm_id WHERE pam.organization_id=$2 AND pam.site_id=$1 AND pam.rera_project_id=$3 AND ($4::bigint IS NULL OR pam.rera_project_phase_id=$4) ORDER BY pam.effective_from DESC`, organizationProjectParams),
     pool.query(`SELECT * FROM project_transaction_allocations WHERE organization_id=$2 AND site_id=$1 AND rera_project_id=$3 AND ($4::bigint IS NULL OR rera_project_phase_id=$4) ORDER BY created_at DESC LIMIT 200`, organizationProjectParams),
     pool.query(
@@ -1451,9 +1453,14 @@ export const getProjectFinance = asyncHandler(async (req, res) => {
     ),
   ]);
   res.json({
-    metrics: metrics.rows[0] || {},
+    metrics: {
+      ...(metrics.rows[0] || {}),
+      project_cost: projectCostSummary.rows[0]?.project_cost || 0,
+      unassigned_cost: unassignedExpenses.rows.reduce((total, row) => total + Math.max(Number(row.amount || 0), Number(row.credit || 0)), 0),
+    },
     collections: collections.rows,
     expenses: expenses.rows,
+    unassigned_expenses: unassignedExpenses.rows,
     accounts: accounts.rows,
     allocations: allocations.rows,
     evidence_documents: evidenceDocuments.rows,
