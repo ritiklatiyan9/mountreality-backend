@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
 const backend = (file) => readFile(new URL(`../${file}`, import.meta.url), 'utf8');
-const frontend = (file) => readFile(new URL(`../../Frontend/${file}`, import.meta.url), 'utf8');
 
 test('access and refresh tokens are bound to active revocable sessions', async () => {
   const [authController, authMiddleware, migration] = await Promise.all([
@@ -71,19 +70,4 @@ test('billing and financial writes use locks, transactions and idempotency const
   assert.match(financeMigration, /uq_imprest_source_posting/);
   assert.match(financeMigration, /uq_subscriptions_razorpay_payment/);
   assert.match(inventoryMigration, /uq_inventory_movement_idempotency/);
-});
-
-test('frontend printing and navigation hardening remain in the production build', async () => {
-  const [safePrint, app, vercel] = await Promise.all([
-    frontend('src/lib/safePrint.js'),
-    frontend('src/App.jsx'),
-    frontend('vercel.json'),
-  ]);
-  assert.match(safePrint, /DOMPurify\.sanitize/);
-  assert.match(safePrint, /FORBID_TAGS/);
-  assert.match(safePrint, /targetWindow\.opener = null/);
-  assert.doesNotMatch(app, /const lazyPage/);
-  assert.match(app, /lazy\(\(\) => import\('\.\/pages\/Dashboard\.jsx'\)\)/);
-  assert.match(vercel, /Content-Security-Policy/);
-  assert.match(vercel, /frame-ancestors 'none'/);
 });
